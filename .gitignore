@@ -1,0 +1,16 @@
+# Datasets
+data/
+data.zip
+
+# Results
+results_long_bench/
+results_ruler/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Environment
+venv/
+.env
