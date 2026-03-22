@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from typing import List
 from svd_utils import get_rank
 
@@ -280,15 +280,18 @@ if __name__ == "__main__":
     replace_llama(args.method.lower())
     replace_mistral(args.method.lower())
     
+    config = AutoConfig.from_pretrained(args.model_path)
+    config.rank = args.rank
+    config.layer_step = args.layer_step
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
+        config=config,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
         device_map="auto",
         use_cache=args.use_cache,
         attn_implementation=args.attn_implementation,
-        # rank=args.rank,
-        # layer_step=args.layer_step
     )
 
     if args.method == 'Ours':

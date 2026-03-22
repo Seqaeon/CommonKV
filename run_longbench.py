@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 import torch
 from svd_utils import get_rank
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
 datasets = [
             "narrativeqa", "qasper", \
@@ -390,15 +390,18 @@ if __name__ == "__main__":
     replace_llama(args.method.lower())
     replace_mistral(args.method.lower())
     
+    config = AutoConfig.from_pretrained(args.model_path)
+    config.rank = args.rank
+    config.layer_step = args.layer_step
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
+        config=config,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
         device_map="auto",
         use_cache=args.use_cache,
         attn_implementation=args.attn_implementation,
-        # rank=args.rank,         # Removed to prevent TypeError on unsupported models
-        # layer_step=args.layer_step
         # lrd_method=args.lrd_method
     )
 
