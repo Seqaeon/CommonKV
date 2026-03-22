@@ -31,7 +31,11 @@ from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache, DynamicCache, SlidingWindowCache, StaticCache
+try:
+    from transformers.cache_utils import Cache, DynamicCache, SlidingWindowCache, StaticCache
+except ImportError:
+    from transformers.cache_utils import Cache, DynamicCache, StaticCache
+    SlidingWindowCache = type("SlidingWindowCache", (object,), {})
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
