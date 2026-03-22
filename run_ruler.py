@@ -82,6 +82,7 @@ def main(args):
     
     input_max_len = 0
     model_path = args.model_path.lower()
+    model_max_len = 8192 # Fallback config
     
     for key in model2maxlen:
         if key in model_path:
@@ -150,7 +151,7 @@ def main(args):
             max_capacity_prompts = round(batch_input_ids.shape[1] * args.max_capacity_prompts_ratio)
         
         
-        if args.method not in ["FullKV", "Ours"] :
+        if args.method.lower() not in ["fullkv", "ours"] :
             if args.method.lower() in ["snapkv","pyramidkv","h2o","cam", "l2norm", "think"]:
                 window_sizes = 8
             elif args.method.lower() in ["streamingllm"]:
