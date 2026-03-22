@@ -390,7 +390,7 @@ if __name__ == "__main__":
     replace_llama(args.method.lower())
     replace_mistral(args.method.lower())
     
-    config = AutoConfig.from_pretrained(args.model_path)
+    config = AutoConfig.from_pretrained(args.model_path, use_cache=args.use_cache)
     config.rank = args.rank
     config.layer_step = args.layer_step
 
@@ -400,7 +400,6 @@ if __name__ == "__main__":
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
         device_map="auto",
-        use_cache=args.use_cache,
         attn_implementation=args.attn_implementation,
         # lrd_method=args.lrd_method
     )
