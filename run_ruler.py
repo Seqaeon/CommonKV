@@ -287,8 +287,8 @@ if __name__ == "__main__":
         device_map="auto",
         use_cache=args.use_cache,
         attn_implementation=args.attn_implementation,
-        rank=args.rank,
-        layer_step=args.layer_step
+        # rank=args.rank,
+        # layer_step=args.layer_step
     )
 
     if args.method == 'Ours':
