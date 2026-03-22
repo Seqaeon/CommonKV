@@ -1,14 +1,14 @@
 from importlib.metadata import version
 import transformers
 
-# from modeling_llama_svd import LlamaForCausalLM
-from modeling_llama_svd_merge import LlamaForCausalLM
-from modeling_mistral_svd_merge import MistralForCausalLM
+# from commonkv.modeling_llama_svd import LlamaForCausalLM
+from commonkv.modeling_llama_svd_merge import LlamaForCausalLM
+from commonkv.modeling_mistral_svd_merge import MistralForCausalLM
 
 
 
-from llama_model import prepare_inputs_for_generation_llama_new
-from mistral_model import prepare_inputs_for_generation_mistral_new
+from commonkv.llama_model import prepare_inputs_for_generation_llama_new
+from commonkv.mistral_model import prepare_inputs_for_generation_mistral_new
 
 
 def replace_llama(method, model_name=None):
