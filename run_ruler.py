@@ -300,7 +300,7 @@ if __name__ == "__main__":
         attn_implementation=args.attn_implementation,
     )
 
-    if args.method == 'Ours':
+    if args.method.lower() in ['ours', 'commonkv']:
         RANK = args.rank
         layer_step = args.layer_step
 

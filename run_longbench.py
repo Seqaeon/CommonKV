@@ -115,7 +115,7 @@ def main(args):
     contexts = []
     answerss = []
     lengths = []
-    datasets = []
+    dataset_names = []
     languages = []
     all_classess = []
     _ids = []
@@ -167,7 +167,7 @@ def main(args):
         contexts.append(example["context"])
         answerss.append(example["answers"])
         lengths.append(example["length"])
-        datasets.append(example["dataset"])
+        dataset_names.append(example["dataset"])
         languages.append(example["language"])
         all_classess.append(example["all_classes"])
         _ids.append(example["_id"])
@@ -194,7 +194,7 @@ def main(args):
         batch_answerss = answerss[i:i+args.eval_batch_size]
         batch_lengths = lengths[i:i+args.eval_batch_size]
         
-        batch_datasets = datasets[i:i+args.eval_batch_size]
+        batch_datasets = dataset_names[i:i+args.eval_batch_size]
         batch_languages = languages[i:i+args.eval_batch_size]
         batch_all_classess = all_classess[i:i+args.eval_batch_size]
         batch__ids = _ids[i:i+args.eval_batch_size]
@@ -423,7 +423,7 @@ if __name__ == "__main__":
 
     model.eval()
 
-    if args.method == 'Ours':
+    if args.method.lower() in ['ours', 'commonkv']:
         RANK = args.rank
         layer_step = args.layer_step
         # lrd_method = args.lrd_method
