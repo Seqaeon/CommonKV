@@ -39,6 +39,27 @@ dataset2metric = {
     "repobench-p": code_sim_score,
 }
 
+# These lists will be dynamically patched by run_eval_dynamic.py
+methods = ["FullKV", "random", "SnapKV", "StreamingLLM", "H2O", "PyramidKV", "L2Norm","CAM","ThinK"]
+dataset_list = [
+    "narrativeqa",
+    "qasper",
+    "multifieldqa_en",
+    "hotpotqa",
+    "2wikimqa",
+    "musique",
+    "gov_report",
+    "qmsum",
+    "multi_news",
+    "trec",
+    "triviaqa",
+    "samsum",
+    "passage_count",
+    "passage_retrieval_en",
+    "lcc",
+    "repobench-p"
+]
+
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--results_dir', type=str, default=None)
@@ -72,48 +93,18 @@ def scorer(dataset, predictions, answers, all_classes):
         for ground_truth in ground_truths:
             score = max(score, dataset2metric[dataset](prediction, ground_truth, all_classes=all_classes))
         total_score += score
+    if len(predictions) == 0:
+        return 0.0
     return round(100 * total_score / len(predictions), 2)
 
 if __name__ == '__main__':
     args = parse_args()
     
-    dataset_list = [
-        "narrativeqa",
-        "qasper",
-        "multifieldqa_en",
-        "hotpotqa",
-        "2wikimqa",
-        "musique",
-        "gov_report",
-        "qmsum",
-        "multi_news",
-        "trec",
-        "triviaqa",
-        "samsum",
-        "passage_count",
-        "passage_retrieval_en",
-        "lcc",
-        "repobench-p"
-        ]
-    
-    results_list = [
-        ["dataset"],
-        ["FullKV"],
-        ["random"],
-        ["SnapKV"],
-        ["StreamingLLM"],
-        ["H2O"],
-        ["PyramidKV"],
-        ["CAM"],
-        ["L2Norm"],
-        ["ThinK"],
-    ]
+    results_list = [["dataset"]] + [[m] for m in methods]
     
     for dataset in dataset_list:
-        
         results_list[0].append(dataset)
-        
-        for idx, method in enumerate(["FullKV", "random", "SnapKV", "StreamingLLM", "H2O", "PyramidKV", "L2Norm","CAM","ThinK"]):
+        for idx, method in enumerate(methods):
         # for idx, method in enumerate(["H2_global", "PyramidKV_global", "local"]):
             try:
                 args.method = method
