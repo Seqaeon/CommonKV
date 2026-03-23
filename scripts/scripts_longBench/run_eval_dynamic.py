@@ -21,8 +21,9 @@ def discover_methods(results_dir: str):
 def patch_methods_list(eval_source: str, methods):
     methods_repr = "[" + ", ".join(repr(m) for m in methods) + "]"
     patterns = [
-        r"(?m)^methods\s*=\s*\[[^\]]*\]",
-        r"(?m)^methods\s*=\s*\[[^\]]*\]",
+        r"(?ms)^methods\s*=\s*\[.*?\]",
+        r"(?ms)^methods\s*:\s*list\s*=\s*\[.*?\]",
+        r"(?ms)^METHODS\s*=\s*\[.*?\]",
     ]
     for pattern in patterns:
         patched, count = re.subn(pattern, f"methods = {methods_repr}", eval_source, count=1)

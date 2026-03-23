@@ -7,8 +7,66 @@ from commonkv.modeling_mistral_svd_merge import MistralForCausalLM
 
 
 
-from commonkv.llama_model import prepare_inputs_for_generation_llama_new
-from commonkv.mistral_model import prepare_inputs_for_generation_mistral_new
+from commonkv.llama_model import (
+    prepare_inputs_for_generation_llama_new,
+    llama_attn_forward_PyramidKV,
+    llama_attn_forward_L2Norm,
+    llama_attn_forward_CAM,
+    llama_attn_forward_H2O,
+    llama_attn_forward_StreamingLLM,
+    llama_attn_forward_SnapKV,
+)
+from commonkv.mistral_model import (
+    prepare_inputs_for_generation_mistral_new,
+    mistral_attn_forward_PyramidKV,
+    mistral_attn_forward_L2Norm,
+    mistral_attn_forward_CAM,
+    mistral_attn_forward_H2O,
+    mistral_attn_forward_StreamingLLM,
+    mistral_attn_forward_SnapKV,
+)
+
+
+def _replace_llama_attention_forward(method):
+    method = method.lower()
+    attn_method_map = {
+        "pyramidkv": llama_attn_forward_PyramidKV,
+        "l2norm": llama_attn_forward_L2Norm,
+        "cam": llama_attn_forward_CAM,
+        "h2o": llama_attn_forward_H2O,
+        "streamingllm": llama_attn_forward_StreamingLLM,
+        "snapkv": llama_attn_forward_SnapKV,
+        "think": llama_attn_forward_SnapKV,
+        "palu": llama_attn_forward_SnapKV,
+        "minicache": llama_attn_forward_SnapKV,
+    }
+    forward_fn = attn_method_map.get(method)
+    if forward_fn is None:
+        return
+    transformers.models.llama.modeling_llama.LlamaAttention.forward = forward_fn
+    transformers.models.llama.modeling_llama.LlamaFlashAttention2.forward = forward_fn
+    transformers.models.llama.modeling_llama.LlamaSdpaAttention.forward = forward_fn
+
+
+def _replace_mistral_attention_forward(method):
+    method = method.lower()
+    attn_method_map = {
+        "pyramidkv": mistral_attn_forward_PyramidKV,
+        "l2norm": mistral_attn_forward_L2Norm,
+        "cam": mistral_attn_forward_CAM,
+        "h2o": mistral_attn_forward_H2O,
+        "streamingllm": mistral_attn_forward_StreamingLLM,
+        "snapkv": mistral_attn_forward_SnapKV,
+        "think": mistral_attn_forward_SnapKV,
+        "palu": mistral_attn_forward_SnapKV,
+        "minicache": mistral_attn_forward_SnapKV,
+    }
+    forward_fn = attn_method_map.get(method)
+    if forward_fn is None:
+        return
+    transformers.models.mistral.modeling_mistral.MistralAttention.forward = forward_fn
+    transformers.models.mistral.modeling_mistral.MistralFlashAttention2.forward = forward_fn
+    transformers.models.mistral.modeling_mistral.MistralSdpaAttention.forward = forward_fn
 
 
 def replace_llama(method, model_name=None):
@@ -19,6 +77,7 @@ def replace_llama(method, model_name=None):
 
     if method not in ["fullkv"]:
         transformers.models.llama.modeling_llama.LlamaForCausalLM.prepare_inputs_for_generation = prepare_inputs_for_generation_llama_new
+        _replace_llama_attention_forward(method)
 
     
 
@@ -32,3 +91,4 @@ def replace_mistral(method):
     
     if method not in ["fullkv"]:
         transformers.models.mistral.modeling_mistral.MistralForCausalLM.prepare_inputs_for_generation = prepare_inputs_for_generation_mistral_new
+        _replace_mistral_attention_forward(method)
