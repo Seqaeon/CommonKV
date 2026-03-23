@@ -1,5 +1,7 @@
 results_dir=$1  # results directory
 eval_py=${2:-eval.py}  # optional absolute/relative path to LongBench eval.py
+dynamic_methods=${3:-1}  # set to 0 to disable dynamic method patching
+script_dir="$(cd "$(dirname "$0")" && pwd)"
 
 if [ -z "${results_dir}" ]; then
     echo "Usage: sh scripts/scripts_longBench/metrics.sh <results_dir> [eval_py_path]"
@@ -13,6 +15,11 @@ if [ ! -f "${eval_py}" ]; then
     exit 1
 fi
 
-python3 "${eval_py}" \
-    --results_dir "${results_dir}"
-
+if [ "${dynamic_methods}" = "1" ]; then
+    python3 "${script_dir}/run_eval_dynamic.py" \
+        --results_dir "${results_dir}" \
+        --eval_py "${eval_py}"
+else
+    python3 "${eval_py}" \
+        --results_dir "${results_dir}"
+fi

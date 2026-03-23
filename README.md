@@ -100,6 +100,7 @@ You can pass an explicit evaluator path:
 ```bash
 sh scripts/scripts_longBench/metrics.sh <results_dir> /path/to/LongBench/eval.py
 ```
+By default, `metrics.sh` auto-detects method files present in your results directory and patches the evaluator's `methods` list for that run (to avoid `scores None` for methods you did not run). Pass a third argument `0` to disable this behavior.
 
 ## Citation
 If you find this work is useful for your research, please cite our paper:
