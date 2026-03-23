@@ -67,6 +67,22 @@ def build_chat(prompt):
         return prompt
 
 
+def resolve_effective_rank(head_wise_ranks, layer_idx, requested_rank, kv_width, warn_prefix="", log_decision=False):
+    rank_entry = head_wise_ranks.get(f"model.layers.{layer_idx}.self_attn.v_proj")
+    metadata_missing = not rank_entry
+    fallback_rank = max(1, min(requested_rank, kv_width))
+    raw_rank = fallback_rank if metadata_missing else rank_entry[0]
+    effective_rank = max(1, min(raw_rank, kv_width))
+    if effective_rank > kv_width:
+        print(f"{warn_prefix}[WARN] effective_rank={effective_rank} exceeds kv_width={kv_width}. This should never happen.")
+    if log_decision:
+        print(
+            f"{warn_prefix}layer={layer_idx}, requested_rank={requested_rank}, kv_width={kv_width}, "
+            f"effective_rank={effective_rank}, rank_source={'fallback' if metadata_missing else 'metadata'}"
+        )
+    return effective_rank, metadata_missing
+
+
 
 def main(args):
     
@@ -201,12 +217,12 @@ def main(args):
                 cache_config={"nbits": args.nbits, "backend": "HQQ","device":"cuda","residual_length":output_max_len,"axis_key":1,"q_group_size":64},
             )
 
-        batch_outputs =tokenizer.batch_decode([output[0][context_length:]], skip_special_tokens=True)
+        batch_outputs = tokenizer.batch_decode(output[:, context_length:], skip_special_tokens=True)
         batch_generations = batch_outputs
 
         torch.cuda.empty_cache()
         
-        for j in range(args.eval_batch_size):
+        for j in range(len(batch_prompts)):
             
             example = {}
             example["prompt"] = batch_prompts[j]
@@ -250,8 +266,13 @@ if __name__ == "__main__":
     parser.add_argument("--max_capacity_prompts_ratio", type=float, default=-1, help="")
     parser.add_argument("--steps", type=int, default=-1, help="maximum number of examples to evaluate per task.")
     parser.add_argument("--max_datasets", type=int, default=-1, help="maximum number of datasets to evaluate.")
-    parser.add_argument("--rank", type=int, default=4096, help="rank of up and down matrix")
+    parser.add_argument("--rank", type=int, default=1024, help="rank of up and down matrix")
     parser.add_argument("--layer_step", type=int, default=2, help="how many layers connect to one")
+    parser.add_argument(
+        "--require_head_wise_ranks",
+        action="store_true",
+        help="Fail fast if head-wise rank metadata is missing when using CommonKV.",
+    )
     
     parser.add_argument(
         "--use_chat_format", 
@@ -305,7 +326,15 @@ if __name__ == "__main__":
         layer_step = args.layer_step
 
         num_layers = len(model.model.layers)
-        head_wise_ranks = get_rank()
+        head_wise_ranks = get_rank(args.model_path)
+        if not head_wise_ranks:
+            message = (
+                "[WARN] CommonKV rank metadata is missing/empty. Using fallback rank policy: "
+                "effective_rank=max(1, min(requested_rank, kv_width))."
+            )
+            if args.require_head_wise_ranks:
+                raise ValueError(message.replace("[WARN]", "[ERROR]"))
+            print(message)
 
 
 
@@ -324,7 +353,15 @@ if __name__ == "__main__":
             offset = 0
             for i, layer in enumerate(layers):
                 current_layer_num = start_idx + i
-                current_rank = head_wise_ranks.get(f'model.layers.{current_layer_num}.self_attn.v_proj', [args.rank])[0]
+                kv_width = layer.k_proj.weight.shape[0]
+                current_rank, _ = resolve_effective_rank(
+                    head_wise_ranks=head_wise_ranks,
+                    layer_idx=current_layer_num,
+                    requested_rank=args.rank,
+                    kv_width=kv_width,
+                    warn_prefix="[CommonKV][RULER] ",
+                    log_decision=True,
+                )
 
                 cur_KVS = KVS[:current_rank]
                 sqrtSigma = torch.sqrt(torch.diag(cur_KVS))
@@ -338,7 +375,15 @@ if __name__ == "__main__":
                 layer.k_proj = None
             for i, layer in enumerate(layers):
                 current_layer_num = start_idx + i
-                current_rank = head_wise_ranks.get(f'model.layers.{current_layer_num}.self_attn.v_proj', [args.rank])[0]
+                kv_width = layer.v_proj.weight.shape[0]
+                current_rank, _ = resolve_effective_rank(
+                    head_wise_ranks=head_wise_ranks,
+                    layer_idx=current_layer_num,
+                    requested_rank=args.rank,
+                    kv_width=kv_width,
+                    warn_prefix="[CommonKV][RULER] ",
+                    log_decision=True,
+                )
 
                 cur_KVS = KVS[:current_rank]
                 sqrtSigma = torch.sqrt(torch.diag(cur_KVS))
