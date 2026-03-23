@@ -361,7 +361,7 @@ if __name__ == "__main__":
     save_dir = args.save_dir
     max_capacity_prompts = args.max_capacity_prompts
     
-    if args.dataset in [None, "all"]:
+    if args.dataset in [None, "all", ""]:
         if args.max_datasets != -1:
             datasets = datasets[:args.max_datasets]
             
@@ -376,5 +376,6 @@ if __name__ == "__main__":
         # Just run the single dataset requested by the command line
         for context_length in context_length_list:
             args.context_length = context_length
-            args.data_file = f"data/RULER/{context_length}/{args.dataset}.jsonl"
+            if not args.data_file:
+                args.data_file = f"data/RULER/{context_length}/{args.dataset}.jsonl"
             main(args)

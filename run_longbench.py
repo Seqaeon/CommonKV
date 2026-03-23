@@ -504,8 +504,8 @@ if __name__ == "__main__":
         
     max_capacity_prompts = args.max_capacity_prompts
     
-    # Only iterate if dataset is not specified or "all"
-    if args.dataset in [None, "all"]:
+    # Only iterate if dataset is not specified, empty, or "all"
+    if args.dataset in [None, "all", ""]:
         if args.max_datasets != -1:
             datasets = datasets[:args.max_datasets]
             
@@ -516,4 +516,6 @@ if __name__ == "__main__":
             main(args)
     else:
         # Just run the single dataset requested by the command line (usually from a notebook loop)
+        if not args.data_file:
+            args.data_file = f"data/LongBench/{args.dataset}.jsonl"
         main(args)
