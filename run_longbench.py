@@ -172,23 +172,10 @@ def main(args):
         all_classess.append(example["all_classes"])
         _ids.append(example["_id"])
 
-    # Load model and tokenizer here
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    if tokenizer.pad_token_id is None:
-        if tokenizer.eos_token_id is not None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-        else:
-            tokenizer.pad_token_id = 0 # Fallback to 0 if both are None
-
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        attn_implementation=args.attn_implementation,
-        trust_remote_code=True,
-        use_cache=args.use_cache
-    )
-    model.eval()
+    # Use the globally loaded model and tokenizer
+    # Removed redundant AutoTokenizer.from_pretrained and AutoModelForCausalLM.from_pretrained
+    
+    # model.eval() is already called in the global setup
     print("Finish loading model and tokenizer")
     
     model_name = args.model_path.split("/")[-1]
@@ -426,6 +413,15 @@ if __name__ == "__main__":
         attn_implementation=args.attn_implementation,
         # lrd_method=args.lrd_method
     )
+
+    # Ensure tokenizer has pad_token correctly set
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token_id is not None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+        else:
+            tokenizer.pad_token_id = 0 # Fallback to 0 if both are None
+
+    model.eval()
 
     if args.method == 'Ours':
         RANK = args.rank
