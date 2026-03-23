@@ -217,7 +217,7 @@ if __name__ == "__main__":
         layer_step=args.layer_step
     )
 
-    if args.method == 'Ours':
+    if args.method.lower() in ['commonkv', 'ours']:
         RANK = args.rank
         layer_step = args.layer_step
         num_layers = len(model.model.layers)

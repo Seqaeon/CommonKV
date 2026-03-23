@@ -8,7 +8,7 @@ model_path=$4  # model path
 quant_method=$5 # Support kivi and kvquant, default None.
 nbits=$6 # Quantization bit-width support 8,4,2. Need to set quant_method first.
 save_dir=${source_path}"results_long_bench" # path to result save_dir
-rank=4098
+rank=1024
 layer_step=4
 
 python run_longbench.py \
