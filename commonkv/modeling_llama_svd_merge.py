@@ -1374,11 +1374,17 @@ class LlamaModel(LlamaPreTrainedModel):
 
             group_k = group_avg_k[g_idx]  # shape: [B, H, S, D']
             group_v = group_avg_v[g_idx]  # shape: [B, H, S, D']
-            k_updates = group_k[b_vals, h_vals, s_vals].to(k_tensor.dtype)
-            v_updates = group_v[b_vals, h_vals, s_vals].to(v_tensor.dtype)
+            
+            target_device = k_tensor.device
+            b_vals_sync = b_vals.to(target_device)
+            h_vals_sync = h_vals.to(target_device)
+            s_vals_sync = s_vals.to(target_device)
+            
+            k_updates = group_k.to(target_device)[b_vals_sync, h_vals_sync, s_vals_sync].to(k_tensor.dtype)
+            v_updates = group_v.to(target_device)[b_vals_sync, h_vals_sync, s_vals_sync].to(v_tensor.dtype)
 
-            k_tensor[b_vals, h_vals, s_vals] = k_updates
-            v_tensor[b_vals, h_vals, s_vals] = v_updates
+            k_tensor[b_vals_sync, h_vals_sync, s_vals_sync] = k_updates
+            v_tensor[b_vals_sync, h_vals_sync, s_vals_sync] = v_updates
 
 
         if not isinstance(past_key_values, tuple):
@@ -1427,8 +1433,9 @@ class LlamaModel(LlamaPreTrainedModel):
 
             for i in range(layers_per_group):
                 layer_idx = group_idx * layers_per_group + i
-                cache_tuple[layer_idx][0][:, :, -1, :] = key_mean
-                cache_tuple[layer_idx][1][:, :, -1, :] = value_mean
+                target_device = cache_tuple[layer_idx][0].device
+                cache_tuple[layer_idx][0][:, :, -1, :] = key_mean.to(target_device)
+                cache_tuple[layer_idx][1][:, :, -1, :] = value_mean.to(target_device)
 
         new_cache = list(cache_tuple)
         if not isinstance(past_key_values, tuple):
