@@ -13,7 +13,7 @@ from commonkv.mistral_model import prepare_inputs_for_generation_mistral_new
 
 def replace_llama(method, model_name=None):
 
-    if method == "commonkv":
+    if method in ["commonkv", "ours"]:
         print("Using CommonKV!")
         transformers.models.llama.modeling_llama.LlamaForCausalLM = LlamaForCausalLM
 
@@ -25,8 +25,8 @@ def replace_llama(method, model_name=None):
 
 def replace_mistral(method):
 
-    if method == "ours":
-        print("Using ours!")
+    if method in ["commonkv", "ours"]:
+        print("Using CommonKV!")
         transformers.models.mistral.modeling_mistral.MistralForCausalLM = MistralForCausalLM
 
     

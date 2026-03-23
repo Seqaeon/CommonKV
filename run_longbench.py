@@ -399,6 +399,9 @@ if __name__ == "__main__":
     )
     
     args = parser.parse_args()
+    if args.method and args.method.lower() == "ours":
+        print("[INFO] Method alias 'ours' detected; normalizing to 'commonkv'.")
+        args.method = "commonkv"
     
     set_seed(args.seed)
     if args.quant_method == "kvquant":

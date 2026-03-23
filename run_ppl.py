@@ -12,8 +12,8 @@ from svd_utils import get_rank
 
 def load_model_and_tokenizer(model_name_or_path):
     from commonkv.monkeypatch import replace_llama, replace_mistral
-    replace_llama("ours")
-    replace_mistral("ours")
+    replace_llama("commonkv")
+    replace_mistral("commonkv")
 
     # config = AutoConfig.from_pretrained(f"{model_name_or_path}/config_{ratio}.json")
     model = AutoModelForCausalLM.from_pretrained(
