@@ -80,6 +80,10 @@ model2maxlen = {
     "mistral": 7950
 }
 
+OOM_PRONE_METHODS = {
+    "snapkv", "pyramidkv", "h2o", "cam", "l2norm", "adakv", "headkv", "streamingllm", "think", "palu", "minicache"
+}
+
 
 
 def set_seed(seed):
@@ -94,6 +98,36 @@ def set_seed(seed):
 def build_chat(prompt):
         prompt = f"[INST] {prompt} [/INST]"
         return prompt
+
+
+def resolve_effective_rank(head_wise_ranks, layer_idx, requested_rank, kv_width, warn_prefix="", log_decision=False):
+    rank_entry = head_wise_ranks.get(f"model.layers.{layer_idx}.self_attn.v_proj")
+    metadata_missing = not rank_entry
+    fallback_rank = max(1, min(requested_rank, kv_width))
+    raw_rank = fallback_rank if metadata_missing else rank_entry[0]
+    effective_rank = max(1, min(raw_rank, kv_width))
+    if effective_rank > kv_width:
+        print(f"{warn_prefix}[WARN] effective_rank={effective_rank} exceeds kv_width={kv_width}. This should never happen.")
+    if log_decision:
+        print(
+            f"{warn_prefix}layer={layer_idx}, requested_rank={requested_rank}, kv_width={kv_width}, "
+            f"effective_rank={effective_rank}, rank_source={'fallback' if metadata_missing else 'metadata'}"
+        )
+    return effective_rank, metadata_missing
+
+
+def canonicalize_method_name(method_name: str) -> str:
+    canonical_map = {
+        "fullkv": "FullKV",
+        "snapkv": "SnapKV",
+        "streamingllm": "StreamingLLM",
+        "h2o": "H2O",
+        "pyramidkv": "PyramidKV",
+        "l2norm": "L2Norm",
+        "cam": "CAM",
+        "think": "ThinK",
+    }
+    return canonical_map.get(method_name.lower(), method_name)
 
 # def build_prompt(prompt, dataset):
     
@@ -128,6 +162,13 @@ def main(args):
     for key in model2maxlen:
         if key in model_path:
             model_max_len = model2maxlen[key]
+
+    if args.method and args.method.lower() in OOM_PRONE_METHODS and model_max_len > args.max_prefill_tokens_for_custom_methods:
+        print(
+            f"[WARN] Capping prefill length from {model_max_len} to {args.max_prefill_tokens_for_custom_methods} "
+            f"for method={args.method} to avoid OOM in custom attention forward."
+        )
+        model_max_len = args.max_prefill_tokens_for_custom_methods
             
 
     
@@ -184,7 +225,11 @@ def main(args):
     os.makedirs(os.path.join(args.save_dir, f"{model_name}_{args.rank}_{args.layer_step}_v4", args.dataset),exist_ok=True)
 
     # fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}_{args.rank}", args.dataset, f"{args.method}.json"), "w")
-    fout = open(os.path.join(args.save_dir, f"{model_name}_{args.rank}_{args.layer_step}_v4", args.dataset, f"{args.method}.json"), "w")
+    output_dir = os.path.join(args.save_dir, f"{model_name}_{args.rank}_{args.layer_step}_v4", args.dataset)
+    json_output_path = os.path.join(output_dir, f"{args.method}.json")
+    pretty_json_output_path = os.path.join(output_dir, f"{args.method}.pretty.json")
+    jsonl_output_path = os.path.join(output_dir, f"{args.method}.jsonl")
+    predictions = []
      
     for i in tqdm(range(0, len(prompts), args.eval_batch_size)):
         if args.steps != -1 and i >= args.steps: break
@@ -295,7 +340,7 @@ def main(args):
                 cache_config={"nbits": args.nbits, "backend": "HQQ","device":"cuda","residual_length":output_max_len,"axis_key":1,"q_group_size":64},
             )
 
-        batch_outputs =tokenizer.batch_decode([output[0][context_length:]], skip_special_tokens=True)
+        batch_outputs = tokenizer.batch_decode(output[:, context_length:], skip_special_tokens=True)
 
         # print(f"debbug batch_outputs {batch_outputs}")
 
@@ -303,7 +348,7 @@ def main(args):
 
         torch.cuda.empty_cache()
 
-        for j in range(args.eval_batch_size):
+        for j in range(len(batch_prompts)):
 
             example = {}
 
@@ -319,8 +364,17 @@ def main(args):
             example["all_classes"] = batch_all_classes[j]
             example["_id"] = batch__ids[j]
 
-        # print(f'{batch_generations[j]}')
-        fout.write(json.dumps(example) + "\n")
+            # print(f'{batch_generations[j]}')
+            predictions.append(example)
+
+    with open(json_output_path, "w") as fout_json:
+        for example in predictions:
+            fout_json.write(json.dumps(example, ensure_ascii=False) + "\n")
+    with open(pretty_json_output_path, "w") as fout_pretty:
+        json.dump(predictions, fout_pretty, ensure_ascii=False, indent=2)
+    with open(jsonl_output_path, "w") as fout_jsonl:
+        for example in predictions:
+            fout_jsonl.write(json.dumps(example, ensure_ascii=False) + "\n")
 
 
 
@@ -352,6 +406,12 @@ if __name__ == "__main__":
     parser.add_argument("--quant_method",type=str,default=None,choices=["kivi","kvquant"])
     parser.add_argument("--nbits", type=int, default=8, help="")
     parser.add_argument("--max_capacity_prompts", type=int, default=512, help="")
+    parser.add_argument(
+        "--max_prefill_tokens_for_custom_methods",
+        type=int,
+        default=2048,
+        help="Safety cap for prompt prefill tokens on memory-heavy custom methods (snapkv/think/palu/minicache/etc.).",
+    )
     parser.add_argument("--max_capacity_prompts_ratio", type=float, default=-1, help="")
     parser.add_argument("--steps", type=int, default=-1, help="maximum number of examples to evaluate per task.")
     parser.add_argument("--max_datasets", type=int, default=-1, help="maximum number of datasets to evaluate.")
@@ -361,8 +421,13 @@ if __name__ == "__main__":
     parser.add_argument('--head_beta', type=float, default=1.01, help='hyper-parameter used on HeadKV')
     parser.add_argument("--recent_size", type=int, default=32, help="")
     parser.add_argument("--pruning_ratio", type=float, default=0.4, help="pruning ratio of Key Cache")
-    parser.add_argument("--rank", type=int, default=4096, help="rank of up and down matrix")
+    parser.add_argument("--rank", type=int, default=1024, help="rank of up and down matrix")
     parser.add_argument("--layer_step", type=int, default=2, help="how many layers connect to one")
+    parser.add_argument(
+        "--require_head_wise_ranks",
+        action="store_true",
+        help="Fail fast if head-wise rank metadata is missing when using CommonKV.",
+    )
     # parser.add_argument("--lrd_method", type=str, default="J_LRD", help="low rank decomposition method")
 
     parser.add_argument(
@@ -378,6 +443,11 @@ if __name__ == "__main__":
     )
     
     args = parser.parse_args()
+    if args.method and args.method.lower() == "ours":
+        print("[INFO] Method alias 'ours' detected; normalizing to 'commonkv'.")
+        args.method = "commonkv"
+    if args.method:
+        args.method = canonicalize_method_name(args.method)
     
     set_seed(args.seed)
     if args.quant_method == "kvquant":
@@ -430,6 +500,14 @@ if __name__ == "__main__":
 
         num_layers = len(model.model.layers)
         head_wise_ranks = get_rank(args.model_path)
+        if not head_wise_ranks:
+            message = (
+                "[WARN] CommonKV rank metadata is missing/empty. Using fallback rank policy: "
+                "effective_rank=max(1, min(requested_rank, kv_width))."
+            )
+            if args.require_head_wise_ranks:
+                raise ValueError(message.replace("[WARN]", "[ERROR]"))
+            print(message)
 
 
         def get_hadamard_matrix(r):
@@ -456,7 +534,15 @@ if __name__ == "__main__":
             offset = 0
             for i, layer in enumerate(layers):
                 current_layer_num = start_idx + i
-                current_rank = head_wise_ranks.get(f'model.layers.{current_layer_num}.self_attn.v_proj', [args.rank])[0]
+                kv_width = layer.k_proj.weight.shape[0]
+                current_rank, _ = resolve_effective_rank(
+                    head_wise_ranks=head_wise_ranks,
+                    layer_idx=current_layer_num,
+                    requested_rank=args.rank,
+                    kv_width=kv_width,
+                    warn_prefix="[CommonKV][LongBench] ",
+                    log_decision=True,
+                )
 
                 cur_KVS = KVS[:current_rank]
                 sqrtSigma = torch.sqrt(torch.diag(cur_KVS))
@@ -470,7 +556,15 @@ if __name__ == "__main__":
                 layer.k_proj = None
             for i, layer in enumerate(layers):
                 current_layer_num = start_idx + i
-                current_rank = head_wise_ranks.get(f'model.layers.{current_layer_num}.self_attn.v_proj', [args.rank])[0]
+                kv_width = layer.v_proj.weight.shape[0]
+                current_rank, _ = resolve_effective_rank(
+                    head_wise_ranks=head_wise_ranks,
+                    layer_idx=current_layer_num,
+                    requested_rank=args.rank,
+                    kv_width=kv_width,
+                    warn_prefix="[CommonKV][LongBench] ",
+                    log_decision=True,
+                )
 
                 cur_KVS = KVS[:current_rank]
                 sqrtSigma = torch.sqrt(torch.diag(cur_KVS))
