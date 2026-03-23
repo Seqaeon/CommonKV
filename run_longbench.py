@@ -216,6 +216,7 @@ def main(args):
     # fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}_{args.rank}", args.dataset, f"{args.method}.json"), "w")
     output_dir = os.path.join(args.save_dir, f"{model_name}_{args.rank}_{args.layer_step}_v4", args.dataset)
     json_output_path = os.path.join(output_dir, f"{args.method}.json")
+    pretty_json_output_path = os.path.join(output_dir, f"{args.method}.pretty.json")
     jsonl_output_path = os.path.join(output_dir, f"{args.method}.jsonl")
     predictions = []
      
@@ -355,8 +356,11 @@ def main(args):
             # print(f'{batch_generations[j]}')
             predictions.append(example)
 
-    with open(json_output_path, "w") as fout:
-        json.dump(predictions, fout, ensure_ascii=False)
+    with open(json_output_path, "w") as fout_json:
+        for example in predictions:
+            fout_json.write(json.dumps(example, ensure_ascii=False) + "\n")
+    with open(pretty_json_output_path, "w") as fout_pretty:
+        json.dump(predictions, fout_pretty, ensure_ascii=False, indent=2)
     with open(jsonl_output_path, "w") as fout_jsonl:
         for example in predictions:
             fout_jsonl.write(json.dumps(example, ensure_ascii=False) + "\n")

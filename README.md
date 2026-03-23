@@ -93,7 +93,9 @@ sh scripts/scripts_ruler/eval.sh
 If you encounter configuration issues while running the program using the llama 3.1-8B model, you can try replacing the config.json file in this project with one in the model weights folder.
 
 For LongBench metric calculation, this repo expects an `eval.py` script (official LongBench evaluator) to be available in the working directory used by `scripts/scripts_longBench/metrics.sh`.
-`run_longbench.py` writes a valid JSON array to `*.json` and also emits a line-delimited companion `*.jsonl` file for convenience/debugging.
+`run_longbench.py` keeps `*.json` as line-delimited JSON records (for evaluator compatibility), and also emits:
+- `*.jsonl` (same line-delimited content),
+- `*.pretty.json` (human-readable JSON array for easy inspection).
 You can pass an explicit evaluator path:
 ```bash
 sh scripts/scripts_longBench/metrics.sh <results_dir> /path/to/LongBench/eval.py
