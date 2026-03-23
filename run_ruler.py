@@ -83,6 +83,20 @@ def resolve_effective_rank(head_wise_ranks, layer_idx, requested_rank, kv_width,
     return effective_rank, metadata_missing
 
 
+def canonicalize_method_name(method_name: str) -> str:
+    canonical_map = {
+        "fullkv": "FullKV",
+        "snapkv": "SnapKV",
+        "streamingllm": "StreamingLLM",
+        "h2o": "H2O",
+        "pyramidkv": "PyramidKV",
+        "l2norm": "L2Norm",
+        "cam": "CAM",
+        "think": "ThinK",
+    }
+    return canonical_map.get(method_name.lower(), method_name)
+
+
 
 def main(args):
     
@@ -141,7 +155,10 @@ def main(args):
     model_name = args.model_path.split("/")[-1]
 
     os.makedirs(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", str(args.context_length), args.dataset), exist_ok=True)
-    fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", str(args.context_length), args.dataset, f"{args.method}.json"), "w")
+    output_dir = os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", str(args.context_length), args.dataset)
+    json_output_path = os.path.join(output_dir, f"{args.method}.json")
+    jsonl_output_path = os.path.join(output_dir, f"{args.method}.jsonl")
+    predictions = []
     
     for i in tqdm(range(0, len(prompt_list), args.eval_batch_size)):
         if args.steps != -1 and i >= args.steps: break
@@ -231,7 +248,13 @@ def main(args):
             example["pred"] = batch_generations[j]
             example["length"] = batch_lengths[j]
 
-            fout.write(json.dumps(example) + "\n")
+            predictions.append(example)
+
+    with open(json_output_path, "w") as fout:
+        json.dump(predictions, fout, ensure_ascii=False)
+    with open(jsonl_output_path, "w") as fout_jsonl:
+        for example in predictions:
+            fout_jsonl.write(json.dumps(example, ensure_ascii=False) + "\n")
     
     
 
@@ -290,6 +313,8 @@ if __name__ == "__main__":
     if args.method and args.method.lower() == "ours":
         print("[INFO] Method alias 'ours' detected; normalizing to 'commonkv'.")
         args.method = "commonkv"
+    if args.method:
+        args.method = canonicalize_method_name(args.method)
     
     set_seed(args.seed)
     if args.quant_method == "kvquant":
