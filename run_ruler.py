@@ -217,12 +217,12 @@ def main(args):
                 cache_config={"nbits": args.nbits, "backend": "HQQ","device":"cuda","residual_length":output_max_len,"axis_key":1,"q_group_size":64},
             )
 
-        batch_outputs =tokenizer.batch_decode([output[0][context_length:]], skip_special_tokens=True)
+        batch_outputs = tokenizer.batch_decode(output[:, context_length:], skip_special_tokens=True)
         batch_generations = batch_outputs
 
         torch.cuda.empty_cache()
         
-        for j in range(args.eval_batch_size):
+        for j in range(len(batch_prompts)):
             
             example = {}
             example["prompt"] = batch_prompts[j]
