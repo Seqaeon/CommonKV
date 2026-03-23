@@ -1,6 +1,7 @@
 import os
 import json
 import argparse
+import glob
 import numpy as np
 
 from metrics import (
@@ -60,9 +61,29 @@ dataset_list = [
     "repobench-p"
 ]
 
+def discover_methods_and_datasets(results_dir: str):
+    methods = set()
+    datasets = set()
+    dataset_dirs = [d for d in glob.glob(os.path.join(results_dir, "*")) if os.path.isdir(d)]
+    for dataset_dir in dataset_dirs:
+        dataset_name = os.path.basename(dataset_dir)
+        has_jsons = False
+        for fp in glob.glob(os.path.join(dataset_dir, "*.json")):
+            name = os.path.basename(fp)
+            if name == "metrics.json" or name.endswith(".pretty.json"):
+                continue
+            if os.path.getsize(fp) > 0:
+                methods.add(name[:-5])
+                has_jsons = True
+        if has_jsons:
+            datasets.add(dataset_name)
+    return sorted(methods), sorted(datasets)
+
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--results_dir', type=str, default=None)
+    parser.add_argument('--methods', type=str, default=None, help="Comma-separated list of methods to evaluate")
+    parser.add_argument('--datasets', type=str, default=None, help="Comma-separated list of datasets to evaluate")
     parser.add_argument('--longbench_e', action='store_true', help="Evaluate on LongBench-E")
     return parser.parse_args(args)
 
@@ -100,32 +121,43 @@ def scorer(dataset, predictions, answers, all_classes):
 if __name__ == '__main__':
     args = parse_args()
     
+    # Discovery / Argument handling
+    discovered_methods, discovered_datasets = discover_methods_and_datasets(args.results_dir)
+    
+    if args.methods:
+        methods = [m.strip() for m in args.methods.split(",")]
+    else:
+        # If the global 'methods' list looks unpatched/legacy, use discovered ones
+        legacy_methods = ["FullKV", "random", "SnapKV", "StreamingLLM", "H2O", "PyramidKV", "L2Norm","CAM","ThinK"]
+        if methods == legacy_methods:
+            methods = discovered_methods
+            
+    if args.datasets:
+        dataset_list = [d.strip() for d in args.datasets.split(",")]
+    else:
+        # If the global 'dataset_list' looks unpatched/legacy and we found others, prefer found
+        if len(discovered_datasets) > 0:
+            dataset_list = discovered_datasets
+
+    print(f"Datasets to evaluate: {dataset_list}")
+    print(f"Methods to evaluate: {methods}")
+
     results_list = [["dataset"]] + [[m] for m in methods]
     
     for dataset in dataset_list:
         results_list[0].append(dataset)
+        
         for idx, method in enumerate(methods):
-        # for idx, method in enumerate(["H2_global", "PyramidKV_global", "local"]):
             try:
                 args.method = method
                 args.dataset = dataset
-                args.eval_file = os.path.join(args.results_dir,dataset,f"{method}.json")
+                args.eval_file = os.path.join(args.results_dir, dataset, f"{method}.json")
                 
-                # try:
-                
-                scores = dict()
-                # if args.longbench_e:
-                #     path = f"pred_e/{args.model}/"
-                # else:
-                #     path = f"pred_e/{args.model}/"
-                # all_files = os.listdir(path)
-                # print("Evaluating on:", all_files)
-                
-                # for filename in all_files:
-                    # if not filename.endswith("jsonl"):
-                    #     continue
+                if not os.path.exists(args.eval_file) or os.path.getsize(args.eval_file) == 0:
+                    results_list[idx+1].append(-1)
+                    continue
+
                 predictions, answers, lengths = [], [], []
-                # dataset = filename.split('.')[0]
                 with open(args.eval_file, "r", encoding="utf-8") as f:
                     for line in f:
                         try:
@@ -135,41 +167,31 @@ if __name__ == '__main__':
                             all_classes = data["all_classes"]
                             if "length" in data:
                                 lengths.append(data["length"])
-                        except:
-                            print("error")
+                        except Exception:
+                            continue
+
+                if len(predictions) == 0:
+                    results_list[idx+1].append(-1)
+                    continue
+
                 if args.longbench_e:
                     score = scorer_e(args.dataset, predictions, answers, lengths, all_classes)
                 else:
                     score = scorer(args.dataset, predictions, answers, all_classes)
-                    if args.dataset == 'qasper':
-                        score_e = scorer_e(args.dataset, predictions, answers, lengths, all_classes)
-                scores[args.dataset] = score
-                    # if dataset == 'qasper':
-                    #     scores[dataset + '_e'] = score_e
                     
-                # if args.longbench_e:
-                #     out_path = f"H2O/results/{args.model}/result.json"
-                # else:
-                #     out_path = f"H2O/results/{args.model}/result.json"
-                    # out_path_e = f"pred/{args.model}/result_e.json"
-                    # with open(out_path_e, "w") as f:
-                    #     json.dump(score_e, f, ensure_ascii=False, indent=4)
-                    
-                output_dir = os.path.dirname(args.eval_file)
-                
                 results_list[idx+1].append(score)
                 
+                scores = {args.dataset: score}
+                output_dir = os.path.dirname(args.eval_file)
                 with open(os.path.join(output_dir, "metrics.json"), "w") as f:
                     json.dump(scores, f, ensure_ascii=False, indent=4)
             
                 print(f"dataset {args.dataset} method {args.method} scores {scores}")
-            except:
-                
+            except Exception as e:
                 results_list[idx+1].append(-1)
-                
-                print(f"dataset {args.dataset} method {args.method} scores {None}")
+                print(f"dataset {args.dataset} method {args.method} scores {None} (Error: {e})")
                 
     import csv
-    with open(os.path.join(args.results_dir,f"results.csv"), 'w') as fp:
+    with open(os.path.join(args.results_dir, f"results.csv"), 'w') as fp:
         writer = csv.writer(fp)
         writer.writerows(results_list)
