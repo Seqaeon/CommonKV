@@ -456,7 +456,7 @@ if __name__ == "__main__":
             offset = 0
             for i, layer in enumerate(layers):
                 current_layer_num = start_idx + i
-                current_rank = head_wise_ranks[f'model.layers.{current_layer_num}.self_attn.v_proj'][0]
+                current_rank = head_wise_ranks.get(f'model.layers.{current_layer_num}.self_attn.v_proj', [args.rank])[0]
 
                 cur_KVS = KVS[:current_rank]
                 sqrtSigma = torch.sqrt(torch.diag(cur_KVS))
@@ -470,7 +470,7 @@ if __name__ == "__main__":
                 layer.k_proj = None
             for i, layer in enumerate(layers):
                 current_layer_num = start_idx + i
-                current_rank = head_wise_ranks[f'model.layers.{current_layer_num}.self_attn.v_proj'][0]
+                current_rank = head_wise_ranks.get(f'model.layers.{current_layer_num}.self_attn.v_proj', [args.rank])[0]
 
                 cur_KVS = KVS[:current_rank]
                 sqrtSigma = torch.sqrt(torch.diag(cur_KVS))
