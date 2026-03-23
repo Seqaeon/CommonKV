@@ -360,8 +360,8 @@ class LlamaAttention(nn.Module):
         self.is_causal = True
 
         self.rank = self.config.rank
-        self.k_rank = self.config.head_wise_ranks[f'model.layers.{layer_idx}.self_attn.v_proj'][0]
-        self.v_rank = self.config.head_wise_ranks[f'model.layers.{layer_idx}.self_attn.v_proj'][0]
+        self.k_rank = self.config.head_wise_ranks.get(f'model.layers.{layer_idx}.self_attn.v_proj', [self.rank])[0]
+        self.v_rank = self.config.head_wise_ranks.get(f'model.layers.{layer_idx}.self_attn.v_proj', [self.rank])[0]
         # self.k_rank = 512
         # self.v_rank = 512
         # self.lrd_method = self.config.lrd_method
