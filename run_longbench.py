@@ -184,6 +184,7 @@ def main(args):
      
     for i in tqdm(range(0, len(prompts), args.eval_batch_size)):
         if args.steps != -1 and i >= args.steps: break
+        batch_prompts = prompts[i:i+args.eval_batch_size]
         batch_inputs = inputs[i:i+args.eval_batch_size]
         batch_contexts = contexts[i:i+args.eval_batch_size]
         batch_answerss = answerss[i:i+args.eval_batch_size]
@@ -393,7 +394,7 @@ if __name__ == "__main__":
     config = AutoConfig.from_pretrained(args.model_path, use_cache=args.use_cache)
     config.rank = args.rank
     config.layer_step = args.layer_step
-    if args.method.lower() == 'ours':
+    if args.method.lower() in ['ours', 'commonkv']:
         config.head_wise_ranks = get_rank(args.model_path)
     else:
         # Avoid crashing entirely on other methods if the attribute is accidentally probed
