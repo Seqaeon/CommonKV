@@ -37,7 +37,7 @@ model_path=$4
 quant_method=$5 
 nbits=$6 
 save_dir=${source_path}"results_long_bench" 
-rank=4098
+rank=1024
 layer_step=4
 
 python run_longbench.py \
@@ -63,7 +63,7 @@ model_path=$4
 quant_method=$5 
 nbits=$6 
 save_dir=${result_path}"results_ruler" 
-rank=4096
+rank=1024
 layer_step=4
 
 python3 run_ruler.py \
@@ -80,6 +80,7 @@ python3 run_ruler.py \
 * CUDA_VISIBLE_DEVICES: For multi-GPU inference for big LLMs, just need to specify CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7. For single GPU inference, just need to specify CUDA_VISIBLE_DEVICES=0.
 * model_path: Path to your model. Support "Llama-3.1-8B-Instruct" and "Mistral-7B-Instruct-v0.2" for now.
 * save_dir: Path to your dir to save LongBench result.
+* rank: Keep this `<=` each layer's KV output width (`num_key_value_heads * head_dim`) to avoid KV cache expansion/OOM.
 
 After modifying parameters, run:
 
