@@ -214,8 +214,14 @@ class MistralAttention(nn.Module):
         self.is_causal = True
 
         self.rank = self.config.rank
-        self.k_rank = self.config.head_wise_ranks.get(f'model.layers.{layer_idx}.self_attn.v_proj', [self.rank])[0]
-        self.v_rank = self.config.head_wise_ranks.get(f'model.layers.{layer_idx}.self_attn.v_proj', [self.rank])[0]
+        kv_width = self.num_key_value_heads * self.head_dim
+        fallback_rank = max(1, min(self.rank, kv_width))
+        self.k_rank = self.config.head_wise_ranks.get(
+            f'model.layers.{layer_idx}.self_attn.v_proj', [fallback_rank]
+        )[0]
+        self.v_rank = self.config.head_wise_ranks.get(
+            f'model.layers.{layer_idx}.self_attn.v_proj', [fallback_rank]
+        )[0]
 
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
