@@ -117,7 +117,7 @@ def main(args):
     lengths = []
     dataset_names = []
     languages = []
-    all_classess = []
+    all_classes = []
     _ids = []
     
     input_max_len = 0
@@ -169,7 +169,7 @@ def main(args):
         lengths.append(example["length"])
         dataset_names.append(example["dataset"])
         languages.append(example["language"])
-        all_classess.append(example["all_classes"])
+        all_classes.append(example["all_classes"])
         _ids.append(example["_id"])
 
     # Use the globally loaded model and tokenizer
@@ -196,7 +196,7 @@ def main(args):
         
         batch_datasets = dataset_names[i:i+args.eval_batch_size]
         batch_languages = languages[i:i+args.eval_batch_size]
-        batch_all_classess = all_classess[i:i+args.eval_batch_size]
+        batch_all_classes = all_classes[i:i+args.eval_batch_size]
         batch__ids = _ids[i:i+args.eval_batch_size]
         
         tokenized_prompts = tokenizer(batch_prompts, padding="longest", return_tensors="pt", add_special_tokens=True).to('cuda')
@@ -316,7 +316,7 @@ def main(args):
 
             example["dataset"] = batch_datasets[j]
             example["language"] = batch_languages[j]
-            example["all_classes"] = batch_all_classess[j]
+            example["all_classes"] = batch_all_classes[j]
             example["_id"] = batch__ids[j]
 
         # print(f'{batch_generations[j]}')
