@@ -183,8 +183,7 @@ def main(args):
     fout = open(os.path.join(args.save_dir, f"{model_name}_{args.rank}_{args.layer_step}_v4", args.dataset, f"{args.method}.json"), "w")
      
     for i in tqdm(range(0, len(prompts), args.eval_batch_size)):
-        if i == 50: break
-        batch_prompts = prompts[i:i+args.eval_batch_size]
+        if args.steps != -1 and i >= args.steps: break
         batch_inputs = inputs[i:i+args.eval_batch_size]
         batch_contexts = contexts[i:i+args.eval_batch_size]
         batch_answerss = answerss[i:i+args.eval_batch_size]
@@ -350,6 +349,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_capacity_prompts", type=int, default=512, help="")
     parser.add_argument("--max_capacity_prompts_ratio", type=float, default=-1, help="")
     parser.add_argument("--steps", type=int, default=-1, help="maximum number of examples to evaluate per task.")
+    parser.add_argument("--max_datasets", type=int, default=-1, help="maximum number of datasets to evaluate.")
     parser.add_argument("--merge", type=str, default=None, help="kv merge method(look-m)")
     parser.add_argument('--floor', type=float, default=0.2, help='hyper-parameter used in AdaKV')
     parser.add_argument('--head_path', type=str, default='./data/heads_score/Meta-Llama-3-8B-Instruct_retrieval_reasoning_heads.json', help='Path to head score (HeadKV)')
@@ -486,6 +486,9 @@ if __name__ == "__main__":
         
     max_capacity_prompts = args.max_capacity_prompts
     
+    if args.max_datasets != -1:
+        datasets = datasets[:args.max_datasets]
+        
     for idx, dataset in enumerate(datasets):
         
         print(f"Working on max_capacity_prompts {args.max_capacity_prompts} dataset {dataset} - {idx}/{len(datasets)}")

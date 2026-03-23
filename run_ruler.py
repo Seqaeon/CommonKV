@@ -127,8 +127,7 @@ def main(args):
     fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", str(args.context_length), args.dataset, f"{args.method}.json"), "w")
     
     for i in tqdm(range(0, len(prompt_list), args.eval_batch_size)):
-        if i >= 200: break
-        batch_prompts = prompt_list[i:i+args.eval_batch_size]
+        if args.steps != -1 and i >= args.steps: break
         batch_inputs = input_list[i:i+args.eval_batch_size]
         batch_answers = outputs_list[i:i+args.eval_batch_size]
         batch_lengths = length_list[i:i+args.eval_batch_size]
@@ -248,6 +247,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_capacity_prompts", type=int, default=512, help="")
     parser.add_argument("--max_capacity_prompts_ratio", type=float, default=-1, help="")
     parser.add_argument("--steps", type=int, default=-1, help="maximum number of examples to evaluate per task.")
+    parser.add_argument("--max_datasets", type=int, default=-1, help="maximum number of datasets to evaluate.")
     parser.add_argument("--rank", type=int, default=4096, help="rank of up and down matrix")
     parser.add_argument("--layer_step", type=int, default=2, help="how many layers connect to one")
     
@@ -359,6 +359,9 @@ if __name__ == "__main__":
     save_dir = args.save_dir
     max_capacity_prompts = args.max_capacity_prompts
     
+    if args.max_datasets != -1:
+        datasets = datasets[:args.max_datasets]
+        
     for context_length in context_length_list:
         for idx, dataset in enumerate(datasets):
 
