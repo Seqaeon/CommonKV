@@ -30,7 +30,7 @@ Please refer to `scripts/scripts_longBench/eval.sh` and `scripts/scripts_ruler/e
 export CUDA_VISIBLE_DEVICES=$1
 
 method=$2 
-max_capacity_prompts=8950 
+max_capacity_prompts=2048 
 attn_implementation=eager 
 source_path=$3  
 model_path=$4 
@@ -81,6 +81,7 @@ python3 run_ruler.py \
 * model_path: Path to your model. Support "Llama-3.1-8B-Instruct" and "Mistral-7B-Instruct-v0.2" for now.
 * save_dir: Path to your dir to save LongBench result.
 * rank: Keep this `<=` each layer's KV output width (`num_key_value_heads * head_dim`) to avoid KV cache expansion/OOM.
+* For SnapKV/ThinK/PALU/MiniCache-like custom attention methods on 14-16GB GPUs, start with `max_capacity_prompts=2048` and increase only if memory allows.
 
 After modifying parameters, run:
 

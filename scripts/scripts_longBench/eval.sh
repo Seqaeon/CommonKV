@@ -1,7 +1,7 @@
 export CUDA_VISIBLE_DEVICES=$1
 
 method=$2 # Support FullKV, CommonKV
-max_capacity_prompts=8950 # 128,2048 in paper
+max_capacity_prompts=2048 # safer default for 14-16GB GPUs; 128/2048 in paper
 attn_implementation=eager # Support "eager".
 source_path=$3  # path for saving results
 model_path=$4  # model path

@@ -80,6 +80,10 @@ model2maxlen = {
     "mistral": 7950
 }
 
+OOM_PRONE_METHODS = {
+    "snapkv", "pyramidkv", "h2o", "cam", "l2norm", "adakv", "headkv", "streamingllm", "think", "palu", "minicache"
+}
+
 
 
 def set_seed(seed):
@@ -158,6 +162,13 @@ def main(args):
     for key in model2maxlen:
         if key in model_path:
             model_max_len = model2maxlen[key]
+
+    if args.method and args.method.lower() in OOM_PRONE_METHODS and model_max_len > args.max_prefill_tokens_for_custom_methods:
+        print(
+            f"[WARN] Capping prefill length from {model_max_len} to {args.max_prefill_tokens_for_custom_methods} "
+            f"for method={args.method} to avoid OOM in custom attention forward."
+        )
+        model_max_len = args.max_prefill_tokens_for_custom_methods
             
 
     
@@ -395,6 +406,12 @@ if __name__ == "__main__":
     parser.add_argument("--quant_method",type=str,default=None,choices=["kivi","kvquant"])
     parser.add_argument("--nbits", type=int, default=8, help="")
     parser.add_argument("--max_capacity_prompts", type=int, default=512, help="")
+    parser.add_argument(
+        "--max_prefill_tokens_for_custom_methods",
+        type=int,
+        default=2048,
+        help="Safety cap for prompt prefill tokens on memory-heavy custom methods (snapkv/think/palu/minicache/etc.).",
+    )
     parser.add_argument("--max_capacity_prompts_ratio", type=float, default=-1, help="")
     parser.add_argument("--steps", type=int, default=-1, help="maximum number of examples to evaluate per task.")
     parser.add_argument("--max_datasets", type=int, default=-1, help="maximum number of datasets to evaluate.")
