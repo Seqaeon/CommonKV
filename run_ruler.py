@@ -151,7 +151,7 @@ def main(args):
             max_capacity_prompts = round(batch_input_ids.shape[1] * args.max_capacity_prompts_ratio)
         
         
-        if args.method.lower() not in ["fullkv", "ours"] :
+        if args.method.lower() not in ["fullkv", "ours", "commonkv"] :
             if args.method.lower() in ["snapkv","pyramidkv","h2o","cam", "l2norm", "think", "palu", "minicache"]:
                 window_sizes = 8
             elif args.method.lower() in ["streamingllm"]:
@@ -366,7 +366,7 @@ if __name__ == "__main__":
     for context_length in context_length_list:
         for idx, dataset in enumerate(datasets):
 
-            print(f"Working on context length {context_length}, max_capacity_prompts: {args.max_capacity_prompts}, dataset: {dataset} - {idx}/{len(datasets)}")
+            print(f"Working on max_capacity_prompts {args.max_capacity_prompts} dataset {dataset} - {idx+1}/{len(datasets)}")
             args.context_length = context_length
             args.dataset = dataset
             args.data_file = f"data/RULER/{context_length}/{args.dataset}.jsonl"
