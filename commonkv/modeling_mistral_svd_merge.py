@@ -304,15 +304,15 @@ class MistralAttention(nn.Module):
         query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
         # time_list.append(time.time() - start_time)
 
-        key_states = self.k_down_proj(key_up_states.squeeze(2))
+        key_states = self.k_down_proj(key_up_states)
         # time_list.append(time.time() - start_time)
 
-        key_states = key_states.view(bsz, kv_seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         # time_list.append(time.time() - start_time)
 
         # key_cos, key_sin = self.rotary_emb(value_states, key_position_ids)
         key_states = apply_rotary_pos_emb_single(key_states, cos, sin, key_position_ids)
-        value_states = self.v_down_proj(value_up_states.squeeze(2))
+        value_states = self.v_down_proj(value_up_states)
 
         # if past_key_value is not None:  # 暂时加入
         #     # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -337,7 +337,8 @@ class MistralAttention(nn.Module):
         # 矩阵不融合
         # value_states = self.v_down_proj(value_up_states.squeeze(2))
         # value_states = value_up_states.squeeze(2)
-        value_states = value_states.view(bsz, kv_seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = self.v_down_proj(value_up_states)
+        value_states = value_states.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
         attn_output = torch.matmul(attn_weights, value_states)
 
@@ -922,8 +923,12 @@ class MistralModel(MistralPreTrainedModel):
             # group_avg_v.append(self.multi_slerp_stack(group_values))
 
             # weighted avg
-            group_avg_k.append((torch.stack(group_keys, dim=0) * weights).sum(dim=0))
-            group_avg_v.append((torch.stack(group_values, dim=0) * weights).sum(dim=0))
+            # Ensure all tensors in the group are on the same device before stacking
+            synced_group_keys = [k.to(device) for k in group_keys]
+            synced_group_values = [v.to(device) for v in group_values]
+            
+            group_avg_k.append((torch.stack(synced_group_keys, dim=0) * weights).sum(dim=0))
+            group_avg_v.append((torch.stack(synced_group_values, dim=0) * weights).sum(dim=0))
 
 
         new_cache = list(cache_tuple)

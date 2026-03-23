@@ -121,7 +121,8 @@ def main(args):
         index_list.append(example["index"])
 
     print("Finish loading model and tokenizer")
-    model_name = model_path.split("/")[-1]
+    # Restore original casing for model_name
+    model_name = args.model_path.split("/")[-1]
 
     os.makedirs(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", str(args.context_length), args.dataset), exist_ok=True)
     fout = open(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", str(args.context_length), args.dataset, f"{args.method}.json"), "w")
@@ -360,15 +361,20 @@ if __name__ == "__main__":
     save_dir = args.save_dir
     max_capacity_prompts = args.max_capacity_prompts
     
-    if args.max_datasets != -1:
-        datasets = datasets[:args.max_datasets]
-        
-    for context_length in context_length_list:
-        for idx, dataset in enumerate(datasets):
-
-            print(f"Working on max_capacity_prompts {args.max_capacity_prompts} dataset {dataset} - {idx+1}/{len(datasets)}")
+    if args.dataset in [None, "all"]:
+        if args.max_datasets != -1:
+            datasets = datasets[:args.max_datasets]
+            
+        for context_length in context_length_list:
+            for idx, dataset in enumerate(datasets):
+                print(f"Working on max_capacity_prompts {args.max_capacity_prompts} dataset {dataset} - {idx+1}/{len(datasets)}")
+                args.context_length = context_length
+                args.dataset = dataset
+                args.data_file = f"data/RULER/{context_length}/{args.dataset}.jsonl"
+                main(args)
+    else:
+        # Just run the single dataset requested by the command line
+        for context_length in context_length_list:
             args.context_length = context_length
-            args.dataset = dataset
             args.data_file = f"data/RULER/{context_length}/{args.dataset}.jsonl"
-
             main(args)

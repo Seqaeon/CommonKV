@@ -465,9 +465,8 @@ class LlamaAttention(nn.Module):
 
         query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
 
-        key_states = self.k_down_proj(key_up_states.squeeze(2))
-
-        key_states = key_states.view(bsz, kv_seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        key_states = self.k_down_proj(key_up_states)
+        key_states = key_states.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         key_states = apply_rotary_pos_emb_single(key_states, cos, sin, key_position_ids)
         if self.layer_idx == test_layer:
@@ -494,9 +493,9 @@ class LlamaAttention(nn.Module):
         # attn_output = self.o_proj(attn_output)
 
         # matrix no merge
-        value_states = self.v_down_proj(value_up_states.squeeze(2))
+        value_states = self.v_down_proj(value_up_states)
         # value_states = value_up_states.squeeze(2)
-        value_states = value_states.view(bsz, kv_seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         attn_output = torch.matmul(attn_weights, value_states)
@@ -880,9 +879,12 @@ class LlamaDecoderLayer(nn.Module):
         if layer_idx != mapped_layer:
             return past_key_values
         k_list = [past_key_values[layer_idx][0], past_key_values[layer_idx - 1][0], past_key_values[layer_idx - 2][0], past_key_values[layer_idx - 3][0]]
-        past_key_values.key_cache[test_layer] = torch.mean(torch.stack(k_list, dim=0), dim=0)
         v_list = [past_key_values[layer_idx][1], past_key_values[layer_idx - 1][1], past_key_values[layer_idx - 2][1], past_key_values[layer_idx - 3][1]]
-        past_key_values.value_cache[test_layer] = torch.mean(torch.stack(v_list, dim=0), dim=0)
+        device = k_list[0].device
+        synced_k_list = [t.to(device) for t in k_list]
+        synced_v_list = [t.to(device) for t in v_list]
+        past_key_values.key_cache[test_layer] = torch.mean(torch.stack(synced_k_list, dim=0), dim=0)
+        past_key_values.value_cache[test_layer] = torch.mean(torch.stack(synced_v_list, dim=0), dim=0)
 
         return past_key_values
 
@@ -1146,7 +1148,9 @@ class LlamaModel(LlamaPreTrainedModel):
         return out * interp_norm
 
     def multi_slerp_stack(self, tensor_list):
-        stacked = torch.stack(tensor_list, dim=0)
+        device = tensor_list[0].device
+        synced_list = [t.to(device) for t in tensor_list]
+        stacked = torch.stack(synced_list, dim=0)
         result = stacked[0]
         for i in range(1, stacked.shape[0]):
             result = self.slerp(result, stacked[i], t=1.0 / (i + 1))
@@ -1154,7 +1158,9 @@ class LlamaModel(LlamaPreTrainedModel):
 
     def slerp_merge_rows_batch(self, tensor_list, t=0.5, gamma=0.05):
         # Stack all tensors along a new dimension (num_tensors, 1, 1, L, d)
-        stacked = torch.stack(tensor_list, dim=0)
+        device = tensor_list[0].device
+        synced_list = [t.to(device) for t in tensor_list]
+        stacked = torch.stack(synced_list, dim=0)
 
         # Compute row-wise norms for each tensor => shape (num_tensors, 1, 1, L, 1)
         norms = torch.norm(stacked, dim=-1, keepdim=True)
@@ -1323,8 +1329,12 @@ class LlamaModel(LlamaPreTrainedModel):
 
 
             # Weighted Average
-            group_avg_k.append((torch.stack(group_keys, dim=0) * weights).sum(dim=0))
-            group_avg_v.append((torch.stack(group_values, dim=0) * weights).sum(dim=0))
+            # Ensure all tensors in the group are on the same device before stacking
+            synced_group_keys = [k.to(device) for k in group_keys]
+            synced_group_values = [v.to(device) for v in group_values]
+            
+            group_avg_k.append((torch.stack(synced_group_keys, dim=0) * weights).sum(dim=0))
+            group_avg_v.append((torch.stack(synced_group_values, dim=0) * weights).sum(dim=0))
             # deep layer as merge result
             # group_avg_k.append(group_keys[3])
             # group_avg_v.append(group_values[3])
@@ -1408,8 +1418,12 @@ class LlamaModel(LlamaPreTrainedModel):
                 key_tensors.append(key_last)
                 value_tensors.append(value_last)
 
-            key_mean = torch.stack(key_tensors, dim=0).mean(dim=0)
-            value_mean = torch.stack(value_tensors, dim=0).mean(dim=0)
+            device = key_tensors[0].device
+            synced_key_tensors = [t.to(device) for t in key_tensors]
+            synced_value_tensors = [t.to(device) for t in value_tensors]
+            
+            key_mean = torch.stack(synced_key_tensors, dim=0).mean(dim=0)
+            value_mean = torch.stack(synced_value_tensors, dim=0).mean(dim=0)
 
             for i in range(layers_per_group):
                 layer_idx = group_idx * layers_per_group + i

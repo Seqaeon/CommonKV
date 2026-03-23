@@ -172,9 +172,26 @@ def main(args):
         all_classess.append(example["all_classes"])
         _ids.append(example["_id"])
 
+    # Load model and tokenizer here
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token_id is not None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+        else:
+            tokenizer.pad_token_id = 0 # Fallback to 0 if both are None
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        attn_implementation=args.attn_implementation,
+        trust_remote_code=True,
+        use_cache=args.use_cache
+    )
+    model.eval()
     print("Finish loading model and tokenizer")
     
-    model_name = model_path.split("/")[-1]
+    model_name = args.model_path.split("/")[-1]
 
     # os.makedirs(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}_{args.rank}", args.dataset), exist_ok=True)
     os.makedirs(os.path.join(args.save_dir, f"{model_name}_{args.rank}_{args.layer_step}_v4", args.dataset),exist_ok=True)
@@ -487,15 +504,16 @@ if __name__ == "__main__":
         
     max_capacity_prompts = args.max_capacity_prompts
     
-    if args.max_datasets != -1:
-        datasets = datasets[:args.max_datasets]
-        
-    for idx, dataset in enumerate(datasets):
-        
-        print(f"Working on max_capacity_prompts {args.max_capacity_prompts} dataset {dataset} - {idx+1}/{len(datasets)}")
-        
-        args.dataset = dataset
-        
-        args.data_file = f"data/LongBench/{args.dataset}.jsonl"
-        
+    # Only iterate if dataset is not specified or "all"
+    if args.dataset in [None, "all"]:
+        if args.max_datasets != -1:
+            datasets = datasets[:args.max_datasets]
+            
+        for idx, dataset in enumerate(datasets):
+            print(f"Working on max_capacity_prompts {args.max_capacity_prompts} dataset {dataset} - {idx+1}/{len(datasets)}")
+            args.dataset = dataset
+            args.data_file = f"data/LongBench/{args.dataset}.jsonl"
+            main(args)
+    else:
+        # Just run the single dataset requested by the command line (usually from a notebook loop)
         main(args)
