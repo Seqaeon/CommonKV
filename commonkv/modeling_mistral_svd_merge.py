@@ -400,56 +400,30 @@ class MistralFlashAttention2(MistralAttention):
             key_up_states = self.k_up_proj(hidden_states).view(bsz, q_len, 1, self.k_rank).transpose(1, 2)
             value_up_states = self.v_up_proj(hidden_states).view(bsz, q_len, 1, self.v_rank).transpose(1, 2)
             query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-            cos, sin = self.rotary_emb(value_up_states, position_ids)
-            query_states, key_states = apply_rotary_pos_emb(query_states, value_up_states, cos, sin) # value_up_states just for shape
-            # Re-apply rotary only if we have full states
         else:
             query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
             key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
             value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            cos, sin = self.rotary_emb(value_states, position_ids)
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        kv_seq_len = (key_up_states if use_svd else key_states).shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += cache_position[0]
 
         if past_key_value is not None:
-            # Activate slicing cache only if the config has a value `sliding_windows` attribute
-            cache_has_contents = past_key_value.get_seq_length(self.layer_idx) > 0
-            if (
-                getattr(self.config, "sliding_window", None) is not None
-                and kv_seq_len > self.config.sliding_window
-                and cache_has_contents
-            ):
-                slicing_tokens = 1 - self.config.sliding_window
-
-                past_key = past_key_value[self.layer_idx][0]
-                past_value = past_key_value[self.layer_idx][1]
-
-                past_key = past_key[:, :, slicing_tokens:, :].contiguous()
-                past_value = past_value[:, :, slicing_tokens:, :].contiguous()
-
-                if past_key.shape[-2] != self.config.sliding_window - 1:
-                    raise ValueError(
-                        f"past key must have a shape of (`batch_size, num_heads, self.config.sliding_window-1, head_dim`), got"
-                        f" {past_key.shape}"
-                    )
-
-                if attention_mask is not None:
-                    attention_mask = attention_mask[:, slicing_tokens:]
-                    attention_mask = torch.cat([attention_mask, torch.ones_like(attention_mask[:, -1:])], dim=-1)
-
-            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+            cache_kwargs = {"cache_position": cache_position}
             if use_svd:
                 key_up_states, value_up_states = past_key_value.update(key_up_states, value_up_states, self.layer_idx, cache_kwargs)
             else:
                 key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
+        kv_seq_len = (key_up_states if use_svd else key_states).shape[-2]
+        key_position_ids = torch.arange(kv_seq_len, device=position_ids.device).unsqueeze(0).expand(bsz, -1)
+        cos, sin = self.rotary_emb(value_up_states if use_svd else value_states, key_position_ids)
+
+        query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
+
         if use_svd:
             key_states = self.k_down_proj(key_up_states).view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            key_states = apply_rotary_pos_emb_single(key_states, cos, sin, position_ids)
+            key_states = apply_rotary_pos_emb_single(key_states, cos, sin, key_position_ids)
             value_states = self.v_down_proj(value_up_states).view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        else:
+            key_states = apply_rotary_pos_emb_single(key_states, cos, sin, key_position_ids)
 
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -550,27 +524,31 @@ class MistralSdpaAttention(MistralAttention):
             key_up_states = self.k_up_proj(hidden_states).view(bsz, q_len, 1, self.k_rank).transpose(1, 2)
             value_up_states = self.v_up_proj(hidden_states).view(bsz, q_len, 1, self.v_rank).transpose(1, 2)
             query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-            cos, sin = self.rotary_emb(value_up_states, position_ids)
-            query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
         else:
             query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
             key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
             value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            cos, sin = self.rotary_emb(value_states, position_ids)
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            cache_kwargs = {"cache_position": cache_position}
             if use_svd:
                 key_up_states, value_up_states = past_key_value.update(key_up_states, value_up_states, self.layer_idx, cache_kwargs)
             else:
                 key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
+        kv_seq_len = (key_up_states if use_svd else key_states).shape[-2]
+        key_position_ids = torch.arange(kv_seq_len, device=position_ids.device).unsqueeze(0).expand(bsz, -1)
+        cos, sin = self.rotary_emb(value_up_states if use_svd else value_states, key_position_ids)
+
+        query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
+
         if use_svd:
             key_states = self.k_down_proj(key_up_states).view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            key_states = apply_rotary_pos_emb_single(key_states, cos, sin, position_ids)
+            key_states = apply_rotary_pos_emb_single(key_states, cos, sin, key_position_ids)
             value_states = self.v_down_proj(value_up_states).view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        else:
+            key_states = apply_rotary_pos_emb_single(key_states, cos, sin, key_position_ids)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)

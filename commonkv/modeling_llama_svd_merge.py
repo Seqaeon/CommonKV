@@ -564,35 +564,31 @@ class LlamaFlashAttention2(LlamaAttention):
             key_up_states = self.k_up_proj(hidden_states).view(bsz, q_len, 1, self.k_rank).transpose(1, 2)
             value_up_states = self.v_up_proj(hidden_states).view(bsz, q_len, 1, self.v_rank).transpose(1, 2)
             query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-            if position_embeddings is None:
-                cos, sin = self.rotary_emb(value_up_states, position_ids)
-            else:
-                cos, sin = position_embeddings
-            query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
         else:
             query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
             key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
             value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-            if position_embeddings is None:
-                cos, sin = self.rotary_emb(value_states, position_ids)
-            else:
-                cos, sin = position_embeddings
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            cache_kwargs = {"cache_position": cache_position}
             if use_svd:
                 key_up_states, value_up_states = past_key_value.update(key_up_states, value_up_states, self.layer_idx, cache_kwargs)
             else:
                 key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
+        kv_seq_len = (key_up_states if use_svd else key_states).shape[-2]
+        key_position_ids = torch.arange(kv_seq_len, device=position_ids.device).unsqueeze(0).expand(bsz, -1)
+        cos, sin = self.rotary_emb(value_up_states if use_svd else value_states, key_position_ids)
+
+        query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
+
         if use_svd:
             key_states = self.k_down_proj(key_up_states).view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            key_states = apply_rotary_pos_emb_single(key_states, cos, sin, position_ids)
+            key_states = apply_rotary_pos_emb_single(key_states, cos, sin, key_position_ids)
             value_states = self.v_down_proj(value_up_states).view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        else:
+            key_states = apply_rotary_pos_emb_single(key_states, cos, sin, key_position_ids)
 
         # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
         # to be able to avoid many of these transpose/reshape/view.
@@ -694,35 +690,31 @@ class LlamaSdpaAttention(LlamaAttention):
             key_up_states = self.k_up_proj(hidden_states).view(bsz, q_len, 1, self.k_rank).transpose(1, 2)
             value_up_states = self.v_up_proj(hidden_states).view(bsz, q_len, 1, self.v_rank).transpose(1, 2)
             query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-            if position_embeddings is None:
-                cos, sin = self.rotary_emb(value_up_states, position_ids)
-            else:
-                cos, sin = position_embeddings
-            query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
         else:
             query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
             key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
             value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-            if position_embeddings is None:
-                cos, sin = self.rotary_emb(value_states, position_ids)
-            else:
-                cos, sin = position_embeddings
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            cache_kwargs = {"cache_position": cache_position}
             if use_svd:
                 key_up_states, value_up_states = past_key_value.update(key_up_states, value_up_states, self.layer_idx, cache_kwargs)
             else:
                 key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
+        kv_seq_len = (key_up_states if use_svd else key_states).shape[-2]
+        key_position_ids = torch.arange(kv_seq_len, device=position_ids.device).unsqueeze(0).expand(bsz, -1)
+        cos, sin = self.rotary_emb(value_up_states if use_svd else value_states, key_position_ids)
+
+        query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
+
         if use_svd:
             key_states = self.k_down_proj(key_up_states).view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            key_states = apply_rotary_pos_emb_single(key_states, cos, sin, position_ids)
+            key_states = apply_rotary_pos_emb_single(key_states, cos, sin, key_position_ids)
             value_states = self.v_down_proj(value_up_states).view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        else:
+            key_states = apply_rotary_pos_emb_single(key_states, cos, sin, key_position_ids)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
