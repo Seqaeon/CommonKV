@@ -142,19 +142,19 @@ if __name__ == '__main__':
     print(f"Datasets to evaluate: {dataset_list}")
     print(f"Methods to evaluate: {methods}")
 
-    results_list = [["dataset"]] + [[m] for m in methods]
+    results_list = [["dataset"] + methods]
     
     for dataset in dataset_list:
-        results_list[0].append(dataset)
+        row = [dataset]
         
-        for idx, method in enumerate(methods):
+        for method in methods:
             try:
                 args.method = method
                 args.dataset = dataset
                 args.eval_file = os.path.join(args.results_dir, dataset, f"{method}.json")
                 
                 if not os.path.exists(args.eval_file) or os.path.getsize(args.eval_file) == 0:
-                    results_list[idx+1].append(-1)
+                    row.append(-1)
                     continue
 
                 predictions, answers, lengths = [], [], []
@@ -171,7 +171,7 @@ if __name__ == '__main__':
                             continue
 
                 if len(predictions) == 0:
-                    results_list[idx+1].append(-1)
+                    row.append(-1)
                     continue
 
                 if args.longbench_e:
@@ -179,7 +179,7 @@ if __name__ == '__main__':
                 else:
                     score = scorer(args.dataset, predictions, answers, all_classes)
                     
-                results_list[idx+1].append(score)
+                row.append(score)
                 
                 scores = {args.dataset: score}
                 output_dir = os.path.dirname(args.eval_file)
@@ -188,8 +188,10 @@ if __name__ == '__main__':
             
                 print(f"dataset {args.dataset} method {args.method} scores {scores}")
             except Exception as e:
-                results_list[idx+1].append(-1)
+                row.append(-1)
                 print(f"dataset {args.dataset} method {args.method} scores {None} (Error: {e})")
+        
+        results_list.append(row)
                 
     import csv
     with open(os.path.join(args.results_dir, f"results.csv"), 'w') as fp:
