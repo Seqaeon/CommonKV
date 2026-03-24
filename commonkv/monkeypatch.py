@@ -15,6 +15,9 @@ from commonkv.llama_model import (
     llama_attn_forward_H2O,
     llama_attn_forward_StreamingLLM,
     llama_attn_forward_SnapKV,
+    llama_attn_forward_ThinK,
+    llama_attn_forward_MiniCache,
+    llama_attn_forward_Palu,
 )
 from commonkv.mistral_model import (
     prepare_inputs_for_generation_mistral_new,
@@ -24,6 +27,9 @@ from commonkv.mistral_model import (
     mistral_attn_forward_H2O,
     mistral_attn_forward_StreamingLLM,
     mistral_attn_forward_SnapKV,
+    mistral_attn_forward_ThinK,
+    mistral_attn_forward_MiniCache,
+    mistral_attn_forward_Palu,
 )
 
 
@@ -36,9 +42,9 @@ def _replace_llama_attention_forward(method):
         "h2o": llama_attn_forward_H2O,
         "streamingllm": llama_attn_forward_StreamingLLM,
         "snapkv": llama_attn_forward_SnapKV,
-        "think": llama_attn_forward_SnapKV,
-        "palu": llama_attn_forward_SnapKV,
-        "minicache": llama_attn_forward_SnapKV,
+        "think": llama_attn_forward_ThinK,
+        "palu": llama_attn_forward_Palu,
+        "minicache": llama_attn_forward_MiniCache,
     }
     forward_fn = attn_method_map.get(method)
     if forward_fn is None:
@@ -57,9 +63,9 @@ def _replace_mistral_attention_forward(method):
         "h2o": mistral_attn_forward_H2O,
         "streamingllm": mistral_attn_forward_StreamingLLM,
         "snapkv": mistral_attn_forward_SnapKV,
-        "think": mistral_attn_forward_SnapKV,
-        "palu": mistral_attn_forward_SnapKV,
-        "minicache": mistral_attn_forward_SnapKV,
+        "think": mistral_attn_forward_ThinK,
+        "palu": mistral_attn_forward_Palu,
+        "minicache": mistral_attn_forward_MiniCache,
     }
     forward_fn = attn_method_map.get(method)
     if forward_fn is None:
