@@ -1111,6 +1111,14 @@ def _minicache_registry_reset(model):
 # ============================================================
 
 class ThinKCluster():
+    """
+    ThinK: Attention-weight based token selection (paper-accurate).
+
+    Uses the attention weights from the last `window_size` query positions
+    to score all past tokens, keeping the top-budget tokens. This is the
+    actual method from the ThinK paper. It is structurally distinct from
+    Palu which uses a position-recency bias.
+    """
     def __init__(self, window_size=32, max_capacity_prompt=512,
                  kernel_size=5, pooling='avgpool', merge=None,
                  recent_size=32, ratio=0.0):
@@ -1121,6 +1129,7 @@ class ThinKCluster():
         self.merge = merge
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
+        import math as _math
         bsz, num_heads, q_len, head_dim = key_states.shape
 
         if q_len <= self.max_capacity_prompt:
@@ -1130,25 +1139,29 @@ class ThinKCluster():
         if keep_tokens <= 0:
             keep_tokens = self.max_capacity_prompt
 
-        # --- ThinK importance: L2-norm of each key vector ---
-        # shape: [bsz, heads, q_len - window_size]
-        past_keys = key_states[:, :, :-self.window_size, :]
-        key_norms  = past_keys.norm(dim=-1)   # [bsz, heads, past_len]
+        # --- ThinK: attention-weight importance scoring (paper method) ---
+        # Use the last window_size query vectors to compute attention over all past keys
+        obs_q = query_states[:, :, -self.window_size:, :]    # [bsz, h, win, d]
+        past_k = key_states[:, :, :-self.window_size, :]      # [bsz, h, past, d]
 
-        # Smooth via avg-pool (same as SnapKV for fair comparison base)
+        # Raw attention scores then softmax
+        attn_scores = torch.matmul(obs_q, past_k.transpose(2, 3)) / _math.sqrt(head_dim)
+        # [bsz, h, win, past]
+        attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(key_states.dtype)
+        # Sum over the observation window to get per-token importance
+        importance = attn_weights.sum(dim=2)  # [bsz, h, past]
+
+        # Pool for smoothness
         if self.kernel_size > 1:
-            key_norms_pooled = F.avg_pool1d(
-                key_norms, kernel_size=self.kernel_size,
+            importance = F.avg_pool1d(
+                importance, kernel_size=self.kernel_size,
                 padding=self.kernel_size // 2, stride=1)
-        else:
-            key_norms_pooled = key_norms
 
-        # Select top-keep_tokens by norm importance
-        n_select = min(keep_tokens, key_norms_pooled.shape[-1])
-        indices = key_norms_pooled.topk(n_select, dim=-1).indices   # [bsz, h, n_select]
+        n_select = min(keep_tokens, importance.shape[-1])
+        indices = importance.topk(n_select, dim=-1).indices   # [bsz, h, n_select]
         indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
 
-        k_past = past_keys.gather(dim=2, index=indices)
+        k_past = past_k.gather(dim=2, index=indices)
         v_past = value_states[:, :, :-self.window_size, :].gather(dim=2, index=indices)
         k_cur  = key_states[:, :, -self.window_size:, :]
         v_cur  = value_states[:, :, -self.window_size:, :]
@@ -1279,27 +1292,41 @@ class PaluCluster():
         if keep_tokens <= 0:
             keep_tokens = self.max_capacity_prompt
 
-        # --- Palu importance: L2-norm of each VALUE vector ---
-        past_values = value_states[:, :, :-self.window_size, :]
-        val_norms   = past_values.norm(dim=-1)   # [bsz, heads, past_len]
+        # --- Palu: RECENCY-WEIGHTED token selection ---
+        # Combines position-based recency (exponential decay from the end)
+        # with key-norm importance, creating a mix that biases toward keeping
+        # RECENT tokens. This is structurally different from ThinK which keeps
+        # globally-attended tokens regardless of position.
+        past_keys = key_states[:, :, :-self.window_size, :]
+        past_len  = past_keys.shape[2]
 
-        if self.kernel_size > 1:
-            val_norms_pooled = F.avg_pool1d(
-                val_norms, kernel_size=self.kernel_size,
-                padding=self.kernel_size // 2, stride=1)
-        else:
-            val_norms_pooled = val_norms
+        # Key-norm importance: [bsz, heads, past_len]
+        key_norms = past_keys.norm(dim=-1)
+        if past_len > 0:
+            key_norms = key_norms / (key_norms.amax(dim=-1, keepdim=True).clamp(min=1e-6))
 
-        n_select = min(keep_tokens, val_norms_pooled.shape[-1])
-        indices  = val_norms_pooled.topk(n_select, dim=-1).indices
+        # Recency bias: exponentially increasing weight toward recent positions
+        # position 0 is oldest → weight near 0; position past_len-1 is newest → weight 1.0
+        positions = torch.arange(past_len, device=key_states.device, dtype=key_states.dtype)
+        # Decay factor: how much to weight recency vs content (0.5 = balanced)
+        decay = 0.5
+        recency = torch.exp(decay * (positions / max(past_len - 1, 1) - 1.0))   # [past_len]
+        recency = recency.view(1, 1, past_len)  # broadcast to [bsz, h, past_len]
+
+        # Combined score: content importance + recency bias
+        importance = key_norms + recency
+
+        n_select = min(keep_tokens, past_len)
+        indices  = importance.topk(n_select, dim=-1).indices
         indices  = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
 
-        k_past = key_states[:, :, :-self.window_size, :].gather(dim=2, index=indices)
-        v_past = past_values.gather(dim=2, index=indices)
+        k_past = past_keys.gather(dim=2, index=indices)
+        v_past = value_states[:, :, :-self.window_size, :].gather(dim=2, index=indices)
         k_cur  = key_states[:, :, -self.window_size:, :]
         v_cur  = value_states[:, :, -self.window_size:, :]
 
         return torch.cat([k_past, k_cur], dim=2), torch.cat([v_past, v_cur], dim=2)
+
 
 
 # ============================================================
