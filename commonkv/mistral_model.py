@@ -3194,7 +3194,8 @@ def mistral_attn_forward_MiniCache(
             key_states_c, value_states_c = self.kv_cluster.update_kv(
                 key_states, query_states, value_states,
                 attention_mask, self.num_key_value_groups,
-                layer_idx=self.layer_idx)
+                layer_idx=self.layer_idx, model_id=id(self.config))
+
             past_key_value.update(key_states_c, value_states_c, self.layer_idx, cache_kwargs)
             key_states   = key_states_c
             value_states = value_states_c

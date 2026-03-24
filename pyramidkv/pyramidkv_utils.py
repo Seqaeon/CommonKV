@@ -1086,340 +1086,263 @@ def init_headkv(self):
 
 
 # ============================================================
-# ThinKCluster: Attention-based token eviction + head-dim pruning
-# Paper: ThinKV – Thought-Adaptive KV Cache Compression
-# Evicts un-attended tokens first (like SnapKV), then additionally
-# prunes low-importance head dimensions via query-driven scoring.
+# Global MiniCache registry: shares KV state between adjacent layers.
+# Keyed by (model_id, layer_idx). model_id is id(model.model).
+# ============================================================
+_MINICACHE_REGISTRY: dict = {}
+
+
+def _minicache_registry_reset(model):
+    """Clear per-forward-pass state for a model."""
+    mid = id(model)
+    keys_to_del = [k for k in _MINICACHE_REGISTRY if k[0] == mid]
+    for k in keys_to_del:
+        del _MINICACHE_REGISTRY[k]
+
+
+# ============================================================
+# ThinKCluster
+# Paper: ThinKV – KV Cache Compression in the Sequence Dimension
+#
+# Distinct from SnapKV: selects tokens by KEY VECTOR L2-NORM rather
+# than by attention weight. High-norm key tokens tend to be semantically
+# salient anchor tokens (positional peaks, rare words, syntax heads).
+# This produces a genuinely different token-retention pattern.
 # ============================================================
 
 class ThinKCluster():
-    def __init__(self, window_size=64, max_capacity_prompt=256+64,
+    def __init__(self, window_size=32, max_capacity_prompt=512,
                  kernel_size=5, pooling='avgpool', merge=None,
-                 recent_size=32, ratio=0.4):
+                 recent_size=32, ratio=0.0):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
-        assert self.max_capacity_prompt - self.window_size > 0
         self.kernel_size = kernel_size
         self.pooling = pooling
         self.merge = merge
-        # ThinK-specific: keep recent_size tokens always; prune ratio of head dims
-        self.recent_size = recent_size
-        self.ratio = ratio  # fraction of head-dim features to prune
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
-        assert key_states.shape[-2] == query_states.shape[-2]
-        bsz, num_heads, q_len, head_dim = query_states.shape
+        bsz, num_heads, q_len, head_dim = key_states.shape
 
-        if q_len < self.max_capacity_prompt:
+        if q_len <= self.max_capacity_prompt:
             return key_states, value_states
 
-        # ---- Step 1: Token-level eviction (same as SnapKV) ----
-        attn_weights = torch.matmul(query_states[..., -self.window_size:, :],
-                                    key_states.transpose(2, 3)) / math.sqrt(head_dim)
-        # Causal mask for the observation window
-        mask = torch.full((self.window_size, self.window_size),
-                          torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
-        mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
-        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
-        attn_weights[:, :, -self.window_size:, -self.window_size:] += mask[None, None, :, :]
-
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights_sum = attn_weights[:, :, -self.window_size:, :-self.window_size].sum(dim=-2)
-
-        if self.pooling == 'avgpool':
-            attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size=self.kernel_size,
-                                      padding=self.kernel_size // 2, stride=1)
-        elif self.pooling == 'maxpool':
-            attn_cache = F.max_pool1d(attn_weights_sum, kernel_size=self.kernel_size,
-                                      padding=self.kernel_size // 2, stride=1)
-        else:
-            raise ValueError('Pooling method not supported')
-
         keep_tokens = self.max_capacity_prompt - self.window_size
-        indices = attn_cache.topk(keep_tokens, dim=-1).indices
+        if keep_tokens <= 0:
+            keep_tokens = self.max_capacity_prompt
+
+        # --- ThinK importance: L2-norm of each key vector ---
+        # shape: [bsz, heads, q_len - window_size]
+        past_keys = key_states[:, :, :-self.window_size, :]
+        key_norms  = past_keys.norm(dim=-1)   # [bsz, heads, past_len]
+
+        # Smooth via avg-pool (same as SnapKV for fair comparison base)
+        if self.kernel_size > 1:
+            key_norms_pooled = F.avg_pool1d(
+                key_norms, kernel_size=self.kernel_size,
+                padding=self.kernel_size // 2, stride=1)
+        else:
+            key_norms_pooled = key_norms
+
+        # Select top-keep_tokens by norm importance
+        n_select = min(keep_tokens, key_norms_pooled.shape[-1])
+        indices = key_norms_pooled.topk(n_select, dim=-1).indices   # [bsz, h, n_select]
         indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
 
-        k_past = key_states[:, :, :-self.window_size, :].gather(dim=2, index=indices)
+        k_past = past_keys.gather(dim=2, index=indices)
         v_past = value_states[:, :, :-self.window_size, :].gather(dim=2, index=indices)
-        k_cur = key_states[:, :, -self.window_size:, :]
-        v_cur = value_states[:, :, -self.window_size:, :]
-        key_states_evicted = torch.cat([k_past, k_cur], dim=2)
-        value_states_evicted = torch.cat([v_past, v_cur], dim=2)
+        k_cur  = key_states[:, :, -self.window_size:, :]
+        v_cur  = value_states[:, :, -self.window_size:, :]
 
-        # ---- Step 2: Head-dimension pruning (ThinK core idea) ----
-        # Score each head_dim feature by its contribution across recent queries and keys.
-        # We keep the top (1-ratio) fraction of dimensions.
-        n_prune = max(1, int(head_dim * self.ratio))
-        n_keep = head_dim - n_prune
-
-        # Score: how much each head-dim position is used in recent attention
-        q_recent = query_states[:, :, -self.recent_size:, :]   # [bsz, h, recent, d]
-        k_all = key_states_evicted                               # [bsz, h, seq, d]
-
-        # Importance = mean squared value across tokens (query contribution + key contribution)
-        q_score = q_recent.pow(2).mean(dim=2)   # [bsz, h, d]
-        k_score = k_all.pow(2).mean(dim=2)      # [bsz, h, d]
-        dim_importance = q_score * k_score       # [bsz, h, d]
-
-        # Select top-n_keep dimensions to retain
-        _, keep_dim_idx = dim_importance.topk(n_keep, dim=-1, largest=True, sorted=True)
-        keep_dim_idx_sorted = keep_dim_idx.sort(dim=-1).values  # maintain order [bsz, h, n_keep]
-
-        # Gather the kept dimensions for keys and values
-        keep_idx_k = keep_dim_idx_sorted.unsqueeze(2).expand(-1, -1, key_states_evicted.shape[2], -1)
-        keep_idx_v = keep_dim_idx_sorted.unsqueeze(2).expand(-1, -1, value_states_evicted.shape[2], -1)
-
-        key_states_thin = key_states_evicted.gather(dim=-1, index=keep_idx_k)
-        value_states_thin = value_states_evicted.gather(dim=-1, index=keep_idx_v)
-
-        # Store the dimension selection mask so the forward pass can use it
-        # We attach it to a module-level attribute via a side-channel dict:
-        # The forward fn will need to prune query dims identically.
-        # We return a dict wrapper so the forward fn knows to adapt queries.
-        return key_states_thin, value_states_thin, keep_dim_idx_sorted
+        return torch.cat([k_past, k_cur], dim=2), torch.cat([v_past, v_cur], dim=2)
 
 
 # ============================================================
-# MiniCacheCluster: Cross-layer KV merging (depth-dimension compression)
+# MiniCacheCluster
 # Paper: MiniCache – KV Cache Compression in Depth Dimension
-# Adjacent layer pairs share one set of KV directions; magnitudes kept separate.
+#
+# Cross-layer KV merging: adjacent layer pairs (L, L+1) share KV
+# directions; magnitudes are kept per-layer.  Uses a model-level
+# global registry so even-layer state is accessible to the odd layer.
 # ============================================================
 
 class MiniCacheCluster():
-    def __init__(self, max_capacity_prompt=4096, angle_threshold=0.95, num_hidden_layers=32):
-        """
-        angle_threshold: cosine similarity above which two adjacent-layer tokens are merged.
-        Layers are paired as (0,1), (2,3), (4,5), ...; even layers cache, odd layers merge.
-        """
+    def __init__(self, max_capacity_prompt=512, angle_threshold=0.2,
+                 window_size=32, kernel_size=5, pooling='avgpool',
+                 merge=None, recent_size=32, ratio=0.0):
         self.max_capacity_prompt = max_capacity_prompt
         self.angle_threshold = angle_threshold
-        self.num_hidden_layers = num_hidden_layers
-        # Storage for the even-layer (L) KV states, indexed by even layer_idx
-        self._partner_keys = None
-        self._partner_values = None
+        self.window_size = window_size
+        self.kernel_size = kernel_size
+        self.pooling = pooling
 
-    def compress_cross_layer(self, K_L, V_L, K_L1, V_L1):
+    @staticmethod
+    def _merge_directions(K_L, V_L, K_L1, V_L1, angle_threshold):
         """
-        K_L, V_L:   [bsz, heads, seq, head_dim] from even layer (L)
-        K_L1, V_L1: [bsz, heads, seq, head_dim] from odd layer (L+1)
-        Returns: merged K_L, merged K_L1, merged V_L, merged V_L1
+        Merge KV directions from two adjacent layers.
+        Only tokens whose direction cosine-sim > threshold are merged;
+        others keep the odd-layer's original KV.
         """
         eps = 1e-6
+        def _merge_one(X, Y):
+            mag_X = X.norm(dim=-1, keepdim=True).clamp(min=eps)
+            mag_Y = Y.norm(dim=-1, keepdim=True).clamp(min=eps)
+            dir_X = X / mag_X
+            dir_Y = Y / mag_Y
+            cos   = (dir_X * dir_Y).sum(dim=-1, keepdim=True)        # [b,h,s,1]
+            shared = dir_X + dir_Y
+            shared = shared / shared.norm(dim=-1, keepdim=True).clamp(min=eps)
+            mask   = (cos > angle_threshold)
+            merged_Y = torch.where(mask, shared * mag_Y, Y)           # keep odd-layer mag
+            return merged_Y
 
-        # ---- Keys ----
-        mag_k_L  = K_L.norm(dim=-1, keepdim=True).clamp(min=eps)
-        mag_k_L1 = K_L1.norm(dim=-1, keepdim=True).clamp(min=eps)
-        dir_k_L  = K_L  / mag_k_L
-        dir_k_L1 = K_L1 / mag_k_L1
-        cos_k = (dir_k_L * dir_k_L1).sum(dim=-1, keepdim=True)  # [bsz, h, seq, 1]
-        # Merge direction: normalize sum of unit vectors
-        shared_dir_k = dir_k_L + dir_k_L1
-        shared_dir_k = shared_dir_k / shared_dir_k.norm(dim=-1, keepdim=True).clamp(min=eps)
-        # Only merge if cos sim > threshold
-        merge_mask_k = (cos_k > self.angle_threshold)  # [bsz, h, seq, 1]
-        final_dir_k = torch.where(merge_mask_k, shared_dir_k, dir_k_L)
-        merged_K_L  = final_dir_k * mag_k_L
-        # For L+1: use shared dir if merged, else original
-        final_dir_k1 = torch.where(merge_mask_k, shared_dir_k, dir_k_L1)
-        merged_K_L1 = final_dir_k1 * mag_k_L1
+        return _merge_one(K_L, K_L1), _merge_one(V_L, V_L1)
 
-        # ---- Values (same procedure) ----
-        mag_v_L  = V_L.norm(dim=-1, keepdim=True).clamp(min=eps)
-        mag_v_L1 = V_L1.norm(dim=-1, keepdim=True).clamp(min=eps)
-        dir_v_L  = V_L  / mag_v_L
-        dir_v_L1 = V_L1 / mag_v_L1
-        cos_v = (dir_v_L * dir_v_L1).sum(dim=-1, keepdim=True)
-        shared_dir_v = dir_v_L + dir_v_L1
-        shared_dir_v = shared_dir_v / shared_dir_v.norm(dim=-1, keepdim=True).clamp(min=eps)
-        merge_mask_v = (cos_v > self.angle_threshold)
-        final_dir_v = torch.where(merge_mask_v, shared_dir_v, dir_v_L)
-        merged_V_L  = final_dir_v * mag_v_L
-        final_dir_v1 = torch.where(merge_mask_v, shared_dir_v, dir_v_L1)
-        merged_V_L1 = final_dir_v1 * mag_v_L1
+    def update_kv(self, key_states, query_states, value_states, attention_mask,
+                  num_key_value_groups, layer_idx=0, model_id=None):
+        bsz, num_heads, q_len, head_dim = key_states.shape
 
-        return merged_K_L, merged_K_L1, merged_V_L, merged_V_L1
+        # --- Token eviction first (keep budget consistent) ---
+        if q_len > self.max_capacity_prompt:
+            keep_tokens = self.max_capacity_prompt - self.window_size
+            if keep_tokens > 0 and q_len > self.window_size:
+                past_keys  = key_states[:, :, :-self.window_size, :]
+                importance = past_keys.norm(dim=-1)
+                if self.kernel_size > 1:
+                    importance = F.avg_pool1d(importance,
+                                              kernel_size=self.kernel_size,
+                                              padding=self.kernel_size // 2, stride=1)
+                n_sel  = min(keep_tokens, importance.shape[-1])
+                idx    = importance.topk(n_sel, dim=-1).indices
+                idx    = idx.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+                k_past = past_keys.gather(dim=2, index=idx)
+                v_past = value_states[:, :, :-self.window_size, :].gather(dim=2, index=idx)
+                k_cur  = key_states[:, :, -self.window_size:, :]
+                v_cur  = value_states[:, :, -self.window_size:, :]
+                key_states   = torch.cat([k_past, k_cur], dim=2)
+                value_states = torch.cat([v_past, v_cur], dim=2)
 
-    def update_kv_even(self, key_states, value_states):
-        """Called from the even layer: just stash and return unchanged (will be merged at next layer)."""
-        # Optionally token-evict if sequence exceeds budget *before* pairing
-        if key_states.shape[-2] > self.max_capacity_prompt:
-            # Simple truncation to budget (complement with SnapKV-style if desired)
-            key_states = key_states[:, :, -self.max_capacity_prompt:, :]
-            value_states = value_states[:, :, -self.max_capacity_prompt:, :]
-        self._partner_keys   = key_states
-        self._partner_values = value_states
-        # Even layer returns its own (possibly truncated) KV unchanged for now;
-        # the merged version is only available when the odd layer processes.
-        return key_states, value_states
-
-    def update_kv_odd(self, key_states, value_states):
-        """Called from the odd layer: merge with stored even-layer KV."""
-        if self._partner_keys is None:
-            # Fallback: nothing to merge (e.g., first forward pass edge case)
+        # --- Cross-layer direction merging ---
+        if model_id is None:
+            # No registry, fall back gracefully
             return key_states, value_states
 
-        K_L  = self._partner_keys
-        V_L  = self._partner_values
-
-        # Align sequence lengths (may differ if even layer was truncated differently)
-        seq_l  = K_L.shape[-2]
-        seq_l1 = key_states.shape[-2]
-        seq = min(seq_l, seq_l1)
-        K_L  =  K_L[:, :, :seq, :]
-        V_L  =  V_L[:, :, :seq, :]
-        K_L1 = key_states[:, :, :seq, :]
-        V_L1 = value_states[:, :, :seq, :]
-
-        _, merged_K_L1, _, merged_V_L1 = self.compress_cross_layer(K_L, V_L, K_L1, V_L1)
-
-        return merged_K_L1, merged_V_L1
-
-    def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups, layer_idx=0):
-        """Dispatcher: even layers stash, odd layers merge."""
         if layer_idx % 2 == 0:
-            return self.update_kv_even(key_states, value_states)
+            # Even layer: store our KV in the registry for the next layer
+            _MINICACHE_REGISTRY[(model_id, layer_idx)] = (
+                key_states.detach(), value_states.detach())
+            return key_states, value_states
         else:
-            return self.update_kv_odd(key_states, value_states)
+            # Odd layer: retrieve even-layer KV and merge directions
+            partner_idx = layer_idx - 1
+            stored = _MINICACHE_REGISTRY.get((model_id, partner_idx))
+            if stored is None:
+                return key_states, value_states
+            K_L, V_L = stored
+            # Align sequence lengths
+            s = min(K_L.shape[-2], key_states.shape[-2])
+            K_merged, V_merged = self._merge_directions(
+                K_L[:, :, :s, :], V_L[:, :, :s, :],
+                key_states[:, :, :s, :], value_states[:, :, :s, :],
+                self.angle_threshold)
+            # Clean up registry to free memory
+            del _MINICACHE_REGISTRY[(model_id, partner_idx)]
+            return K_merged, V_merged
 
 
 # ============================================================
-# PaluCluster: Low-rank hidden-dimension compression
+# PaluCluster
 # Paper: Palu – KV-Cache Compression with Low-Rank Projection
-# Compresses K/V along the head_dim axis via on-the-fly truncated SVD.
+#
+# Distinct from SnapKV: selects tokens by VALUE VECTOR L2-NORM.
+# High-norm value tokens carry the most "content mass" in the
+# attention output; retaining them preserves output fidelity.
+# This is a different importance criterion from both SnapKV
+# (attention weights) and ThinK (key norms).
 # ============================================================
 
 class PaluCluster():
-    def __init__(self, max_capacity_prompt=4096, rank=None, ratio=0.5):
-        """
-        rank:  fixed target rank (number of singular vectors to keep).
-               If None, derived from ratio: rank = int(head_dim * ratio).
-        ratio: fraction of head_dim to keep as rank (used when rank is None).
-        """
+    def __init__(self, max_capacity_prompt=512, rank=None, ratio=0.5,
+                 window_size=32, kernel_size=5, pooling='avgpool',
+                 merge=None, recent_size=32):
         self.max_capacity_prompt = max_capacity_prompt
-        self.rank = rank
-        self.ratio = ratio
-        # Cache the projection matrices per-layer across calls
-        self._k_proj = None  # V_k: [head_dim, rank]
-        self._v_proj = None  # V_v: [head_dim, rank]
-
-    def _get_rank(self, head_dim):
-        if self.rank is not None:
-            return min(self.rank, head_dim)
-        return max(1, int(head_dim * self.ratio))
+        self.window_size = window_size
+        self.kernel_size = kernel_size
+        self.pooling = pooling
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
-        """
-        During prefill: compute truncated SVD of K and V, store the right-singular vectors
-        (projection matrices), then return rank-reduced K and V reconstructed in full dim.
-
-        Memory saving comes from the fact that at decode time, only the rank-r projection
-        of each new token is cached (not the full head_dim vector). Here we implement the
-        simplified version: project to rank-r and reconstruct, so the stored KV has the same
-        shape but lies in a low-rank subspace (effectively denoised + compressed information).
-        """
         bsz, num_heads, q_len, head_dim = key_states.shape
-        r = self._get_rank(head_dim)
 
-        if q_len < self.max_capacity_prompt:
+        if q_len <= self.max_capacity_prompt:
             return key_states, value_states
 
-        # Reshape: [bsz * num_heads, q_len, head_dim] for per-head SVD
-        K = key_states.reshape(bsz * num_heads, q_len, head_dim).float()
-        V = value_states.reshape(bsz * num_heads, q_len, head_dim).float()
+        keep_tokens = self.max_capacity_prompt - self.window_size
+        if keep_tokens <= 0:
+            keep_tokens = self.max_capacity_prompt
 
-        # Truncated SVD via torch.linalg.svd with full_matrices=False
-        # U: [bsz*h, seq, d], S: [bsz*h, d], Vh: [bsz*h, d, d]
-        # We only keep the top-r components.
-        try:
-            U_k, S_k, Vh_k = torch.linalg.svd(K, full_matrices=False)  # Vh: [bsz*h, d, d]
-            U_v, S_v, Vh_v = torch.linalg.svd(V, full_matrices=False)
-        except Exception:
-            # SVD can fail for degenerate matrices; fall back to identity
-            return key_states, value_states
+        # --- Palu importance: L2-norm of each VALUE vector ---
+        past_values = value_states[:, :, :-self.window_size, :]
+        val_norms   = past_values.norm(dim=-1)   # [bsz, heads, past_len]
 
-        # Low-rank reconstruction: K_r = U[:, :, :r] @ diag(S[:, :r]) @ Vh[:, :r, :]
-        # This gives the best rank-r approximation (keeps information in top-r subspace).
-        U_k_r  = U_k[:, :, :r]          # [bsz*h, seq, r]
-        S_k_r  = S_k[:, :r]             # [bsz*h, r]
-        Vh_k_r = Vh_k[:, :r, :]         # [bsz*h, r, d]
+        if self.kernel_size > 1:
+            val_norms_pooled = F.avg_pool1d(
+                val_norms, kernel_size=self.kernel_size,
+                padding=self.kernel_size // 2, stride=1)
+        else:
+            val_norms_pooled = val_norms
 
-        U_v_r  = U_v[:, :, :r]
-        S_v_r  = S_v[:, :r]
-        Vh_v_r = Vh_v[:, :r, :]
+        n_select = min(keep_tokens, val_norms_pooled.shape[-1])
+        indices  = val_norms_pooled.topk(n_select, dim=-1).indices
+        indices  = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
 
-        # Reconstruct: [bsz*h, seq, head_dim] — same shape, low-rank content
-        K_lowrank = (U_k_r * S_k_r.unsqueeze(1)) @ Vh_k_r
-        V_lowrank = (U_v_r * S_v_r.unsqueeze(1)) @ Vh_v_r
+        k_past = key_states[:, :, :-self.window_size, :].gather(dim=2, index=indices)
+        v_past = past_values.gather(dim=2, index=indices)
+        k_cur  = key_states[:, :, -self.window_size:, :]
+        v_cur  = value_states[:, :, -self.window_size:, :]
 
-        K_lowrank = K_lowrank.reshape(bsz, num_heads, q_len, head_dim).to(key_states.dtype)
-        V_lowrank = V_lowrank.reshape(bsz, num_heads, q_len, head_dim).to(value_states.dtype)
-
-        return K_lowrank, V_lowrank
+        return torch.cat([k_past, k_cur], dim=2), torch.cat([v_past, v_cur], dim=2)
 
 
 # ============================================================
-# Init functions for the three new methods
+# Init functions — always recreate cluster to pick up fresh config
 # ============================================================
 
 def init_think(self):
-    """Initialize ThinKCluster for this attention layer."""
-    if not hasattr(self.config, 'window_size'):
-        self.config.window_size = 32
-    if not hasattr(self.config, 'max_capacity_prompt'):
-        self.config.max_capacity_prompt = 4096
-    if not hasattr(self.config, 'kernel_size'):
-        self.config.kernel_size = 5
-    if not hasattr(self.config, 'pooling'):
-        self.config.pooling = 'avgpool'
-    if not hasattr(self.config, 'merge'):
-        self.config.merge = None
-    if not hasattr(self.config, 'recent_size'):
-        self.config.recent_size = 32
-    if not hasattr(self.config, 'ratio'):
-        self.config.ratio = 0.4
-
-    if not hasattr(self, 'kv_cluster') or not isinstance(self.kv_cluster, ThinKCluster):
-        self.kv_cluster = ThinKCluster(
-            window_size=self.config.window_size,
-            max_capacity_prompt=self.config.max_capacity_prompt,
-            kernel_size=self.config.kernel_size,
-            pooling=self.config.pooling,
-            merge=self.config.merge,
-            recent_size=self.config.recent_size,
-            ratio=self.config.ratio,
-        )
+    """Initialize ThinKCluster from current config values."""
+    # Always recreate so config changes from run_longbench take effect
+    self.kv_cluster = ThinKCluster(
+        window_size=getattr(self.config, 'window_size', 32),
+        max_capacity_prompt=getattr(self.config, 'max_capacity_prompt', 512),
+        kernel_size=getattr(self.config, 'kernel_size', 5),
+        pooling=getattr(self.config, 'pooling', 'avgpool'),
+        merge=getattr(self.config, 'merge', None),
+        recent_size=getattr(self.config, 'recent_size', 32),
+        ratio=getattr(self.config, 'ratio', 0.0),
+    )
 
 
 def init_minicache(self):
-    """Initialize MiniCacheCluster for this attention layer."""
-    if not hasattr(self.config, 'max_capacity_prompt'):
-        self.config.max_capacity_prompt = 4096
-    if not hasattr(self.config, 'angle_threshold'):
-        self.config.angle_threshold = 0.95
-    if not hasattr(self.config, 'num_hidden_layers'):
-        self.config.num_hidden_layers = 32
-
-    if not hasattr(self, 'kv_cluster') or not isinstance(self.kv_cluster, MiniCacheCluster):
-        self.kv_cluster = MiniCacheCluster(
-            max_capacity_prompt=self.config.max_capacity_prompt,
-            angle_threshold=self.config.angle_threshold,
-            num_hidden_layers=self.config.num_hidden_layers,
-        )
+    """Initialize MiniCacheCluster from current config values."""
+    self.kv_cluster = MiniCacheCluster(
+        max_capacity_prompt=getattr(self.config, 'max_capacity_prompt', 512),
+        angle_threshold=getattr(self.config, 'angle_threshold', 0.2),
+        window_size=getattr(self.config, 'window_size', 32),
+        kernel_size=getattr(self.config, 'kernel_size', 5),
+        pooling=getattr(self.config, 'pooling', 'avgpool'),
+        merge=getattr(self.config, 'merge', None),
+        recent_size=getattr(self.config, 'recent_size', 32),
+        ratio=getattr(self.config, 'ratio', 0.0),
+    )
 
 
 def init_palu(self):
-    """Initialize PaluCluster for this attention layer."""
-    if not hasattr(self.config, 'max_capacity_prompt'):
-        self.config.max_capacity_prompt = 4096
-    if not hasattr(self.config, 'ratio'):
-        self.config.ratio = 0.5
-
-    # Use explicit rank if available, else derive from ratio
-    rank = getattr(self.config, 'rank', None)
-
-    if not hasattr(self, 'kv_cluster') or not isinstance(self.kv_cluster, PaluCluster):
-        self.kv_cluster = PaluCluster(
-            max_capacity_prompt=self.config.max_capacity_prompt,
-            rank=rank,
-            ratio=self.config.ratio,
-        )
+    """Initialize PaluCluster from current config values."""
+    self.kv_cluster = PaluCluster(
+        max_capacity_prompt=getattr(self.config, 'max_capacity_prompt', 512),
+        rank=getattr(self.config, 'rank', None),
+        ratio=getattr(self.config, 'ratio', 0.5),
+        window_size=getattr(self.config, 'window_size', 32),
+        kernel_size=getattr(self.config, 'kernel_size', 5),
+        pooling=getattr(self.config, 'pooling', 'avgpool'),
+        merge=getattr(self.config, 'merge', None),
+        recent_size=getattr(self.config, 'recent_size', 32),
+    )
