@@ -49,9 +49,21 @@ def _replace_llama_attention_forward(method):
     forward_fn = attn_method_map.get(method)
     if forward_fn is None:
         return
+    
+    # Patch original Transformers classes
     transformers.models.llama.modeling_llama.LlamaAttention.forward = forward_fn
     transformers.models.llama.modeling_llama.LlamaFlashAttention2.forward = forward_fn
     transformers.models.llama.modeling_llama.LlamaSdpaAttention.forward = forward_fn
+
+    # Patch SVD-merged model classes (if commonkv/ours was used)
+    try:
+        from commonkv import modeling_llama_svd_merge
+        modeling_llama_svd_merge.LlamaAttention.forward = forward_fn
+        modeling_llama_svd_merge.LlamaFlashAttention2.forward = forward_fn
+        modeling_llama_svd_merge.LlamaSdpaAttention.forward = forward_fn
+    except (ImportError, AttributeError):
+        pass
+
 
 
 def _replace_mistral_attention_forward(method):
@@ -70,9 +82,21 @@ def _replace_mistral_attention_forward(method):
     forward_fn = attn_method_map.get(method)
     if forward_fn is None:
         return
+
+    # Patch original Transformers classes
     transformers.models.mistral.modeling_mistral.MistralAttention.forward = forward_fn
     transformers.models.mistral.modeling_mistral.MistralFlashAttention2.forward = forward_fn
     transformers.models.mistral.modeling_mistral.MistralSdpaAttention.forward = forward_fn
+
+    # Patch SVD-merged model classes (if commonkv/ours was used)
+    try:
+        from commonkv import modeling_mistral_svd_merge
+        modeling_mistral_svd_merge.MistralAttention.forward = forward_fn
+        modeling_mistral_svd_merge.MistralFlashAttention2.forward = forward_fn
+        modeling_mistral_svd_merge.MistralSdpaAttention.forward = forward_fn
+    except (ImportError, AttributeError):
+        pass
+
 
 
 def replace_llama(method, model_name=None):

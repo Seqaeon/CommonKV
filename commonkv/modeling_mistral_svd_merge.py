@@ -251,7 +251,7 @@ class MistralAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
-        init_snapkv(self)  # 正交实验时使用
+        # init_snapkv(self)  # Removed to favor monkeypatched init_* in forward functions
 
         # if self.config.pretraining_tp > 1:
         #     key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp

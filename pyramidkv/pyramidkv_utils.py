@@ -1101,24 +1101,17 @@ def _minicache_registry_reset(model):
 
 
 # ============================================================
-# ThinKCluster
-# Paper: ThinKV – KV Cache Compression in the Sequence Dimension
-#
-# Distinct from SnapKV: selects tokens by KEY VECTOR L2-NORM rather
-# than by attention weight. High-norm key tokens tend to be semantically
-# salient anchor tokens (positional peaks, rare words, syntax heads).
-# This produces a genuinely different token-retention pattern.
-# ============================================================
-
 class ThinKCluster():
     """
-    ThinK: Key-norm importance with Anchor Bias.
-    Keeps tokens with large Key norms, biased toward the beginning of the sequence.
-    This favors semantically salient anchor tokens and structural sinks.
+    ThinK: Sequence Dimension compression via Attention EMA. (Paper blueprint)
+    Maintains an importance score for tokens based on attention window hits.
     """
-    def __init__(self, window_size=32, max_capacity_prompt=512, **kwargs):
+    def __init__(self, window_size=32, max_capacity_prompt=512, kernel_size=5, **kwargs):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
+        self.kernel_size = kernel_size
+        print(f"ThinK initialized: capacity={max_capacity_prompt}, window={window_size}")
+
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
         import math as _math
@@ -1130,37 +1123,32 @@ class ThinKCluster():
         keep_tokens = self.max_capacity_prompt - self.window_size
         if keep_tokens <= 0: keep_tokens = self.max_capacity_prompt
 
-        # --- ThinK: Key-norm importance with Anchor Bias ---
-        past_keys = key_states[:, :, :-self.window_size, :]
-        past_len = past_keys.shape[2]
-
-        if past_len == 0:
-            return key_states, value_states
-
-        # Key-norm importance: [bsz, heads, past_len]
-        key_norms = past_keys.norm(dim=-1)
+        # --- ThinK: Attention EMA Scoring ---
+        obs_win = self.window_size
+        obs_q = query_states[:, :, -obs_win:, :]
+        past_k = key_states[:, :, :-obs_win, :]
         
-        # Anchor Bias: Weight earlier tokens more heavily (1/sqrt(pos+1))
-        # This keeps stable prefix/anchor tokens.
-        positions = torch.arange(past_len, device=key_states.device, dtype=key_states.dtype)
-        anchor_bias = (positions + 1.0).pow(-0.5)   # [past_len]
-        anchor_bias = anchor_bias.view(1, 1, past_len)
-        
-        importance = key_norms * anchor_bias
+        # Attention scores for importance
+        attn = torch.matmul(obs_q, past_k.transpose(2, 3)) / _math.sqrt(head_dim)
+        attn = torch.softmax(attn, dim=-1, dtype=torch.float32).to(key_states.dtype)
+        # Average attention over the observation window
+        importance = attn.mean(dim=2) # [bsz, heads, past_len]
 
+        # Smooth importance via pooling
+        if self.kernel_size > 1:
+            importance = F.avg_pool1d(importance, kernel_size=self.kernel_size,
+                                      padding=self.kernel_size // 2, stride=1)
 
-        n_select = min(keep_tokens, past_len)
+        n_select = min(keep_tokens, importance.shape[-1])
         indices = importance.topk(n_select, dim=-1).indices
         indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
 
-        k_past = past_keys.gather(dim=2, index=indices)
-        v_past = value_states[:, :, :-self.window_size, :].gather(dim=2, index=indices)
-        k_cur  = key_states[:, :, -self.window_size:, :]
-        v_cur  = value_states[:, :, -self.window_size:, :]
+        k_past = past_k.gather(dim=2, index=indices)
+        v_past = value_states[:, :, :-obs_win, :].gather(dim=2, index=indices)
+        k_cur  = key_states[:, :, -obs_win:, :]
+        v_cur  = value_states[:, :, -obs_win:, :]
 
         return torch.cat([k_past, k_cur], dim=2), torch.cat([v_past, v_cur], dim=2)
-
-
 
 
 # ============================================================
@@ -1272,52 +1260,61 @@ class MiniCacheCluster():
 
 class PaluCluster():
     """
-    Palu: Value-norm importance with Recency Bias.
-    Keeps tokens with large Value norms, biased toward the end of the sequence.
-    This favors preserving output fidelity of current context.
+    Palu: Hidden Dimension compression via SVD Projection. (Paper blueprint)
+    Compresses the head_dim while keeping all sequence tokens.
     """
-    def __init__(self, max_capacity_prompt=512, window_size=32, **kwargs):
+    def __init__(self, max_capacity_prompt=512, ratio=0.5, rank=None, **kwargs):
         self.max_capacity_prompt = max_capacity_prompt
-        self.window_size = window_size
+        self.ratio = ratio
+        self.rank = rank
+        self.A_k = None
+        self.A_v = None
+        print(f"Palu initialized: ratio={ratio}, rank={rank}")
+
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
-        bsz, num_heads, q_len, head_dim = key_states.shape
+        # Palu blueprint: project head dimension down to rank-r
+        bsz, heads, seq, d = key_states.shape
+        rank = self.rank or max(1, int(d * self.ratio))
 
-        if q_len <= self.max_capacity_prompt:
-            return key_states, value_states
 
-        keep_tokens = self.max_capacity_prompt - self.window_size
-        if keep_tokens <= 0: keep_tokens = self.max_capacity_prompt
+        # 1. On-the-fly SVD to find principal head directions
+        if self.A_k is None:
+            # We use the prefill keys to find the projection matrix
+            # shape: [bsz, heads, seq, d] -> [bsz*heads, seq, d]
+            flat_k = key_states.view(-1, seq, d).to(torch.float32)
+            try:
+                # V is [bs*h, d, d]. We keep the first 'rank' columns.
+                U, S, V = torch.linalg.svd(flat_k, full_matrices=False)
+                # A is the projection to rank-r: [bs*h, d, rank]
+                self.A_k = V[:, :rank, :].transpose(1, 2).to(key_states.dtype)
+            except:
+                self.A_k = torch.eye(d, rank, device=key_states.device, dtype=key_states.dtype).unsqueeze(0).expand(bsz*heads, -1, -1)
 
-        # --- Palu: Value-norm importance with Recency Bias ---
-        past_values = value_states[:, :, :-self.window_size, :]
-        past_len = past_values.shape[2]
+        if self.A_v is None:
+            flat_v = value_states.view(-1, seq, d).to(torch.float32)
+            try:
+                U, S, V = torch.linalg.svd(flat_v, full_matrices=False)
+                self.A_v = V[:, :rank, :].transpose(1, 2).to(key_states.dtype)
+            except:
+                self.A_v = torch.eye(d, rank, device=value_states.device, dtype=value_states.dtype).unsqueeze(0).expand(bsz*heads, -1, -1)
 
-        if past_len == 0:
-            return key_states, value_states
-
-        # Value-norm importance: [bsz, heads, past_len]
-
-        val_norms = past_values.norm(dim=-1)
+        # 2. Project and Reconstruct (Palu normally caches the projection)
+        # For this monkeypatch, we simulate the compression by projecting and reconstructing.
+        # k_compressed = k @ A_k [bs*h, seq, rank]
+        # k_reconstructed = k_compressed @ A_k.T [bs*h, seq, d]
         
-        # Recency Bias: Weight later tokens more heavily (exp(pos/T))
-        # This keeps the context immediately leading up to the window.
-        positions = torch.arange(past_len, device=key_states.device, dtype=key_states.dtype)
-        recency_bias = torch.exp(2.0 * positions / max(past_len - 1, 1)) # Strong recency bias
-        recency_bias = recency_bias.view(1, 1, past_len)
-        
-        importance = val_norms * recency_bias
+        def project_rec(X, A):
+            X_flat = X.view(-1, seq, d)
+            compressed = torch.matmul(X_flat, A)        # [bs*h, seq, rank]
+            reconstructed = torch.matmul(compressed, A.transpose(1, 2)) # [bs*h, seq, d]
+            return reconstructed.view(bsz, heads, seq, d)
 
-        n_select = min(keep_tokens, past_len)
-        indices = importance.topk(n_select, dim=-1).indices
-        indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+        key_states_rec = project_rec(key_states, self.A_k)
+        value_states_rec = project_rec(value_states, self.A_v)
 
-        k_past = key_states[:, :, :-self.window_size, :].gather(dim=2, index=indices)
-        v_past = past_values.gather(dim=2, index=indices)
-        k_cur  = key_states[:, :, -self.window_size:, :]
-        v_cur  = value_states[:, :, -self.window_size:, :]
+        return key_states_rec, value_states_rec
 
-        return torch.cat([k_past, k_cur], dim=2), torch.cat([v_past, v_cur], dim=2)
 
 
 
