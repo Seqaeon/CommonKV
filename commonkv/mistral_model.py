@@ -3070,6 +3070,7 @@ def mistral_attn_forward_ThinK(
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    print(f"[DEBUG] Entering mistral_attn_forward_ThinK (Layer {self.layer_idx})")
     from pyramidkv.pyramidkv_utils import init_think
     bsz, q_len, _ = hidden_states.size()
     init_think(self)
@@ -3238,6 +3239,7 @@ def mistral_attn_forward_Palu(
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    print(f"[DEBUG] Entering mistral_attn_forward_Palu (Layer {self.layer_idx})")
     from pyramidkv.pyramidkv_utils import init_palu
     bsz, q_len, _ = hidden_states.size()
     init_palu(self)

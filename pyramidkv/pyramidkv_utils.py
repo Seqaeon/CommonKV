@@ -1116,6 +1116,8 @@ class ThinKCluster():
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
         import math as _math
         bsz, num_heads, q_len, head_dim = key_states.shape
+        # DEBUG: Confirm execution
+        print(f"[ThinK-DEBUG] update_kv called: q_len={q_len}, capacity={self.max_capacity_prompt}")
 
         if q_len <= self.max_capacity_prompt:
             return key_states, value_states
@@ -1276,6 +1278,9 @@ class PaluCluster():
         # Palu blueprint: project head dimension down to rank-r
         bsz, heads, seq, d = key_states.shape
         rank = self.rank or max(1, int(d * self.ratio))
+        # DEBUG: Confirm execution
+        print(f"[Palu-DEBUG] update_kv called: seq={seq}, head_dim={d}, target_rank={rank}")
+
 
 
         # 1. On-the-fly SVD to find principal head directions
