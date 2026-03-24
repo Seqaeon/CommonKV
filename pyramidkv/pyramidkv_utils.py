@@ -1112,21 +1112,13 @@ def _minicache_registry_reset(model):
 
 class ThinKCluster():
     """
-    ThinK: Attention-weight based token selection (paper-accurate).
-
-    Uses the attention weights from the last `window_size` query positions
-    to score all past tokens, keeping the top-budget tokens. This is the
-    actual method from the ThinK paper. It is structurally distinct from
-    Palu which uses a position-recency bias.
+    ThinK: Key-norm importance with Anchor Bias.
+    Keeps tokens with large Key norms, biased toward the beginning of the sequence.
+    This favors semantically salient anchor tokens and structural sinks.
     """
-    def __init__(self, window_size=32, max_capacity_prompt=512,
-                 kernel_size=5, pooling='avgpool', merge=None,
-                 recent_size=32, ratio=0.0):
+    def __init__(self, window_size=32, max_capacity_prompt=512, **kwargs):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
-        self.kernel_size = kernel_size
-        self.pooling = pooling
-        self.merge = merge
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
         import math as _math
@@ -1136,37 +1128,39 @@ class ThinKCluster():
             return key_states, value_states
 
         keep_tokens = self.max_capacity_prompt - self.window_size
-        if keep_tokens <= 0:
-            keep_tokens = self.max_capacity_prompt
+        if keep_tokens <= 0: keep_tokens = self.max_capacity_prompt
 
-        # --- ThinK: attention-weight importance scoring (paper method) ---
-        # Use the last window_size query vectors to compute attention over all past keys
-        obs_q = query_states[:, :, -self.window_size:, :]    # [bsz, h, win, d]
-        past_k = key_states[:, :, :-self.window_size, :]      # [bsz, h, past, d]
+        # --- ThinK: Key-norm importance with Anchor Bias ---
+        past_keys = key_states[:, :, :-self.window_size, :]
+        past_len = past_keys.shape[2]
 
-        # Raw attention scores then softmax
-        attn_scores = torch.matmul(obs_q, past_k.transpose(2, 3)) / _math.sqrt(head_dim)
-        # [bsz, h, win, past]
-        attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(key_states.dtype)
-        # Sum over the observation window to get per-token importance
-        importance = attn_weights.sum(dim=2)  # [bsz, h, past]
+        if past_len == 0:
+            return key_states, value_states
 
-        # Pool for smoothness
-        if self.kernel_size > 1:
-            importance = F.avg_pool1d(
-                importance, kernel_size=self.kernel_size,
-                padding=self.kernel_size // 2, stride=1)
+        # Key-norm importance: [bsz, heads, past_len]
+        key_norms = past_keys.norm(dim=-1)
+        
+        # Anchor Bias: Weight earlier tokens more heavily (1/sqrt(pos+1))
+        # This keeps stable prefix/anchor tokens.
+        positions = torch.arange(past_len, device=key_states.device, dtype=key_states.dtype)
+        anchor_bias = (positions + 1.0).pow(-0.5)   # [past_len]
+        anchor_bias = anchor_bias.view(1, 1, past_len)
+        
+        importance = key_norms * anchor_bias
 
-        n_select = min(keep_tokens, importance.shape[-1])
-        indices = importance.topk(n_select, dim=-1).indices   # [bsz, h, n_select]
+
+        n_select = min(keep_tokens, past_len)
+        indices = importance.topk(n_select, dim=-1).indices
         indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
 
-        k_past = past_k.gather(dim=2, index=indices)
+        k_past = past_keys.gather(dim=2, index=indices)
         v_past = value_states[:, :, :-self.window_size, :].gather(dim=2, index=indices)
         k_cur  = key_states[:, :, -self.window_size:, :]
         v_cur  = value_states[:, :, -self.window_size:, :]
 
         return torch.cat([k_past, k_cur], dim=2), torch.cat([v_past, v_cur], dim=2)
+
+
 
 
 # ============================================================
@@ -1179,14 +1173,17 @@ class ThinKCluster():
 # ============================================================
 
 class MiniCacheCluster():
-    def __init__(self, max_capacity_prompt=512, angle_threshold=0.2,
-                 window_size=32, kernel_size=5, pooling='avgpool',
-                 merge=None, recent_size=32, ratio=0.0):
+    """
+    MiniCache: Cross-layer KV merging via Global Registry.
+    Shares unit vector directions between adjacent layers.
+    """
+    def __init__(self, max_capacity_prompt=512, angle_threshold=0.2, window_size=32, kernel_size=5, **kwargs):
         self.max_capacity_prompt = max_capacity_prompt
         self.angle_threshold = angle_threshold
         self.window_size = window_size
         self.kernel_size = kernel_size
-        self.pooling = pooling
+
+
 
     @staticmethod
     def _merge_directions(K_L, V_L, K_L1, V_L1, angle_threshold):
@@ -1274,13 +1271,14 @@ class MiniCacheCluster():
 # ============================================================
 
 class PaluCluster():
-    def __init__(self, max_capacity_prompt=512, rank=None, ratio=0.5,
-                 window_size=32, kernel_size=5, pooling='avgpool',
-                 merge=None, recent_size=32):
+    """
+    Palu: Value-norm importance with Recency Bias.
+    Keeps tokens with large Value norms, biased toward the end of the sequence.
+    This favors preserving output fidelity of current context.
+    """
+    def __init__(self, max_capacity_prompt=512, window_size=32, **kwargs):
         self.max_capacity_prompt = max_capacity_prompt
         self.window_size = window_size
-        self.kernel_size = kernel_size
-        self.pooling = pooling
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
         bsz, num_heads, q_len, head_dim = key_states.shape
@@ -1289,43 +1287,38 @@ class PaluCluster():
             return key_states, value_states
 
         keep_tokens = self.max_capacity_prompt - self.window_size
-        if keep_tokens <= 0:
-            keep_tokens = self.max_capacity_prompt
+        if keep_tokens <= 0: keep_tokens = self.max_capacity_prompt
 
-        # --- Palu: RECENCY-WEIGHTED token selection ---
-        # Combines position-based recency (exponential decay from the end)
-        # with key-norm importance, creating a mix that biases toward keeping
-        # RECENT tokens. This is structurally different from ThinK which keeps
-        # globally-attended tokens regardless of position.
-        past_keys = key_states[:, :, :-self.window_size, :]
-        past_len  = past_keys.shape[2]
+        # --- Palu: Value-norm importance with Recency Bias ---
+        past_values = value_states[:, :, :-self.window_size, :]
+        past_len = past_values.shape[2]
 
-        # Key-norm importance: [bsz, heads, past_len]
-        key_norms = past_keys.norm(dim=-1)
-        if past_len > 0:
-            key_norms = key_norms / (key_norms.amax(dim=-1, keepdim=True).clamp(min=1e-6))
+        if past_len == 0:
+            return key_states, value_states
 
-        # Recency bias: exponentially increasing weight toward recent positions
-        # position 0 is oldest → weight near 0; position past_len-1 is newest → weight 1.0
+        # Value-norm importance: [bsz, heads, past_len]
+
+        val_norms = past_values.norm(dim=-1)
+        
+        # Recency Bias: Weight later tokens more heavily (exp(pos/T))
+        # This keeps the context immediately leading up to the window.
         positions = torch.arange(past_len, device=key_states.device, dtype=key_states.dtype)
-        # Decay factor: how much to weight recency vs content (0.5 = balanced)
-        decay = 0.5
-        recency = torch.exp(decay * (positions / max(past_len - 1, 1) - 1.0))   # [past_len]
-        recency = recency.view(1, 1, past_len)  # broadcast to [bsz, h, past_len]
-
-        # Combined score: content importance + recency bias
-        importance = key_norms + recency
+        recency_bias = torch.exp(2.0 * positions / max(past_len - 1, 1)) # Strong recency bias
+        recency_bias = recency_bias.view(1, 1, past_len)
+        
+        importance = val_norms * recency_bias
 
         n_select = min(keep_tokens, past_len)
-        indices  = importance.topk(n_select, dim=-1).indices
-        indices  = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+        indices = importance.topk(n_select, dim=-1).indices
+        indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
 
-        k_past = past_keys.gather(dim=2, index=indices)
-        v_past = value_states[:, :, :-self.window_size, :].gather(dim=2, index=indices)
+        k_past = key_states[:, :, :-self.window_size, :].gather(dim=2, index=indices)
+        v_past = past_values.gather(dim=2, index=indices)
         k_cur  = key_states[:, :, -self.window_size:, :]
         v_cur  = value_states[:, :, -self.window_size:, :]
 
         return torch.cat([k_past, k_cur], dim=2), torch.cat([v_past, v_cur], dim=2)
+
 
 
 
