@@ -268,7 +268,7 @@ def main(args):
             max_capacity_prompts = round(batch_input_ids.shape[1] * args.max_capacity_prompts_ratio)
         
         
-        if args.method.lower() not in ["fullkv", "ours", "commonkv"] :
+        if args.method.lower() not in ["fullkv", "ours", "commonkv", "apkvc", "custom"] :
             if args.method.lower() in ["snapkv","pyramidkv","h2o","cam", "l2norm", "adakv", "headkv", "think", "palu", "minicache"]:
                 window_sizes = 8
             elif args.method.lower() in ["streamingllm"]:

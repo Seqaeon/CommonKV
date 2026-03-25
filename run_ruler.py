@@ -222,7 +222,7 @@ def main(args):
             args.rank = palu_rank
         
         
-        if args.method.lower() not in ["fullkv", "ours", "commonkv"] :
+        if args.method.lower() not in ["fullkv", "ours", "commonkv", "apkvc", "custom"] :
             if args.method.lower() in ["snapkv","pyramidkv","h2o","cam", "l2norm", "think", "palu", "minicache"]:
                 window_sizes = 8
             elif args.method.lower() in ["streamingllm"]:
