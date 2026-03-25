@@ -15,6 +15,7 @@ from metrics import (
     count_score,
     code_sim_score,
 )
+from tqdm import tqdm
 
 dataset2metric = {
     "narrativeqa": qa_f1_score,
@@ -133,20 +134,21 @@ if __name__ == '__main__':
         if methods == legacy_methods:
             methods = discovered_methods
             
-    if args.datasets:
-        dataset_list = [d.strip() for d in args.datasets.split(",")]
-    else:
-        # If the global 'dataset_list' looks unpatched/legacy and we found others, prefer found
-        if len(discovered_datasets) > 0:
-            dataset_list = discovered_datasets
+    dataset_list = discovered_datasets if not args.datasets else [d.strip() for d in args.datasets.split(",")]
+    
+    # method_scores[method][dataset] = float_score
+    method_scores = {m: {} for m in methods}
 
     print(f"Datasets to evaluate: {dataset_list}")
     print(f"Methods to evaluate: {methods}")
 
-    results_list = [["dataset"] + methods]
+    results_list = []
+    cr_list = []
+    long_results = []
     
-    for dataset in dataset_list:
+    for dataset in tqdm(dataset_list):
         row = [dataset]
+        cr_row = [dataset]
         
         for method in methods:
             try:
@@ -156,6 +158,7 @@ if __name__ == '__main__':
                 
                 if not os.path.exists(args.eval_file) or os.path.getsize(args.eval_file) == 0:
                     row.append(-1)
+                    cr_row.append(-1)
                     continue
 
                 predictions, answers, lengths, ratios = [], [], [], []
@@ -175,6 +178,7 @@ if __name__ == '__main__':
 
                 if len(predictions) == 0:
                     row.append(-1)
+                    cr_row.append(-1)
                     continue
 
                 if args.longbench_e:
@@ -182,7 +186,9 @@ if __name__ == '__main__':
                 else:
                     score, cr = scorer(args.dataset, predictions, answers, all_classes, ratios=ratios)
                     
-                row.append(f"{score} (CR: {cr:.4f})")
+                row.append(score)
+                cr_row.append(cr)
+                long_results.append({"dataset": dataset, "method": method, "score": score, "compression_ratio": cr})
                 
                 scores = {args.dataset: score, "compression_ratio": cr}
                 output_dir = os.path.dirname(args.eval_file)
@@ -192,11 +198,68 @@ if __name__ == '__main__':
                 print(f"dataset {args.dataset} method {args.method} scores {scores}")
             except Exception as e:
                 row.append(-1)
+                cr_row.append(-1)
                 print(f"dataset {args.dataset} method {args.method} scores {None} (Error: {e})")
         
         results_list.append(row)
+        cr_list.append(cr_row)
                 
     import csv
-    with open(os.path.join(args.results_dir, f"results.csv"), 'w') as fp:
+    # 1. Wide Results (Score only)
+    with open(os.path.join(args.results_dir, "results.csv"), 'w') as fp:
         writer = csv.writer(fp)
+        writer.writerow(["dataset"] + methods)
         writer.writerows(results_list)
+    
+    # 2. Wide Compression Ratios
+    with open(os.path.join(args.results_dir, "compression_ratios.csv"), 'w') as fp:
+        writer = csv.writer(fp)
+        writer.writerow(["dataset"] + methods)
+        writer.writerows(cr_list)
+        
+    # 3. Long Format (Best for Pandas)
+    with open(os.path.join(args.results_dir, "results_long.jsonl"), 'w') as fp:
+        for entry in long_results:
+            fp.write(json.dumps(entry) + "\n")
+
+    # Generate Tie Table (Win/Loss/Tie Matrix)
+    print("\n" + "="*50)
+    print("      TIE TABLE (Win / Loss / Tie)")
+    print("="*50)
+    
+    # Header
+    header = " " * 15
+    for m in methods:
+        header += f"{m[:10]:>12}"
+    print(header)
+
+    tie_results = []
+    for m1 in methods:
+        row = [m1]
+        print_row = f"{m1[:12]:<15}"
+        for m2 in methods:
+            if m1 == m2:
+                print_row += f"{'-':>12}"
+                row.append("-")
+            else:
+                wins, losses, ties = 0, 0, 0
+                for d in dataset_list:
+                    s1 = method_scores[m1].get(d, -1)
+                    s2 = method_scores[m2].get(d, -1)
+                    if s1 == -1 or s2 == -1: continue
+                    
+                    if s1 > s2 + 0.1: wins += 1
+                    elif s2 > s1 + 0.1: losses += 1
+                    else: ties += 1
+                
+                cell = f"{wins}/{losses}/{ties}"
+                print_row += f"{cell:>12}"
+                row.append(cell)
+        print(print_row)
+        tie_results.append(row)
+
+    with open(os.path.join(args.results_dir, "tie_table.csv"), "w") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Method"] + methods)
+        writer.writerows(tie_results)
+    print("="*50 + "\n")
