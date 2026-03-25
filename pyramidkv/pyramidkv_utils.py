@@ -923,34 +923,6 @@ def init_snapkv(self):
         merge = self.config.merge,
         )
 
-def init_think(self):
-    if not hasattr(self, "kv_cluster"):
-        if not hasattr(self.config, 'window_size'):
-            self.config.window_size = 32
-        if not hasattr(self.config, 'max_capacity_prompt'):
-            self.config.max_capacity_prompt = 4096
-        if not hasattr(self.config, 'kernel_size'):
-            self.config.kernel_size = 5
-        if not hasattr(self.config, 'pooling'):
-            self.config.pooling = 'avgpool'
-        if not hasattr(self.config, 'merge'):
-            self.config.merge = None
-        if not hasattr(self.config, 'recent_size'):
-            self.config.recent_size = 32
-        if not hasattr(self.config, 'ratio'):
-            self.config.ratio = 0.4
-    
-    
-    self.kv_cluster = SnapKVCluster( 
-        window_size = self.config.window_size, 
-        max_capacity_prompt = self.config.max_capacity_prompt, 
-        kernel_size = self.config.kernel_size,
-        pooling = self.config.pooling,
-        merge = self.config.merge,
-        recent_size = self.config.recent_size,
-        ratio = self.config.ratio
-        )
-
 def init_l2norm(self):
     
     if not hasattr(self, "kv_cluster"):
