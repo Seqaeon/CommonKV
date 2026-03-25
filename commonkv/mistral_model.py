@@ -3445,7 +3445,6 @@ def mistral_attn_forward_Custom(
         from pyramidkv.pyramidkv_utils import init_kv_cluster
         self.kv_cluster = init_kv_cluster(self, "apkvc")
     
-    bsz, q_len, _ = hidden_states.size()
     query_states = self.q_proj(hidden_states)
     key_states = self.k_proj(hidden_states)
     value_states = self.v_proj(hidden_states)
@@ -3468,9 +3467,6 @@ def mistral_attn_forward_Custom(
 
     if past_key_value is not None:
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        if not hasattr(self, "kv_cluster"):
-            from pyramidkv.pyramidkv_utils import init_custom
-            self.kv_cluster = init_custom(self)
 
         if key_states.shape[-2] >= kv_seq_len:  # prefill
             self.kv_seq_len = kv_seq_len

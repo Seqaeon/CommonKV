@@ -3295,10 +3295,11 @@ def llama_attn_forward_Custom(
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-    if not hasattr(self, "kv_cluster"):
-        self.kv_cluster = init_kv_cluster(self, "custom")
-    
     bsz, q_len, _ = hidden_states.size()
+    if not hasattr(self, "kv_cluster"):
+        from pyramidkv.pyramidkv_utils import init_kv_cluster
+        self.kv_cluster = init_kv_cluster(self, "apkvc")
+    
     query_states = self.q_proj(hidden_states)
     key_states = self.k_proj(hidden_states)
     value_states = self.v_proj(hidden_states)
@@ -3318,11 +3319,6 @@ def llama_attn_forward_Custom(
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-    bsz, q_len, _ = hidden_states.size()
-    if not hasattr(self, "kv_cluster"):
-        from pyramidkv.pyramidkv_utils import init_kv_cluster
-        self.kv_cluster = init_kv_cluster(self, "apkvc")
 
     if past_key_value is not None:
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
