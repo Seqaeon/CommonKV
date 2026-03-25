@@ -11,7 +11,8 @@ from typing import List
 from svd_utils import get_rank
 
 
-context_length_list = [8192]
+# Default context length list if nothing is specified via CLI
+DEFAULT_CONTEXT_LENGTHS = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
 
 datasets = [
             "niah_single_1",
@@ -170,16 +171,16 @@ def main(args):
         elif args.sample_method == "topk":
             test_data = test_data[:args.max_num_examples]
     
-    for example in test_data:
+    for idx, example in enumerate(test_data):
         prompt_list.append(example["prompt"])
         input_list.append(example["input"])
         outputs_list.append(example["outputs"])
         length_list.append(example["length"])
-        index_list.append(example["index"])
+        index_list.append(example.get("index", idx))
 
     print("Finish loading model and tokenizer")
-    # Restore original casing for model_name
-    model_name = args.model_path.split("/")[-1]
+    # Restore original casing for model_name and handle trailing slashes
+    model_name = args.model_path.rstrip("/").split("/")[-1]
 
     os.makedirs(os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", str(args.context_length), args.dataset), exist_ok=True)
     output_dir = os.path.join(args.save_dir, f"{model_name}_{args.max_capacity_prompts}", str(args.context_length), args.dataset)
@@ -346,6 +347,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_datasets", type=int, default=-1, help="maximum number of datasets to evaluate.")
     parser.add_argument("--rank", type=int, default=1024, help="rank of up and down matrix")
     parser.add_argument("--layer_step", type=int, default=2, help="how many layers connect to one")
+    parser.add_argument("--context_lengths", type=int, nargs="+", default=None, help="Context lengths to evaluate. Defaults to DEFAULT_CONTEXT_LENGTHS.")
     parser.add_argument(
         "--require_head_wise_ranks",
         action="store_true",
@@ -489,21 +491,28 @@ if __name__ == "__main__":
     save_dir = args.save_dir
     max_capacity_prompts = args.max_capacity_prompts
     
+    # Determine which context lengths to run
+    if args.context_lengths:
+        target_context_lengths = args.context_lengths
+    else:
+        target_context_lengths = DEFAULT_CONTEXT_LENGTHS
+    
     if args.dataset in [None, "all", ""]:
         if args.max_datasets != -1:
             datasets = datasets[:args.max_datasets]
             
-        for context_length in context_length_list:
+        for context_length in target_context_lengths:
             for idx, dataset in enumerate(datasets):
-                print(f"Working on max_capacity_prompts {args.max_capacity_prompts} dataset {dataset} - {idx+1}/{len(datasets)}")
+                print(f"Working on max_capacity_prompts {args.max_capacity_prompts} dataset {dataset} - {idx+1}/{len(datasets)} - Context {context_length}")
                 args.context_length = context_length
                 args.dataset = dataset
                 args.data_file = f"data/RULER/{context_length}/{args.dataset}.jsonl"
                 main(args)
     else:
         # Just run the single dataset requested by the command line
-        for context_length in context_length_list:
+        for context_length in target_context_lengths:
             args.context_length = context_length
+            print(f"Working on max_capacity_prompts {args.max_capacity_prompts} dataset {args.dataset} - Context {context_length}")
             if not args.data_file:
                 args.data_file = f"data/RULER/{context_length}/{args.dataset}.jsonl"
             main(args)
