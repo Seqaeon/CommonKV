@@ -2851,9 +2851,9 @@ def llama_attn_forward_ThinK(
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-    from pyramidkv.pyramidkv_utils import init_think
-    bsz, q_len, _ = hidden_states.size()
-    init_think(self)
+    if not hasattr(self, "kv_cluster"):
+        from pyramidkv.pyramidkv_utils import init_think
+        self.kv_cluster = init_think(self)
 
     query_states = self.q_proj(hidden_states)
     key_states   = self.k_proj(hidden_states)
@@ -2953,9 +2953,9 @@ def llama_attn_forward_MiniCache(
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-    from pyramidkv.pyramidkv_utils import init_minicache
-    bsz, q_len, _ = hidden_states.size()
-    init_minicache(self)
+    if not hasattr(self, "kv_cluster"):
+        from pyramidkv.pyramidkv_utils import init_minicache
+        self.kv_cluster = init_minicache(self)
 
     query_states = self.q_proj(hidden_states)
     key_states   = self.k_proj(hidden_states)
@@ -3033,9 +3033,9 @@ def llama_attn_forward_Palu(
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-    from pyramidkv.pyramidkv_utils import init_palu
-    bsz, q_len, _ = hidden_states.size()
-    init_palu(self)
+    if not hasattr(self, "kv_cluster"):
+        from pyramidkv.pyramidkv_utils import init_palu
+        self.kv_cluster = init_palu(self)
 
     query_states = self.q_proj(hidden_states)
     key_states   = self.k_proj(hidden_states)
@@ -3315,11 +3315,12 @@ def llama_attn_forward_Custom(
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
+    if not hasattr(self, "kv_cluster"):
+        from pyramidkv.pyramidkv_utils import init_kv_cluster
+        self.kv_cluster = init_kv_cluster(self, "apkvc")
+
     if past_key_value is not None:
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        if not hasattr(self, "kv_cluster"):
-            from pyramidkv.pyramidkv_utils import init_custom
-            self.kv_cluster = init_custom(self)
 
         if key_states.shape[-2] >= kv_seq_len:  # prefill
             self.kv_seq_len = kv_seq_len

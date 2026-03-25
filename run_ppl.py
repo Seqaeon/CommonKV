@@ -62,8 +62,8 @@ def load_model_and_tokenizer(model_name_or_path):
             KVVt_reduced = sqrtSigma @ KVVt[:current_rank]
 
             D_out = k_weights[i].shape[0]
-            layer.k_down_proj.weight.data = KV_reduced[offset:offset + D_out].half()
-            layer.k_up_proj.weight.data = KVVt_reduced.to(torch.float16)
+            layer.k_down_proj.weight.data = KV_reduced[offset:offset + D_out].half().to(layer.k_down_proj.weight.device)
+            layer.k_up_proj.weight.data = KVVt_reduced.to(torch.float16).to(layer.k_up_proj.weight.device)
             layer.k_rank = current_rank
             offset += D_out
             layer.k_proj = None
@@ -77,8 +77,8 @@ def load_model_and_tokenizer(model_name_or_path):
             KVVt_reduced = sqrtSigma @ KVVt[:current_rank]
 
             D_out = v_weights[i].shape[0]
-            layer.v_down_proj.weight.data = KV_reduced[offset:offset + D_out].half()
-            layer.v_up_proj.weight.data = KVVt_reduced.to(torch.float16)
+            layer.v_down_proj.weight.data = KV_reduced[offset:offset + D_out].half().to(layer.v_down_proj.weight.device)
+            layer.v_up_proj.weight.data = KVVt_reduced.to(torch.float16).to(layer.v_up_proj.weight.device)
             layer.v_rank = current_rank
             offset += D_out
             layer.v_proj = None

@@ -3070,9 +3070,9 @@ def mistral_attn_forward_ThinK(
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-    from pyramidkv.pyramidkv_utils import init_think
-    bsz, q_len, _ = hidden_states.size()
-    init_think(self)
+    if not hasattr(self, "kv_cluster"):
+        from pyramidkv.pyramidkv_utils import init_think
+        self.kv_cluster = init_think(self)
 
     query_states = self.q_proj(hidden_states)
     key_states   = self.k_proj(hidden_states)
@@ -3238,9 +3238,9 @@ def mistral_attn_forward_Palu(
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-    from pyramidkv.pyramidkv_utils import init_palu
-    bsz, q_len, _ = hidden_states.size()
-    init_palu(self)
+    if not hasattr(self, "kv_cluster"):
+        from pyramidkv.pyramidkv_utils import init_palu
+        self.kv_cluster = init_palu(self)
 
     query_states = self.q_proj(hidden_states)
     key_states   = self.k_proj(hidden_states)
