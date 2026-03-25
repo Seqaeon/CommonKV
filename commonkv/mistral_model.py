@@ -3467,6 +3467,7 @@ def mistral_attn_forward_Custom(
             past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
         else:
             self.kv_seq_len += q_len
+            key_states, value_states = self.kv_cluster.update_kv(key_states, query_states, value_states, attention_mask, self.num_key_value_groups)
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
         past_key_value._seen_tokens = self.kv_seq_len
 

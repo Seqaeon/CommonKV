@@ -1355,7 +1355,7 @@ def init_palu(self):
 
 def init_custom(self):
     """Generic initialization for user's custom method scaffold."""
-    from custom_kv_template import MyCustomCluster
+    from attention_aware_predictive_kv import AttentionAwarePredictiveKVCluster
     # Pass all relevant config to the custom cluster
     config_dict = self.config.to_dict() if hasattr(self.config, "to_dict") else {}
-    return MyCustomCluster(**config_dict)
+    return AttentionAwarePredictiveKVCluster(**config_dict)
