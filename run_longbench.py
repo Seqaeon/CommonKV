@@ -378,8 +378,9 @@ def main(args):
                 full_bits = 16
                 compressed_bits = (args.K_num_codebooks * 4 + args.V_num_codebooks * 4) / 2
                 anchor_freq = 1.0 / args.max_anchor_interval
+                head_dim = getattr(model.config, "head_dim", model.config.hidden_size // model.config.num_attention_heads)
                 # Simplification: bits per element vs original 16 bits
-                cr = anchor_freq + (1.0 - anchor_freq) * (compressed_bits / (full_bits * model.config.head_dim))
+                cr = anchor_freq + (1.0 - anchor_freq) * (compressed_bits / (full_bits * head_dim))
             
             example = {}
             example["prompt"] = batch_prompts[j]
