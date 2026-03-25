@@ -107,8 +107,9 @@ def mistral_attn_forward_H2O(
             "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
         )
     bsz, q_len, _ = hidden_states.size()
-
-    init_H2O(self)
+    if not hasattr(self, "kv_cluster"):
+        from pyramidkv.pyramidkv_utils import init_H2O
+        self.kv_cluster = init_H2O(self)
 
     query_states = self.q_proj(hidden_states)
     key_states = self.k_proj(hidden_states)
@@ -226,8 +227,9 @@ def mistral_sdpa_attn_forward_H2O(
             cache_position=cache_position,
         )
 
-    init_H2O(self)
-
+    if not hasattr(self, "kv_cluster"):
+        from pyramidkv.pyramidkv_utils import init_H2O
+        self.kv_cluster = init_H2O(self)
     bsz, q_len, _ = hidden_states.size()
 
     query_states = self.q_proj(hidden_states)
@@ -3070,6 +3072,7 @@ def mistral_attn_forward_ThinK(
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    bsz, q_len, _ = hidden_states.size()
     if not hasattr(self, "kv_cluster"):
         from pyramidkv.pyramidkv_utils import init_think
         self.kv_cluster = init_think(self)
@@ -3163,9 +3166,10 @@ def mistral_attn_forward_MiniCache(
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-    from pyramidkv.pyramidkv_utils import init_minicache
     bsz, q_len, _ = hidden_states.size()
-    init_minicache(self)
+    if not hasattr(self, "kv_cluster"):
+        from pyramidkv.pyramidkv_utils import init_minicache
+        self.kv_cluster = init_minicache(self)
 
     query_states = self.q_proj(hidden_states)
     key_states   = self.k_proj(hidden_states)
@@ -3238,6 +3242,7 @@ def mistral_attn_forward_Palu(
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    bsz, q_len, _ = hidden_states.size()
     if not hasattr(self, "kv_cluster"):
         from pyramidkv.pyramidkv_utils import init_palu
         self.kv_cluster = init_palu(self)
@@ -3435,8 +3440,10 @@ def mistral_attn_forward_Custom(
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    bsz, q_len, _ = hidden_states.size()
     if not hasattr(self, "kv_cluster"):
-        self.kv_cluster = init_kv_cluster(self, "custom")
+        from pyramidkv.pyramidkv_utils import init_kv_cluster
+        self.kv_cluster = init_kv_cluster(self, "apkvc")
     
     bsz, q_len, _ = hidden_states.size()
     query_states = self.q_proj(hidden_states)

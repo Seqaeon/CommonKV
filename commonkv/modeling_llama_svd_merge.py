@@ -1273,6 +1273,10 @@ class LlamaModel(LlamaPreTrainedModel):
             start_k = cache_tuple[start_layer][0]  # [batch, num_heads, seq_len, head_dim]
             end_k = cache_tuple[end_layer][0]
 
+            # Ensure tensors are on the same device for cosine similarity
+            if start_k.device != end_k.device:
+                end_k = end_k.to(start_k.device)
+
             similarities = F.cosine_similarity(start_k, end_k, dim=-1)  # [batch, num_heads, seq_len]
 
             group_size = batch_size * num_heads * seq_len

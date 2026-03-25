@@ -2851,9 +2851,11 @@ def llama_attn_forward_ThinK(
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    bsz, q_len, _ = hidden_states.size()
     if not hasattr(self, "kv_cluster"):
         from pyramidkv.pyramidkv_utils import init_think
         self.kv_cluster = init_think(self)
+    
 
     query_states = self.q_proj(hidden_states)
     key_states   = self.k_proj(hidden_states)
@@ -2953,6 +2955,7 @@ def llama_attn_forward_MiniCache(
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    bsz, q_len, _ = hidden_states.size()
     if not hasattr(self, "kv_cluster"):
         from pyramidkv.pyramidkv_utils import init_minicache
         self.kv_cluster = init_minicache(self)
@@ -3033,6 +3036,7 @@ def llama_attn_forward_Palu(
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    bsz, q_len, _ = hidden_states.size()
     if not hasattr(self, "kv_cluster"):
         from pyramidkv.pyramidkv_utils import init_palu
         self.kv_cluster = init_palu(self)
@@ -3315,6 +3319,7 @@ def llama_attn_forward_Custom(
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
+    bsz, q_len, _ = hidden_states.size()
     if not hasattr(self, "kv_cluster"):
         from pyramidkv.pyramidkv_utils import init_kv_cluster
         self.kv_cluster = init_kv_cluster(self, "apkvc")
