@@ -161,6 +161,20 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
             out += C[idx]
         return out
 
+    def _update_rolling(self, K, V):
+        """Update last two anchors for linear trajectory prediction."""
+        # Shift old states
+        self.last_K2 = self.last_K
+        self.last_V2 = self.last_V
+        # Store new anchors
+        self.last_K = K.clone()
+        self.last_V = V.clone()
+
+    def should_reset(self, t):
+        """Check if distance-based or interval-based reset is needed."""
+        interval_reset = (t - self.last_anchor_t) >= self.apkvc_config.max_anchor_interval
+        return interval_reset
+
     def compute_distortion(self, Q, K_true, K_reconstructed):
         """Compute key-dot distortion proxy."""
         # Q: [B, H, 1, D]
