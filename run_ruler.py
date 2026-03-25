@@ -120,6 +120,15 @@ def main(args):
         if key in model_path:
             model_max_len = model2maxlen[key]
     
+    # Parity with run_longbench.py: Cap prefill length for OOM-prone methods
+    OOM_PRONE_METHODS = ["snapkv", "pyramidkv", "h2o", "cam", "l2norm"]
+    if args.method and args.method.lower() in OOM_PRONE_METHODS and model_max_len > args.max_prefill_tokens_for_custom_methods:
+        print(
+            f"[WARN] Capping prefill length from {model_max_len} to {args.max_prefill_tokens_for_custom_methods} "
+            f"for custom method '{args.method}' to avoid OOM."
+        )
+        model_max_len = args.max_prefill_tokens_for_custom_methods
+    
     output_max_len = dataset2maxlen[args.dataset]
     
     with open(args.data_file) as fp:
@@ -187,6 +196,12 @@ def main(args):
         elif args.max_capacity_prompts_ratio != -1:
             max_capacity_prompts = round(batch_input_ids.shape[1] * args.max_capacity_prompts_ratio)
         
+        # Parity with run_longbench.py: Automatic Palu rank calculation
+        if args.method.lower() == 'palu':
+            head_dim = getattr(model.config, 'head_dim', 128)
+            palu_rank = int(args.pruning_ratio * head_dim)
+            args.rank = palu_rank
+        
         
         if args.method.lower() not in ["fullkv", "ours", "commonkv"] :
             if args.method.lower() in ["snapkv","pyramidkv","h2o","cam", "l2norm", "think", "palu", "minicache"]:
@@ -218,8 +233,11 @@ def main(args):
                 model.model.layers[i].self_attn.config.max_capacity_prompt = max_capacity_prompts[i]
                 model.model.layers[i].self_attn.config.kernel_size = kernel_sizes[i]
                 model.model.layers[i].self_attn.config.pooling = pooling
+                model.model.layers[i].self_attn.config.merge = args.merge
+                model.model.layers[i].self_attn.config.floor = args.floor
                 model.model.layers[i].self_attn.config.ratio = ratio[i]
                 model.model.layers[i].self_attn.config.recent_size = recent_size[i]
+                model.model.layers[i].self_attn.config.rank = args.rank
 
         context_length = batch_input_ids.shape[-1]
         if args.quant_method == None:        
@@ -302,9 +320,12 @@ if __name__ == "__main__":
     parser.add_argument("--quant_method",type=str,default=None,choices=["kivi","kvquant"])
     parser.add_argument("--nbits", type=int, default=8, help="")
     parser.add_argument("--max_capacity_prompts", type=int, default=512, help="")
+    parser.add_argument("--max_prefill_tokens_for_custom_methods", type=int, default=2048, help="")
     parser.add_argument("--max_capacity_prompts_ratio", type=float, default=-1, help="")
     parser.add_argument("--pruning_ratio", type=float, default=0.4, help="")
     parser.add_argument("--recent_size", type=int, default=32, help="")
+    parser.add_argument("--merge", action="store_true", help="Whether to merge KV states in certain methods.")
+    parser.add_argument("--floor", type=float, default=0.2, help="Floor for importance scoring.")
     parser.add_argument("--steps", type=int, default=-1, help="maximum number of examples to evaluate per task.")
     parser.add_argument("--max_datasets", type=int, default=-1, help="maximum number of datasets to evaluate.")
     parser.add_argument("--rank", type=int, default=1024, help="rank of up and down matrix")
