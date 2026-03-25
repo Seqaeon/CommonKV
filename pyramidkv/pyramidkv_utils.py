@@ -1082,7 +1082,7 @@ class ThinKCluster():
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
         self.kernel_size = kernel_size
-        print(f"ThinK initialized: capacity={max_capacity_prompt}, window={window_size}")
+        # ThinK initialized print removed
 
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
@@ -1241,7 +1241,7 @@ class PaluCluster():
         self.rank = rank
         self.A_k = None
         self.A_v = None
-        print(f"Palu initialized: ratio={ratio}, rank={rank}")
+        # Palu initialized print removed
 
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
