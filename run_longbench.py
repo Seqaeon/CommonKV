@@ -523,9 +523,10 @@ if __name__ == "__main__":
             end_idx = min(start_idx + layer_step, num_layers)
             layers = [model.model.layers[i].self_attn for i in range(start_idx, end_idx)]
 
-            k_weights = [layer.k_proj.weight.data.float() for layer in layers]
+            target_device = layers[0].k_proj.weight.device
+            k_weights = [layer.k_proj.weight.data.to(target_device).float() for layer in layers]
             k_cat = torch.cat(k_weights, dim=0)
-            v_weights = [layer.v_proj.weight.data.float() for layer in layers]
+            v_weights = [layer.v_proj.weight.data.to(target_device).float() for layer in layers]
             v_cat = torch.cat(v_weights, dim=0)
             kv_cat = torch.cat([k_cat, v_cat], dim=0)
 
