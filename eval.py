@@ -161,7 +161,7 @@ if __name__ == '__main__':
                     cr_row.append(-1)
                     continue
 
-                predictions, answers, lengths, ratios = [], [], [], []
+                predictions, answers, lengths, ratios, latencies, tpss = [], [], [], [], [], []
                 with open(args.eval_file, "r", encoding="utf-8") as f:
                     for line in f:
                         try:
@@ -173,6 +173,10 @@ if __name__ == '__main__':
                                 lengths.append(data["length"])
                             if "compression_ratio" in data:
                                 ratios.append(data["compression_ratio"])
+                            if "latency" in data:
+                                latencies.append(data["latency"])
+                            if "tps" in data:
+                                tpss.append(data["tps"])
                         except Exception:
                             continue
 
@@ -188,9 +192,25 @@ if __name__ == '__main__':
                     
                 row.append(score)
                 cr_row.append(cr)
-                long_results.append({"dataset": dataset, "method": method, "score": score, "compression_ratio": cr})
                 
-                scores = {args.dataset: score, "compression_ratio": cr}
+                avg_latency = np.mean(latencies) if latencies else 0.0
+                avg_tps = np.mean(tpss) if tpss else 0.0
+                
+                long_results.append({
+                    "dataset": dataset, 
+                    "method": method, 
+                    "score": score, 
+                    "compression_ratio": cr,
+                    "latency": round(float(avg_latency), 4),
+                    "tps": round(float(avg_tps), 2)
+                })
+                
+                scores = {
+                    args.dataset: score, 
+                    "compression_ratio": cr,
+                    "latency": avg_latency,
+                    "tps": avg_tps
+                }
                 output_dir = os.path.dirname(args.eval_file)
                 with open(os.path.join(output_dir, "metrics.json"), "w") as f:
                     json.dump(scores, f, ensure_ascii=False, indent=4)

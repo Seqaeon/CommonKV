@@ -2,6 +2,7 @@ import os
 import json
 import random
 import argparse
+import time
 
 import numpy as np
 from tqdm import tqdm
@@ -328,6 +329,7 @@ def main(args):
             
 
         context_length = batch_input_ids.shape[-1]
+        start_time = time.time()
         if args.quant_method == None:
             output = model.generate(
                 **tokenized_prompts,
@@ -353,6 +355,10 @@ def main(args):
                 cache_implementation="quantized",
                 cache_config={"nbits": args.nbits, "backend": "HQQ","device":"cuda","residual_length":output_max_len,"axis_key":1,"q_group_size":64},
             )
+        end_time = time.time()
+        latency = end_time - start_time
+        num_tokens = output.shape[-1] - context_length
+        tps = num_tokens / latency if latency > 0 else 0
 
         batch_outputs = tokenizer.batch_decode(output[:, context_length:], skip_special_tokens=True)
 
@@ -394,6 +400,8 @@ def main(args):
             example["all_classes"] = batch_all_classes[j]
             example["_id"] = batch__ids[j]
             example["compression_ratio"] = float(f"{cr:.4f}")
+            example["latency"] = float(f"{latency:.4f}")
+            example["tps"] = float(f"{tps:.4f}")
             predictions.append(example)
 
     with open(json_output_path, "w") as fout_json:
