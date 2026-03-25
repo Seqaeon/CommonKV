@@ -7,7 +7,7 @@ from pyramidkv.pyramidkv_utils import BaseCluster
 
 @dataclass
 class APKVCConfig:
-    predictor_type: str  = 'identity' # 'identity' or 'linear'
+    predictor_type: str  = 'linear' # 'identity' or 'linear'
     alpha_K: float       = 1.5
     beta_K: float        = -0.5
     alpha_V: float       = 1.5
@@ -122,32 +122,41 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         self.initialized = True
 
     def additive_quantize(self, residual, codebooks):
-        """Encode residual into indices."""
+        """Vectorized Additive Quantization encoding."""
         # residual: [B, H, D]
         # codebooks: List[Parameter]
+        device = residual.device
+        dtype = residual.dtype
         r = residual.clone()
         indices = []
+        
         for C in codebooks:
             # C: [S, D]
-            # unsqueeze for broadcasting: [B, H, 1, D] vs [1, 1, S, D]
-            # We use cdist-like logic: (A-B)^2 = A^2 + B^2 - 2AB
-            # [B, H, S]
-            dist = torch.norm(r.unsqueeze(-2) - C, dim=-1)
-            best = dist.argmin(dim=-1) # [B, H]
+            # Use cdist for fast distance calculation: [B, H, S]
+            # torch.cdist(x1, x2) computes p-norm distance
+            # Here it's [B, H, D] vs [S, D]
+            B, H, D = r.shape
+            r_flat = r.view(B * H, D)
+            C_flat = C # [S, D]
+            
+            # [B*H, S]
+            dists = torch.cdist(r_flat.unsqueeze(1), C_flat.unsqueeze(0)).squeeze(1)
+            best = dists.argmin(dim=-1) # [B*H]
+            best = best.view(B, H)
             indices.append(best)
-            # Subtract chosen codeword
-            # C[best] shape: [B, H, D]
-            batch_indices = torch.arange(r.shape[0], device=r.device).view(-1, 1)
-            head_indices = torch.arange(r.shape[1], device=r.device).view(1, -1)
+            
+            # Subtract chosen codewords
+            # C[best] -> [B, H, D]
             r = r - C[best]
+            
         return indices
 
     def additive_decode(self, indices, codebooks):
         """Reconstruct residual from indices."""
-        # Use first codebook to determine device and dtype
         device = codebooks[0].device
         dtype = codebooks[0].dtype
-        out = torch.zeros(indices[0].shape[0], indices[0].shape[1], self.head_dim, device=device, dtype=dtype)
+        B, H = indices[0].shape
+        out = torch.zeros(B, H, self.head_dim, device=device, dtype=dtype)
         for idx, C in zip(indices, codebooks):
             out += C[idx]
         return out
@@ -156,66 +165,40 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         """Compute key-dot distortion proxy."""
         # Q: [B, H, 1, D]
         # K_true, K_reconstructed: [B, H, 1, D]
-        dtype = Q.dtype
-        K_true = K_true.to(dtype)
-        K_reconstructed = K_reconstructed.to(dtype)
-        
         scale = math.sqrt(self.head_dim)
-        scores_true = torch.einsum('bhqd,bhkd->bhqk', Q, K_true) / scale
-        scores_comp = torch.einsum('bhqd,bhkd->bhqk', Q, K_reconstructed) / scale
-        return (scores_true - scores_comp).abs().max().item()
-
-    def _update_rolling(self, K, V):
-        self.last_K2 = self.last_K
-        self.last_V2 = self.last_V
-        self.last_K = K
-        self.last_V = V
-
-    def should_reset(self, t):
-        if (t - self.last_anchor_t) >= self.apkvc_config.max_anchor_interval:
-            return True
-        if self.last_distortion > self.apkvc_config.rd_threshold:
-            return True
-        # Could add residual norm check here too
-        return False
+        # Faster dot product: [B, H, 1, 1]
+        score_true = torch.sum(Q * K_true, dim=-1, keepdim=True) / scale
+        score_comp = torch.sum(Q * K_reconstructed, dim=-1, keepdim=True) / scale
+        # Max absolute discrepancy across batch/heads
+        return torch.max(torch.abs(score_true - score_comp)).item()
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
         """
-        Intersects the forward pass to perform compression.
-        
-        Args:
-            key_states (torch.Tensor): [B, H, S, D]
-            query_states (torch.Tensor): [B, H, Q, D]
-            value_states (torch.Tensor): [B, H, S, D]
+        APKVC Update Step.
         """
         bsz, num_heads, q_len, head_dim = query_states.shape
         device = query_states.device
+        dtype = query_states.dtype
         
         if not self.initialized:
-            self._init_lazy(head_dim, device, query_states.dtype)
+            self._init_lazy(head_dim, device, dtype)
 
-        # We assume t is the current sequence position
-        # In this repo's Custom implementation, update_kv is called with:
-        # - Full prefix during prefill (S > 1)
-        # - Single token during decoding (S = 1)
-        
         t = len(self.entries)
         
-        # If it's a batch/prefill block (S > 1), we treat the whole block as an anchor for simplicity
-        # or we could iterate. The user spec says "Prefill can be left uncompressed initially".
+        # 1. Prefill / Multi-token fallback
         if key_states.shape[-2] > 1:
-            # Anchor the whole block
             for i in range(key_states.shape[-2]):
                 self.entries.append({'is_anchor': True, 'position': t + i})
             self.last_anchor_t = t + key_states.shape[-2] - 1
             self._update_rolling(key_states[:, :, -1:], value_states[:, :, -1:])
             return key_states, value_states
 
-        # Decoding loop (single token)
-        K_true = key_states # [B, H, 1, D]
-        V_true = value_states # [B, H, 1, D]
-        Q = query_states # [B, H, 1, D]
+        # 2. Decoding Step (Single token)
+        K_true = key_states
+        V_true = value_states
+        Q = query_states
         
+        # Check for anchor reset
         if t == 0 or self.should_reset(t):
             self.entries.append({'is_anchor': True, 'position': t})
             self.last_anchor_t = t
@@ -223,27 +206,28 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
             self._update_rolling(K_true, V_true)
             return K_true, V_true
 
-        # 1. Predict
-        if self.apkvc_config.predictor_type == 'identity' or self.last_K2 is None:
-            K_hat, V_hat = self.last_K, self.last_V
-        else:
+        # 3. Predict K_hat and V_hat
+        if self.apkvc_config.predictor_type == 'linear' and self.last_K2 is not None:
+            # 2nd order extrapolation
             K_hat = self.apkvc_config.alpha_K * self.last_K + self.apkvc_config.beta_K * self.last_K2
             V_hat = self.apkvc_config.alpha_V * self.last_V + self.apkvc_config.beta_V * self.last_V2
+        else:
+            # Identity (last step)
+            K_hat, V_hat = self.last_K.clone(), self.last_V.clone()
 
+        # 4. Compressing residuals
         delta_K = K_true - K_hat
         delta_V = V_true - V_hat
-
-        # 2. RoPE derotation (keys only)
+        
         if self.apkvc_config.use_rope_aware_aq:
             delta_K_base = rope_derotate(delta_K, t)
         else:
             delta_K_base = delta_K
 
-        # 3. Additive quantization
         codes_K = self.additive_quantize(delta_K_base.squeeze(2), self.codebooks_K)
         codes_V = self.additive_quantize(delta_V.squeeze(2), self.codebooks_V)
 
-        # 4. Reconstruct for distortion check and return value
+        # 5. Reconstruction for local feedback
         recon_delta_K_base = self.additive_decode(codes_K, self.codebooks_K).unsqueeze(2)
         recon_delta_V = self.additive_decode(codes_V, self.codebooks_V).unsqueeze(2)
         
@@ -255,25 +239,24 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         K_recon = K_hat + recon_delta_K
         V_recon = V_hat + recon_delta_V
 
-        # 5. Distortion check
+        # 6. Attention-Aware distortion check
         distortion = self.compute_distortion(Q, K_true, K_recon)
         self.last_distortion = distortion
         
         if distortion > self.apkvc_config.rd_threshold:
-            # Distortion too high -> Trigger Reset (Anchor)
+            # Quality too low -> Downgrade to Anchor
             self.entries.append({'is_anchor': True, 'position': t})
             self.last_anchor_t = t
             self.last_distortion = 0.0
             self._update_rolling(K_true, V_true)
             return K_true, V_true
         else:
-            # Commit compression
+            # Success -> Store compressed indices
             self.entries.append({
                 'is_anchor': False,
                 'codes_K': codes_K,
                 'codes_V': codes_V,
-                'position': t,
-                'predictor_type': self.apkvc_config.predictor_type
+                'position': t
             })
             self._update_rolling(K_recon, V_recon)
             return K_recon, V_recon

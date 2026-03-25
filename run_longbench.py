@@ -173,7 +173,13 @@ def main(args):
 
     
     output_max_len = dataset2maxlen[args.dataset]
-    
+    # Initializing compression_ratio here, and refining it later in the loop.
+    compression_ratio = 1.0
+    if args.method.lower() == "fullkv":
+        compression_ratio = 1.0
+    elif args.method.lower() == "palu":
+        compression_ratio = getattr(args, "ratio", 1.0) # Palu uses ratio to determine rank
+
     with open(args.data_file) as fp:
         for line in fp:
             example = json.loads(line)
@@ -268,6 +274,14 @@ def main(args):
             max_capacity_prompts = round(batch_input_ids.shape[1] * args.max_capacity_prompts_ratio)
         
         
+        if args.method.lower() in ["apkvc", "custom"]:
+            for i in range(len(model.model.layers)):
+                model.model.layers[i].self_attn.config.predictor_type = args.predictor_type
+                model.model.layers[i].self_attn.config.rd_threshold = args.rd_threshold
+                model.model.layers[i].self_attn.config.max_anchor_interval = args.max_anchor_interval
+                model.model.layers[i].self_attn.config.K_num_codebooks = args.K_num_codebooks
+                model.model.layers[i].self_attn.config.V_num_codebooks = args.V_num_codebooks
+
         if args.method.lower() not in ["fullkv", "ours", "commonkv", "apkvc", "custom"] :
             if args.method.lower() in ["snapkv","pyramidkv","h2o","cam", "l2norm", "adakv", "headkv", "think", "palu", "minicache"]:
                 window_sizes = 8
@@ -349,22 +363,36 @@ def main(args):
         torch.cuda.empty_cache()
 
         for j in range(len(batch_prompts)):
-
+            # Calculate effective compression ratio for this batch example
+            cr = 1.0
+            if args.method.lower() == "fullkv":
+                cr = 1.0
+            elif args.method.lower() in ["snapkv", "pyramidkv", "h2o", "think", "minicache", "streamingllm"]:
+                avg_cap = sum(max_capacity_prompts) / len(max_capacity_prompts) if isinstance(max_capacity_prompts, list) else max_capacity_prompts
+                cr = min(1.0, avg_cap / (batch_lengths[j] + output_max_len))
+            elif args.method.lower() == "palu":
+                # ratio is used to determine rank in Palu
+                cr = getattr(args, "pruning_ratio", 1.0) # Palu typically uses pruning_ratio for Rank/Width
+            elif args.method.lower() in ["apkvc", "custom"]:
+                # APKVC Ratio Estimate
+                full_bits = 16
+                compressed_bits = (args.K_num_codebooks * 4 + args.V_num_codebooks * 4) / 2
+                anchor_freq = 1.0 / args.max_anchor_interval
+                # Simplification: bits per element vs original 16 bits
+                cr = anchor_freq + (1.0 - anchor_freq) * (compressed_bits / (full_bits * model.config.head_dim))
+            
             example = {}
-
             example["prompt"] = batch_prompts[j]
             example["input"] = batch_inputs[j]
             example["context"] = batch_contexts[j]
             example["answers"] = batch_answerss[j]
             example["pred"] = batch_generations[j]
             example["length"] = batch_lengths[j]
-
             example["dataset"] = batch_datasets[j]
             example["language"] = batch_languages[j]
             example["all_classes"] = batch_all_classes[j]
             example["_id"] = batch__ids[j]
-
-            # print(f'{batch_generations[j]}')
+            example["compression_ratio"] = float(f"{cr:.4f}")
             predictions.append(example)
 
     with open(json_output_path, "w") as fout_json:
@@ -423,6 +451,14 @@ if __name__ == "__main__":
     parser.add_argument("--pruning_ratio", type=float, default=0.4, help="pruning ratio of Key Cache")
     parser.add_argument("--rank", type=int, default=1024, help="rank of up and down matrix")
     parser.add_argument("--layer_step", type=int, default=2, help="how many layers connect to one")
+    
+    # APKVC Specific Arguments
+    parser.add_argument("--predictor_type", type=str, default="identity", choices=["identity", "linear"], help="APKVC predictor type")
+    parser.add_argument("--rd_threshold", type=float, default=0.05, help="APKVC rate-distortion threshold")
+    parser.add_argument("--max_anchor_interval", type=int, default=16, help="APKVC max tokens between anchors")
+    parser.add_argument("--K_num_codebooks", type=int, default=4, help="APKVC codebooks for keys")
+    parser.add_argument("--V_num_codebooks", type=int, default=2, help="APKVC codebooks for values")
+
     parser.add_argument(
         "--require_head_wise_ranks",
         action="store_true",

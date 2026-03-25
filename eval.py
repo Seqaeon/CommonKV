@@ -87,7 +87,7 @@ def parse_args(args=None):
     parser.add_argument('--longbench_e', action='store_true', help="Evaluate on LongBench-E")
     return parser.parse_args(args)
 
-def scorer_e(dataset, predictions, answers, lengths, all_classes):
+def scorer_e(dataset, predictions, answers, lengths, all_classes, ratios=None):
     scores = {"0-4k": [], "4-8k": [], "8k+": []}
     for (prediction, ground_truths, length) in zip(predictions, answers, lengths):
         score = 0.
@@ -99,13 +99,13 @@ def scorer_e(dataset, predictions, answers, lengths, all_classes):
             scores["0-4k"].append(score)
         elif length < 8000:
             scores["4-8k"].append(score)
-        else:
-            scores["8k+"].append(score)
+    avg_ratio = np.mean(ratios) if ratios is not None and len(ratios) > 0 else 1.0
+    final_scores = {}
     for key in scores.keys():
-        scores[key] = round(100 * np.mean(scores[key]), 2)
-    return scores
+        final_scores[key] = round(100 * np.mean(scores[key]), 2) if len(scores[key]) > 0 else 0.0
+    return final_scores, avg_ratio
 
-def scorer(dataset, predictions, answers, all_classes):
+def scorer(dataset, predictions, answers, all_classes, ratios=None):
     total_score = 0.
     for (prediction, ground_truths) in zip(predictions, answers):
         score = 0.
@@ -114,9 +114,10 @@ def scorer(dataset, predictions, answers, all_classes):
         for ground_truth in ground_truths:
             score = max(score, dataset2metric[dataset](prediction, ground_truth, all_classes=all_classes))
         total_score += score
-    if len(predictions) == 0:
-        return 0.0
-    return round(100 * total_score / len(predictions), 2)
+    
+    avg_score = round(100 * total_score / len(predictions), 2) if len(predictions) > 0 else 0.0
+    avg_ratio = np.mean(ratios) if ratios is not None and len(ratios) > 0 else 1.0
+    return avg_score, avg_ratio
 
 if __name__ == '__main__':
     args = parse_args()
@@ -157,7 +158,7 @@ if __name__ == '__main__':
                     row.append(-1)
                     continue
 
-                predictions, answers, lengths = [], [], []
+                predictions, answers, lengths, ratios = [], [], [], []
                 with open(args.eval_file, "r", encoding="utf-8") as f:
                     for line in f:
                         try:
@@ -167,6 +168,8 @@ if __name__ == '__main__':
                             all_classes = data["all_classes"]
                             if "length" in data:
                                 lengths.append(data["length"])
+                            if "compression_ratio" in data:
+                                ratios.append(data["compression_ratio"])
                         except Exception:
                             continue
 
@@ -175,13 +178,13 @@ if __name__ == '__main__':
                     continue
 
                 if args.longbench_e:
-                    score = scorer_e(args.dataset, predictions, answers, lengths, all_classes)
+                    score, cr = scorer_e(args.dataset, predictions, answers, lengths, all_classes, ratios=ratios)
                 else:
-                    score = scorer(args.dataset, predictions, answers, all_classes)
+                    score, cr = scorer(args.dataset, predictions, answers, all_classes, ratios=ratios)
                     
-                row.append(score)
+                row.append(f"{score} (CR: {cr:.4f})")
                 
-                scores = {args.dataset: score}
+                scores = {args.dataset: score, "compression_ratio": cr}
                 output_dir = os.path.dirname(args.eval_file)
                 with open(os.path.join(output_dir, "metrics.json"), "w") as f:
                     json.dump(scores, f, ensure_ascii=False, indent=4)

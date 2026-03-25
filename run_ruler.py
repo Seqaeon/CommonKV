@@ -222,6 +222,14 @@ def main(args):
             args.rank = palu_rank
         
         
+        if args.method.lower() in ["apkvc", "custom"]:
+            for i in range(len(model.model.layers)):
+                model.model.layers[i].self_attn.config.predictor_type = args.predictor_type
+                model.model.layers[i].self_attn.config.rd_threshold = args.rd_threshold
+                model.model.layers[i].self_attn.config.max_anchor_interval = args.max_anchor_interval
+                model.model.layers[i].self_attn.config.K_num_codebooks = args.K_num_codebooks
+                model.model.layers[i].self_attn.config.V_num_codebooks = args.V_num_codebooks
+
         if args.method.lower() not in ["fullkv", "ours", "commonkv", "apkvc", "custom"] :
             if args.method.lower() in ["snapkv","pyramidkv","h2o","cam", "l2norm", "think", "palu", "minicache"]:
                 window_sizes = 8
@@ -349,6 +357,14 @@ if __name__ == "__main__":
     parser.add_argument("--max_datasets", type=int, default=-1, help="maximum number of datasets to evaluate.")
     parser.add_argument("--rank", type=int, default=1024, help="rank of up and down matrix")
     parser.add_argument("--layer_step", type=int, default=2, help="how many layers connect to one")
+    
+    # APKVC Specific Arguments
+    parser.add_argument("--predictor_type", type=str, default="identity", choices=["identity", "linear"], help="APKVC predictor type")
+    parser.add_argument("--rd_threshold", type=float, default=0.05, help="APKVC rate-distortion threshold")
+    parser.add_argument("--max_anchor_interval", type=int, default=16, help="APKVC max tokens between anchors")
+    parser.add_argument("--K_num_codebooks", type=int, default=4, help="APKVC codebooks for keys")
+    parser.add_argument("--V_num_codebooks", type=int, default=2, help="APKVC codebooks for values")
+
     parser.add_argument("--context_lengths", type=int, nargs="+", default=None, help="Context lengths to evaluate. Defaults to DEFAULT_CONTEXT_LENGTHS.")
     parser.add_argument(
         "--require_head_wise_ranks",
