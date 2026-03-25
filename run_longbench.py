@@ -81,7 +81,7 @@ model2maxlen = {
 }
 
 OOM_PRONE_METHODS = {
-    "snapkv", "pyramidkv", "h2o", "cam", "l2norm", "adakv", "headkv", "streamingllm"
+    "snapkv", "pyramidkv", "h2o", "cam", "l2norm", "adakv", "headkv", "streamingllm", "think", "palu", "minicache", "custom"
 }
 
 

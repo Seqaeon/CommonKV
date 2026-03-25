@@ -122,7 +122,9 @@ def main(args):
             model_max_len = model2maxlen[key]
     
     # Parity with run_longbench.py: Cap prefill length for OOM-prone methods
-    OOM_PRONE_METHODS = ["snapkv", "pyramidkv", "h2o", "cam", "l2norm"]
+    OOM_PRONE_METHODS = {
+    "snapkv", "pyramidkv", "h2o", "cam", "l2norm", "adakv", "headkv", "streamingllm", "think", "palu", "minicache", "custom"
+}
     if args.method and args.method.lower() in OOM_PRONE_METHODS and model_max_len > args.max_prefill_tokens_for_custom_methods:
         print(
             f"[WARN] Capping prefill length from {model_max_len} to {args.max_prefill_tokens_for_custom_methods} "

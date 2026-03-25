@@ -1269,7 +1269,7 @@ class PaluCluster():
             flat_v = value_states.view(-1, seq, d).to(torch.float32)
             try:
                 U, S, V = torch.linalg.svd(flat_v, full_matrices=False)
-                self.A_v = V[:, :rank, :].transpose(1, 2).to(key_states.dtype)
+                self.A_v = V[:, :rank, :].transpose(1, 2).to(value_states.dtype)
             except:
                 self.A_v = torch.eye(d, rank, device=value_states.device, dtype=value_states.dtype).unsqueeze(0).expand(bsz*heads, -1, -1)
 
@@ -1286,21 +1286,50 @@ class PaluCluster():
 
         key_states_rec = project_rec(key_states, self.A_k)
         value_states_rec = project_rec(value_states, self.A_v)
-
         return key_states_rec, value_states_rec
 
 
+# ============================================================
+# BaseCluster - Minimal parent for custom methods
+# ============================================================
 
+class BaseCluster:
+    def __init__(self, **kwargs):
+        pass
+    def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
+        return key_states, value_states
 
+def init_kv_cluster(self, method_name):
+    """
+    Initializes the KV cluster based on the method name.
+    """
+    method_name = method_name.lower()
+    if method_name == 'h2o':
+        return init_h2o(self)
+    elif method_name == 'streamingllm':
+        return init_StreamingLLM(self)
+    elif method_name == 'adakv':
+        return init_adakv(self)
+    elif method_name == 'headkv':
+        return init_headkv(self)
+    elif method_name == 'think':
+        return init_think(self)
+    elif method_name == 'palu':
+        return init_palu(self)
+    elif method_name == 'minicache':
+        return init_minicache(self)
+    elif method_name == 'custom':
+        return init_custom(self)
+    else:
+        return None
 
 # ============================================================
-# Init functions — always recreate cluster to pick up fresh config
+# Init functions 
 # ============================================================
 
 def init_think(self):
     """Initialize ThinKCluster from current config values."""
-    # Always recreate so config changes from run_longbench take effect
-    self.kv_cluster = ThinKCluster(
+    return ThinKCluster(
         window_size=getattr(self.config, 'window_size', 32),
         max_capacity_prompt=getattr(self.config, 'max_capacity_prompt', 512),
         kernel_size=getattr(self.config, 'kernel_size', 5),
@@ -1309,31 +1338,24 @@ def init_think(self):
         recent_size=getattr(self.config, 'recent_size', 32),
         ratio=getattr(self.config, 'ratio', 0.0),
     )
-
 
 def init_minicache(self):
-    """Initialize MiniCacheCluster from current config values."""
-    self.kv_cluster = MiniCacheCluster(
-        max_capacity_prompt=getattr(self.config, 'max_capacity_prompt', 512),
-        angle_threshold=getattr(self.config, 'angle_threshold', 0.2),
-        window_size=getattr(self.config, 'window_size', 32),
-        kernel_size=getattr(self.config, 'kernel_size', 5),
-        pooling=getattr(self.config, 'pooling', 'avgpool'),
-        merge=getattr(self.config, 'merge', None),
-        recent_size=getattr(self.config, 'recent_size', 32),
-        ratio=getattr(self.config, 'ratio', 0.0),
-    )
-
+    """Initialize MiniCacheCluster."""
+    k_recent = getattr(self.config, "recent_size", 32)
+    angle_threshold = getattr(self.config, "angle_threshold", 0.2)
+    return MiniCacheCluster(k_recent=k_recent, angle_threshold=angle_threshold)
 
 def init_palu(self):
-    """Initialize PaluCluster from current config values."""
-    self.kv_cluster = PaluCluster(
+    """Initialize PaluCluster."""
+    return PaluCluster(
         max_capacity_prompt=getattr(self.config, 'max_capacity_prompt', 512),
         rank=getattr(self.config, 'rank', None),
         ratio=getattr(self.config, 'ratio', 0.5),
-        window_size=getattr(self.config, 'window_size', 32),
-        kernel_size=getattr(self.config, 'kernel_size', 5),
-        pooling=getattr(self.config, 'pooling', 'avgpool'),
-        merge=getattr(self.config, 'merge', None),
-        recent_size=getattr(self.config, 'recent_size', 32),
     )
+
+def init_custom(self):
+    """Generic initialization for user's custom method scaffold."""
+    from custom_kv_template import MyCustomCluster
+    # Pass all relevant config to the custom cluster
+    config_dict = self.config.to_dict() if hasattr(self.config, "to_dict") else {}
+    return MyCustomCluster(**config_dict)
