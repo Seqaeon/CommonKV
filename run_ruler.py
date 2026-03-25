@@ -135,6 +135,22 @@ def main(args):
         for line in fp:
 
             example = json.loads(line)
+            
+            # Robust key mapping for different RULER formats
+            # Format A: length, input, outputs
+            # Format B: context, question, answer
+            
+            if "length" not in example:
+                # If length is missing, we approximate or use 0
+                example["length"] = len(example.get("context", "")) + len(example.get("question", ""))
+            
+            if "input" not in example:
+                example["input"] = example.get("context", "") + example.get("question", "")
+            
+            if "outputs" not in example:
+                ans = example.get("answer", "")
+                example["outputs"] = [ans] if not isinstance(ans, list) else ans
+                
             length = example["length"]
             if length > input_max_len: 
                 input_max_len = length
