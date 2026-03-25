@@ -93,6 +93,8 @@ def canonicalize_method_name(method_name: str) -> str:
         "l2norm": "L2Norm",
         "cam": "CAM",
         "think": "ThinK",
+        "palu": "Palu",
+        "minicache": "MiniCache",
     }
     return canonical_map.get(method_name.lower(), method_name)
 
@@ -195,6 +197,9 @@ def main(args):
             kernel_sizes = 7
             pooling = "maxpool"
 
+            ratio = args.pruning_ratio
+            recent_size = args.recent_size
+
             layers = len(model.model.layers)
             # check if window_sizes is a list
             if not isinstance(window_sizes, list):
@@ -203,11 +208,18 @@ def main(args):
                 max_capacity_prompts = [max_capacity_prompts] * layers
             if not isinstance(kernel_sizes, list):
                 kernel_sizes = [kernel_sizes] * layers
+            if not isinstance(ratio, list):
+                ratio = [ratio] * layers
+            if not isinstance(recent_size, list):
+                recent_size = [recent_size] * layers
+
             for i in range(layers):
                 model.model.layers[i].self_attn.config.window_size = window_sizes[i]
                 model.model.layers[i].self_attn.config.max_capacity_prompt = max_capacity_prompts[i]
                 model.model.layers[i].self_attn.config.kernel_size = kernel_sizes[i]
                 model.model.layers[i].self_attn.config.pooling = pooling
+                model.model.layers[i].self_attn.config.ratio = ratio[i]
+                model.model.layers[i].self_attn.config.recent_size = recent_size[i]
 
         context_length = batch_input_ids.shape[-1]
         if args.quant_method == None:        
@@ -291,6 +303,8 @@ if __name__ == "__main__":
     parser.add_argument("--nbits", type=int, default=8, help="")
     parser.add_argument("--max_capacity_prompts", type=int, default=512, help="")
     parser.add_argument("--max_capacity_prompts_ratio", type=float, default=-1, help="")
+    parser.add_argument("--pruning_ratio", type=float, default=0.4, help="")
+    parser.add_argument("--recent_size", type=int, default=32, help="")
     parser.add_argument("--steps", type=int, default=-1, help="maximum number of examples to evaluate per task.")
     parser.add_argument("--max_datasets", type=int, default=-1, help="maximum number of datasets to evaluate.")
     parser.add_argument("--rank", type=int, default=1024, help="rank of up and down matrix")
