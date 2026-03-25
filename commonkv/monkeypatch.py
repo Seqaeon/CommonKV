@@ -48,6 +48,7 @@ def _replace_llama_attention_forward(method):
         "palu": llama_attn_forward_Palu,
         "minicache": llama_attn_forward_MiniCache,
         "custom": llama_attn_forward_Custom,
+        "apkvc": llama_attn_forward_Custom,
     }
     forward_fn = attn_method_map.get(method)
     if forward_fn is None:
@@ -82,6 +83,7 @@ def _replace_mistral_attention_forward(method):
         "palu": mistral_attn_forward_Palu,
         "minicache": mistral_attn_forward_MiniCache,
         "custom": mistral_attn_forward_Custom,
+        "apkvc": mistral_attn_forward_Custom,
     }
     forward_fn = attn_method_map.get(method)
     if forward_fn is None:

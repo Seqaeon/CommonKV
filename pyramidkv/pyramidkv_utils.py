@@ -1318,7 +1318,7 @@ def init_kv_cluster(self, method_name):
         return init_palu(self)
     elif method_name == 'minicache':
         return init_minicache(self)
-    elif method_name == 'custom':
+    elif method_name in ['custom', 'apkvc']:
         return init_custom(self)
     else:
         return None
