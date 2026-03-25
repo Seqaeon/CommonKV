@@ -9,7 +9,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from typing import List
 from svd_utils import get_rank
-from commonkv.device_utils import get_device, seed_everything, cleanup_memory
+from commonkv.device_utils import get_device, seed_everything, cleanup_memory, get_preferred_dtype, prepare_model_for_device
 
 
 # Default context length list if nothing is specified via CLI
@@ -413,11 +413,12 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         config=config,
-        torch_dtype=torch.float16,
+        torch_dtype=get_preferred_dtype(),
         low_cpu_mem_usage=True,
         device_map="auto",
         attn_implementation=args.attn_implementation,
     )
+    model = prepare_model_for_device(model, get_device())
 
     if args.method.lower() in ['ours', 'commonkv']:
         RANK = args.rank

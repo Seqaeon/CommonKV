@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 import torch
 from svd_utils import get_rank
-from commonkv.device_utils import get_device, seed_everything, cleanup_memory
+from commonkv.device_utils import get_device, seed_everything, cleanup_memory, get_preferred_dtype, prepare_model_for_device
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
 datasets = [
@@ -517,12 +517,12 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         config=config,
-        torch_dtype=torch.float16,
+        torch_dtype=get_preferred_dtype(),
         low_cpu_mem_usage=True,
         device_map="auto",
         attn_implementation=args.attn_implementation,
-        # lrd_method=args.lrd_method
     )
+    model = prepare_model_for_device(model, get_device())
 
     # Ensure tokenizer has pad_token correctly set
     if tokenizer.pad_token_id is None:

@@ -42,3 +42,23 @@ def cleanup_memory():
         pass
     import gc
     gc.collect()
+
+def get_preferred_dtype():
+    """Return the preferred floating point dtype for the current hardware."""
+    device = get_device()
+    if device.type == "xla":
+        return torch.bfloat16 # TPUs love bfloat16, float16 often fails
+    if device.type == "cuda":
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float16
+    return torch.float32
+
+def prepare_model_for_device(model, device):
+    """Ensure the model is fully moved to the target device."""
+    if device.type == "xla":
+        # For XLA, we often need to move it explicitly if device_map="auto" failed
+        return model.to(device)
+    # On CUDA, device_map="auto" usually handles this perfectly.
+    # If the model is already on the device, .to() is a no-op.
+    return model.to(device)
