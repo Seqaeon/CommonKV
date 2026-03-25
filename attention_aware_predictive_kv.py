@@ -33,8 +33,8 @@ def rope_rotate(x: torch.Tensor, position: int, base: float = 10000.0) -> torch.
     i = torch.arange(0, D // 2, dtype=torch.float32, device=device)
     theta = base ** (-2 * i / D)
     angle = position * theta
-    cos = torch.cos(angle)
-    sin = torch.sin(angle)
+    cos = torch.cos(angle).to(x.dtype)
+    sin = torch.sin(angle).to(x.dtype)
     
     x_even = x[..., 0::2]
     x_odd = x[..., 1::2]
@@ -51,8 +51,8 @@ def rope_derotate(x: torch.Tensor, position: int, base: float = 10000.0) -> torc
     i = torch.arange(0, D // 2, dtype=torch.float32, device=device)
     theta = base ** (-2 * i / D)
     angle = position * theta
-    cos = torch.cos(angle)
-    sin = torch.sin(angle)
+    cos = torch.cos(angle).to(x.dtype)
+    sin = torch.sin(angle).to(x.dtype)
     
     x_even = x[..., 0::2]
     x_odd = x[..., 1::2]
@@ -102,7 +102,7 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         
         self.initialized = False
 
-    def _init_lazy(self, head_dim, device):
+    def _init_lazy(self, head_dim, device, dtype):
         """Lazy initialization of codebooks once head_dim is known."""
         self.head_dim = head_dim
         # Initialize codebooks randomly for now (Calibration usually fits these)
@@ -111,12 +111,12 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         
         # Create M codebooks for K
         for _ in range(self.apkvc_config.K_num_codebooks):
-            cb = nn.Parameter(torch.randn(self.apkvc_config.codebook_size, head_dim, device=device) * 0.01)
+            cb = nn.Parameter(torch.randn(self.apkvc_config.codebook_size, head_dim, device=device, dtype=dtype) * 0.01)
             self.codebooks_K.append(cb)
             
         # Create M codebooks for V
         for _ in range(self.apkvc_config.V_num_codebooks):
-            cb = nn.Parameter(torch.randn(self.apkvc_config.codebook_size, head_dim, device=device) * 0.01)
+            cb = nn.Parameter(torch.randn(self.apkvc_config.codebook_size, head_dim, device=device, dtype=dtype) * 0.01)
             self.codebooks_V.append(cb)
             
         self.initialized = True
@@ -144,7 +144,10 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
 
     def additive_decode(self, indices, codebooks):
         """Reconstruct residual from indices."""
-        out = torch.zeros(indices[0].shape[0], indices[0].shape[1], self.head_dim, device=indices[0].device)
+        # Use first codebook to determine device and dtype
+        device = codebooks[0].device
+        dtype = codebooks[0].dtype
+        out = torch.zeros(indices[0].shape[0], indices[0].shape[1], self.head_dim, device=device, dtype=dtype)
         for idx, C in zip(indices, codebooks):
             out += C[idx]
         return out
@@ -153,6 +156,10 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         """Compute key-dot distortion proxy."""
         # Q: [B, H, 1, D]
         # K_true, K_reconstructed: [B, H, 1, D]
+        dtype = Q.dtype
+        K_true = K_true.to(dtype)
+        K_reconstructed = K_reconstructed.to(dtype)
+        
         scale = math.sqrt(self.head_dim)
         scores_true = torch.einsum('bhqd,bhkd->bhqk', Q, K_true) / scale
         scores_comp = torch.einsum('bhqd,bhkd->bhqk', Q, K_reconstructed) / scale
@@ -185,7 +192,7 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         device = query_states.device
         
         if not self.initialized:
-            self._init_lazy(head_dim, device)
+            self._init_lazy(head_dim, device, query_states.dtype)
 
         # We assume t is the current sequence position
         # In this repo's Custom implementation, update_kv is called with:
