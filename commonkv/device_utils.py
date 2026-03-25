@@ -56,9 +56,14 @@ def get_preferred_dtype():
 
 def prepare_model_for_device(model, device):
     """Ensure the model is fully moved to the target device."""
+    # If the model has a device_map (accelerate), DO NOT call .to() for CUDA.
+    # Calling .to() on a fragmented model leads to 'tensors on different device' errors.
+    if device.type == "cuda" and hasattr(model, "hf_device_map"):
+        return model
+        
     if device.type == "xla":
         # For XLA, we often need to move it explicitly if device_map="auto" failed
         return model.to(device)
-    # On CUDA, device_map="auto" usually handles this perfectly.
-    # If the model is already on the device, .to() is a no-op.
+    
+    # If it's already on the device, .to() is a no-op.
     return model.to(device)
