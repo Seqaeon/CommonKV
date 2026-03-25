@@ -3461,22 +3461,18 @@ def mistral_attn_forward_Custom(
 
     if past_key_value is not None:
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        if self.method in ['custom', 'apkvc']:
-            if key_states.shape[-2] >= kv_seq_len:  # prefill
-                self.kv_seq_len = kv_seq_len
-                key_states, value_states = self.kv_cluster.update_kv(key_states, query_states, value_states, attention_mask, self.num_key_value_groups)
-                past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            else:
-                self.kv_seq_len += q_len
-                key_states, value_states = self.kv_cluster.update_kv(key_states, query_states, value_states, attention_mask, self.num_key_value_groups)
-                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        if not hasattr(self, "kv_cluster"):
+            from pyramidkv.pyramidkv_utils import init_custom
+            self.kv_cluster = init_custom(self)
+
+        if key_states.shape[-2] >= kv_seq_len:  # prefill
+            self.kv_seq_len = kv_seq_len
+            key_states, value_states = self.kv_cluster.update_kv(key_states, query_states, value_states, attention_mask, self.num_key_value_groups)
+            past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
         else:
-            if key_states.shape[-2] >= kv_seq_len:  # prefill
-                self.kv_seq_len = kv_seq_len
-                past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            else:
-                self.kv_seq_len += q_len
-                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            self.kv_seq_len += q_len
+            key_states, value_states = self.kv_cluster.update_kv(key_states, query_states, value_states, attention_mask, self.num_key_value_groups)
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
         past_key_value._seen_tokens = self.kv_seq_len
 
     attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
