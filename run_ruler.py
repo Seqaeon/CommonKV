@@ -9,6 +9,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from typing import List
 from svd_utils import get_rank
+from commonkv.device_utils import get_device, seed_everything, cleanup_memory
 
 
 # Default context length list if nothing is specified via CLI
@@ -55,13 +56,7 @@ model2maxlen = {
 
 
 def set_seed(seed):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.cuda.manual_seed_all(seed)
+    seed_everything(seed)
 
 def build_chat(prompt):
         prompt = f"[INST] {prompt} [/INST]"
@@ -198,7 +193,7 @@ def main(args):
         batch_answers = outputs_list[i:i+args.eval_batch_size]
         batch_lengths = length_list[i:i+args.eval_batch_size]
         
-        tokenized_prompts = tokenizer(batch_prompts, padding="longest", return_tensors="pt", add_special_tokens=True).to('cuda')
+        tokenized_prompts = tokenizer(batch_prompts, padding="longest", return_tensors="pt", add_special_tokens=True).to(get_device())
         batch_input_ids = tokenized_prompts.input_ids
         attention_mask = tokenized_prompts.attention_mask
 
@@ -206,7 +201,7 @@ def main(args):
             half = int(model_max_len/2)
             prompt = tokenizer.decode(batch_input_ids[0][:half], skip_special_tokens=True)+tokenizer.decode(batch_input_ids[0][-half:], skip_special_tokens=True)
             
-            tokenized_prompts = tokenizer(prompt, padding="longest", return_tensors="pt", add_special_tokens=True).to('cuda')
+            tokenized_prompts = tokenizer(prompt, padding="longest", return_tensors="pt", add_special_tokens=True).to(get_device())
             batch_input_ids = tokenized_prompts.input_ids
             attention_mask = tokenized_prompts.attention_mask
 
@@ -295,7 +290,7 @@ def main(args):
         batch_outputs = tokenizer.batch_decode(output[:, context_length:], skip_special_tokens=True)
         batch_generations = batch_outputs
 
-        torch.cuda.empty_cache()
+        cleanup_memory()
         
         for j in range(len(batch_prompts)):
             
