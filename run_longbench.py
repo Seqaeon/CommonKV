@@ -418,7 +418,7 @@ if __name__ == "__main__":
     parser.add_argument("--base_dir", type=str, default="")
     parser.add_argument("--dataset", type=str, default="")
     parser.add_argument("--data_file", type=str, default="")
-    parser.add_argument("--save_dir", type=str, default="")
+    parser.add_argument("--save_dir", type=str, default="results_long_bench")
 
     parser.add_argument("--model_name", type=str, default=None, help="if specified, we will load the model to generate the predictions.")
     parser.add_argument("--model_path", type=str, default=None, help="if specified, we will load the model to generate the predictions.")

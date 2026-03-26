@@ -62,6 +62,23 @@ dataset_list = [
     "repobench-p"
 ]
 
+def find_case_insensitive_path(path):
+    if not path or os.path.exists(path):
+        return path
+    parent = os.path.dirname(path)
+    if not os.path.exists(parent):
+        return path
+    target = os.path.basename(path).lower()
+    try:
+        for entry in os.listdir(parent):
+            if entry.lower() == target:
+                new_path = os.path.join(parent, entry)
+                print(f"[INFO] Path mismatch detected. Using case-insensitive match: {new_path}")
+                return new_path
+    except Exception:
+        pass
+    return path
+
 def discover_methods_and_datasets(results_dir: str):
     methods = set()
     datasets = set()
@@ -124,6 +141,7 @@ if __name__ == '__main__':
     args = parse_args()
     
     # Discovery / Argument handling
+    args.results_dir = find_case_insensitive_path(args.results_dir)
     discovered_methods, discovered_datasets = discover_methods_and_datasets(args.results_dir)
     
     if args.methods:
@@ -136,6 +154,13 @@ if __name__ == '__main__':
             
     dataset_list = discovered_datasets if not args.datasets else [d.strip() for d in args.datasets.split(",")]
     
+    if not dataset_list:
+        print(f"\n[ERROR] No datasets found in: {args.results_dir}")
+        print("Expected structure: results_dir/dataset_name/method_name.json")
+        print("Please check your results folder or --results_dir argument.\n")
+        import sys
+        sys.exit(1)
+
     # method_scores[method][dataset] = float_score
     method_scores = {m: {} for m in methods}
 
