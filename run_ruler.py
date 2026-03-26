@@ -229,6 +229,7 @@ def main(args):
                 model.model.layers[i].self_attn.config.max_anchor_interval = args.max_anchor_interval
                 model.model.layers[i].self_attn.config.K_num_codebooks = args.K_num_codebooks
                 model.model.layers[i].self_attn.config.V_num_codebooks = args.V_num_codebooks
+                model.model.layers[i].self_attn.config.apkvc_calibration_path = args.apkvc_calibration_path
 
         if args.method.lower() not in ["fullkv", "ours", "commonkv", "apkvc", "custom"] :
             if args.method.lower() in ["snapkv","pyramidkv","h2o","cam", "l2norm", "think", "palu", "minicache"]:
@@ -387,6 +388,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_anchor_interval", type=int, default=16, help="APKVC max tokens between anchors")
     parser.add_argument("--K_num_codebooks", type=int, default=4, help="APKVC codebooks for keys")
     parser.add_argument("--V_num_codebooks", type=int, default=2, help="APKVC codebooks for values")
+    parser.add_argument("--apkvc_calibration_path", type=str, default=None, help="Optional path to calibrated APKVC codebooks (.pt)")
 
     parser.add_argument("--context_lengths", type=int, nargs="+", default=None, help="Context lengths to evaluate. Defaults to DEFAULT_CONTEXT_LENGTHS.")
     parser.add_argument(
