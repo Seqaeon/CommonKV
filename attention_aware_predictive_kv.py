@@ -158,8 +158,10 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
     def _append_trace_samples(self, delta_K_base, delta_V):
         if not self.apkvc_config.trace_output_path:
             return
-        k = delta_K_base.squeeze(2).reshape(-1, delta_K_base.shape[-1]).detach().to("cpu", dtype=torch.float32)
-        v = delta_V.squeeze(2).reshape(-1, delta_V.shape[-1]).detach().to("cpu", dtype=torch.float32)
+        k = delta_K_base.reshape(-1, delta_K_base.shape[-1]).detach().to("cpu", dtype=torch.float32)
+        v = delta_V.reshape(-1, delta_V.shape[-1]).detach().to("cpu", dtype=torch.float32)
+        if k.numel() == 0 or v.numel() == 0:
+            return
         AttentionAwarePredictiveKVCluster._trace_delta_k.append(k)
         AttentionAwarePredictiveKVCluster._trace_delta_v.append(v)
         total = sum(x.shape[0] for x in AttentionAwarePredictiveKVCluster._trace_delta_k)
@@ -172,46 +174,6 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
                 dropped = AttentionAwarePredictiveKVCluster._trace_delta_k.pop(0).shape[0]
                 AttentionAwarePredictiveKVCluster._trace_delta_v.pop(0)
                 total -= dropped
-
-    def _try_load_calibrated_codebooks(self, head_dim, device, dtype):
-        path = self.apkvc_config.calibration_path
-        if not path:
-            return False
-        if not os.path.isfile(path):
-            print(f"[APKVC][WARN] calibration file not found: {path}. Falling back to random codebooks.")
-            return False
-        try:
-            payload = torch.load(path, map_location="cpu")
-            k_cbs = payload["K_codebooks"]
-            v_cbs = payload["V_codebooks"]
-            if isinstance(k_cbs, list):
-                k_cbs = torch.stack(k_cbs, dim=0)
-            if isinstance(v_cbs, list):
-                v_cbs = torch.stack(v_cbs, dim=0)
-            # expected: [num_codebooks, codebook_size, head_dim]
-            if k_cbs.dim() != 3 or v_cbs.dim() != 3:
-                raise ValueError("calibrated codebooks must be rank-3 tensors")
-            if k_cbs.shape[-1] != head_dim or v_cbs.shape[-1] != head_dim:
-                raise ValueError(
-                    f"head_dim mismatch: expected {head_dim}, got K={k_cbs.shape[-1]}, V={v_cbs.shape[-1]}"
-                )
-            if k_cbs.shape[0] != self.apkvc_config.K_num_codebooks or v_cbs.shape[0] != self.apkvc_config.V_num_codebooks:
-                raise ValueError(
-                    "num_codebooks mismatch between config and calibration file "
-                    f"(K expected={self.apkvc_config.K_num_codebooks}, file={k_cbs.shape[0]}; "
-                    f"V expected={self.apkvc_config.V_num_codebooks}, file={v_cbs.shape[0]})"
-                )
-            self.codebooks_K = nn.ParameterList(
-                [nn.Parameter(k_cbs[i].to(device=device, dtype=dtype).contiguous()) for i in range(k_cbs.shape[0])]
-            )
-            self.codebooks_V = nn.ParameterList(
-                [nn.Parameter(v_cbs[i].to(device=device, dtype=dtype).contiguous()) for i in range(v_cbs.shape[0])]
-            )
-            print(f"[APKVC] Loaded calibrated codebooks from: {path}")
-            return True
-        except Exception as e:
-            print(f"[APKVC][WARN] failed to load calibration file '{path}': {e}. Using random codebooks.")
-            return False
 
     def _try_load_calibrated_codebooks(self, head_dim, device, dtype):
         path = self.apkvc_config.calibration_path
@@ -382,6 +344,11 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         
         # 1. Prefill / Multi-token fallback
         if key_states.shape[-2] > 1:
+            if self.apkvc_config.trace_output_path and key_states.shape[-2] > 1:
+                prefill_delta_k = key_states[:, :, 1:, :] - key_states[:, :, :-1, :]
+                prefill_delta_v = value_states[:, :, 1:, :] - value_states[:, :, :-1, :]
+                # For prefill traces we keep deltas in current space; decode-time traces remain RoPE-base.
+                self._append_trace_samples(prefill_delta_k, prefill_delta_v)
             for i in range(key_states.shape[-2]):
                 self.entries.append({'is_anchor': True, 'position': t + i})
             self.last_anchor_t = t + key_states.shape[-2] - 1
