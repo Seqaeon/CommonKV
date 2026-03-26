@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import math
 import os
+import atexit
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict
 from pyramidkv.pyramidkv_utils import BaseCluster
@@ -27,6 +28,8 @@ class APKVCConfig:
     residual_norm_threshold_K: float = 1.5
     residual_norm_threshold_V: float = 3.0
     calibration_path: Optional[str] = None
+    trace_output_path: Optional[str] = None
+    trace_max_samples: int = 400000
 
 def rope_rotate(x: torch.Tensor, position: int, base: float = 10000.0) -> torch.Tensor:
     """Apply forward RoPE rotation."""
@@ -75,6 +78,12 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
     - Attention-informed reset policy
     """
     
+    _trace_registered = False
+    _trace_output_path = None
+    _trace_max_samples = 400000
+    _trace_delta_k: List[torch.Tensor] = []
+    _trace_delta_v: List[torch.Tensor] = []
+
     def __init__(self, **kwargs):
         super().__init__()
         # Extract config from kwargs or use defaults
@@ -85,6 +94,8 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
             K_num_codebooks=kwargs.get("K_num_codebooks", 4),
             V_num_codebooks=kwargs.get("V_num_codebooks", 2),
             calibration_path=kwargs.get("apkvc_calibration_path", kwargs.get("calibration_path", None)),
+            trace_output_path=kwargs.get("apkvc_trace_output_path", kwargs.get("trace_output_path", None)),
+            trace_max_samples=int(kwargs.get("apkvc_trace_max_samples", kwargs.get("trace_max_samples", 400000))),
         )
         
         self.head_dim = None
@@ -104,6 +115,103 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         self.last_V2 = None
         
         self.initialized = False
+        self._setup_trace_dump()
+
+    @classmethod
+    def _dump_traces_at_exit(cls):
+        if not cls._trace_output_path:
+            return
+        if len(cls._trace_delta_k) == 0 or len(cls._trace_delta_v) == 0:
+            return
+        try:
+            out_dir = os.path.dirname(cls._trace_output_path) or "."
+            os.makedirs(out_dir, exist_ok=True)
+            delta_k = torch.cat(cls._trace_delta_k, dim=0)[: cls._trace_max_samples].contiguous()
+            delta_v = torch.cat(cls._trace_delta_v, dim=0)[: cls._trace_max_samples].contiguous()
+            torch.save(
+                {
+                    "delta_K_base": delta_k.cpu().half(),
+                    "delta_V": delta_v.cpu().half(),
+                    "metadata": {
+                        "num_samples": int(min(delta_k.shape[0], delta_v.shape[0])),
+                        "head_dim": int(delta_k.shape[-1]),
+                    },
+                },
+                cls._trace_output_path,
+            )
+            print(f"[APKVC] dumped trace residuals -> {cls._trace_output_path}")
+        except Exception as e:
+            print(f"[APKVC][WARN] failed to dump traces: {e}")
+
+    def _setup_trace_dump(self):
+        path = self.apkvc_config.trace_output_path
+        if not path:
+            return
+        AttentionAwarePredictiveKVCluster._trace_output_path = path
+        AttentionAwarePredictiveKVCluster._trace_max_samples = max(
+            1, int(self.apkvc_config.trace_max_samples)
+        )
+        if not AttentionAwarePredictiveKVCluster._trace_registered:
+            atexit.register(AttentionAwarePredictiveKVCluster._dump_traces_at_exit)
+            AttentionAwarePredictiveKVCluster._trace_registered = True
+
+    def _append_trace_samples(self, delta_K_base, delta_V):
+        if not self.apkvc_config.trace_output_path:
+            return
+        k = delta_K_base.squeeze(2).reshape(-1, delta_K_base.shape[-1]).detach().to("cpu", dtype=torch.float32)
+        v = delta_V.squeeze(2).reshape(-1, delta_V.shape[-1]).detach().to("cpu", dtype=torch.float32)
+        AttentionAwarePredictiveKVCluster._trace_delta_k.append(k)
+        AttentionAwarePredictiveKVCluster._trace_delta_v.append(v)
+        total = sum(x.shape[0] for x in AttentionAwarePredictiveKVCluster._trace_delta_k)
+        if total > AttentionAwarePredictiveKVCluster._trace_max_samples:
+            # keep only recent chunks under budget
+            while (
+                len(AttentionAwarePredictiveKVCluster._trace_delta_k) > 1
+                and total > AttentionAwarePredictiveKVCluster._trace_max_samples
+            ):
+                dropped = AttentionAwarePredictiveKVCluster._trace_delta_k.pop(0).shape[0]
+                AttentionAwarePredictiveKVCluster._trace_delta_v.pop(0)
+                total -= dropped
+
+    def _try_load_calibrated_codebooks(self, head_dim, device, dtype):
+        path = self.apkvc_config.calibration_path
+        if not path:
+            return False
+        if not os.path.isfile(path):
+            print(f"[APKVC][WARN] calibration file not found: {path}. Falling back to random codebooks.")
+            return False
+        try:
+            payload = torch.load(path, map_location="cpu")
+            k_cbs = payload["K_codebooks"]
+            v_cbs = payload["V_codebooks"]
+            if isinstance(k_cbs, list):
+                k_cbs = torch.stack(k_cbs, dim=0)
+            if isinstance(v_cbs, list):
+                v_cbs = torch.stack(v_cbs, dim=0)
+            # expected: [num_codebooks, codebook_size, head_dim]
+            if k_cbs.dim() != 3 or v_cbs.dim() != 3:
+                raise ValueError("calibrated codebooks must be rank-3 tensors")
+            if k_cbs.shape[-1] != head_dim or v_cbs.shape[-1] != head_dim:
+                raise ValueError(
+                    f"head_dim mismatch: expected {head_dim}, got K={k_cbs.shape[-1]}, V={v_cbs.shape[-1]}"
+                )
+            if k_cbs.shape[0] != self.apkvc_config.K_num_codebooks or v_cbs.shape[0] != self.apkvc_config.V_num_codebooks:
+                raise ValueError(
+                    "num_codebooks mismatch between config and calibration file "
+                    f"(K expected={self.apkvc_config.K_num_codebooks}, file={k_cbs.shape[0]}; "
+                    f"V expected={self.apkvc_config.V_num_codebooks}, file={v_cbs.shape[0]})"
+                )
+            self.codebooks_K = nn.ParameterList(
+                [nn.Parameter(k_cbs[i].to(device=device, dtype=dtype).contiguous()) for i in range(k_cbs.shape[0])]
+            )
+            self.codebooks_V = nn.ParameterList(
+                [nn.Parameter(v_cbs[i].to(device=device, dtype=dtype).contiguous()) for i in range(v_cbs.shape[0])]
+            )
+            print(f"[APKVC] Loaded calibrated codebooks from: {path}")
+            return True
+        except Exception as e:
+            print(f"[APKVC][WARN] failed to load calibration file '{path}': {e}. Using random codebooks.")
+            return False
 
     def _try_load_calibrated_codebooks(self, head_dim, device, dtype):
         path = self.apkvc_config.calibration_path
@@ -317,6 +425,7 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
             delta_K_base = rope_derotate(delta_K, t)
         else:
             delta_K_base = delta_K
+        self._append_trace_samples(delta_K_base, delta_V)
 
         codes_K = self.additive_quantize(delta_K_base.squeeze(2), self.codebooks_K)
         codes_V = self.additive_quantize(delta_V.squeeze(2), self.codebooks_V)

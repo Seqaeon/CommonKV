@@ -33,7 +33,36 @@ Where:
 - `delta_K_base` is key residual in the de-rotated (RoPE base) space
 - `delta_V` is value residual
 
-## 3) Build codebooks from traces
+## 3) Generate traces from LongBench / RULER runs
+
+You can dump APKVC residual traces directly while running the benchmark scripts:
+
+### LongBench trace dump
+```bash
+python run_longbench.py \
+  --method apkvc \
+  --model_path <model_path> \
+  --dataset hotpotqa \
+  --steps 100 \
+  --apkvc_trace_output_path traces/lb_mix.pt \
+  --apkvc_trace_max_samples 400000
+```
+
+### RULER trace dump
+```bash
+python run_ruler.py \
+  --method apkvc \
+  --model_path <model_path> \
+  --dataset niah_single_1 \
+  --context_lengths 16384 \
+  --steps 100 \
+  --apkvc_trace_output_path traces/ruler_16k.pt \
+  --apkvc_trace_max_samples 400000
+```
+
+The trace file is written at process exit.
+
+## 4) Build codebooks from traces
 
 ```bash
 python scripts/calibrate_apkvc_codebooks.py \
@@ -44,7 +73,7 @@ python scripts/calibrate_apkvc_codebooks.py \
   --codebook_size 256
 ```
 
-## 4) Use calibrated codebooks at inference
+## 5) Use calibrated codebooks at inference
 
 ### LongBench
 ```bash
