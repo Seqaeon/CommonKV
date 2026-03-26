@@ -2,6 +2,7 @@ import os
 import json
 import random
 import argparse
+import time
 import numpy as np
 import torch
 
@@ -91,6 +92,10 @@ def canonicalize_method_name(method_name: str) -> str:
         "think": "ThinK",
         "palu": "Palu",
         "minicache": "MiniCache",
+        "apkvc": "apkvc",
+        "custom": "custom",
+        "commonkv": "commonkv",
+        "ours": "commonkv",
     }
     return canonical_map.get(method_name.lower(), method_name)
 
@@ -118,7 +123,7 @@ def main(args):
     
     # Parity with run_longbench.py: Cap prefill length for OOM-prone methods
     OOM_PRONE_METHODS = {
-    "snapkv", "pyramidkv", "h2o", "cam", "l2norm", "adakv", "headkv", "streamingllm", "think", "palu", "minicache", "custom"
+    "snapkv", "pyramidkv", "h2o", "cam", "l2norm", "adakv", "headkv", "streamingllm", "think", "palu", "minicache", "custom", "apkvc"
 }
     if args.method and args.method.lower() in OOM_PRONE_METHODS and model_max_len > args.max_prefill_tokens_for_custom_methods:
         print(
@@ -262,6 +267,7 @@ def main(args):
                 model.model.layers[i].self_attn.config.rank = args.rank
 
         context_length = batch_input_ids.shape[-1]
+        start_time = time.time()
         if args.quant_method == None:        
             output = model.generate(
                 **tokenized_prompts,
@@ -286,6 +292,10 @@ def main(args):
                 cache_implementation="quantized", 
                 cache_config={"nbits": args.nbits, "backend": "HQQ","device":"cuda","residual_length":output_max_len,"axis_key":1,"q_group_size":64},
             )
+        end_time = time.time()
+        latency = end_time - start_time
+        num_tokens = output.shape[-1] - context_length
+        tps = num_tokens / latency if latency > 0 else 0
 
         batch_outputs = tokenizer.batch_decode(output[:, context_length:], skip_special_tokens=True)
         batch_generations = batch_outputs
@@ -293,13 +303,31 @@ def main(args):
         cleanup_memory()
         
         for j in range(len(batch_prompts)):
-            
+            # Keep compression_ratio semantics aligned with run_longbench.py
+            cr = 1.0
+            if args.method.lower() == "fullkv":
+                cr = 1.0
+            elif args.method.lower() in ["snapkv", "pyramidkv", "h2o", "think", "minicache", "streamingllm"]:
+                avg_cap = sum(max_capacity_prompts) / len(max_capacity_prompts) if isinstance(max_capacity_prompts, list) else max_capacity_prompts
+                cr = min(1.0, avg_cap / (batch_lengths[j] + output_max_len))
+            elif args.method.lower() == "palu":
+                cr = getattr(args, "pruning_ratio", 1.0)
+            elif args.method.lower() in ["apkvc", "custom"]:
+                full_bits = 16
+                compressed_bits = (args.K_num_codebooks * 4 + args.V_num_codebooks * 4) / 2
+                anchor_freq = 1.0 / args.max_anchor_interval
+                head_dim = getattr(model.config, "head_dim", model.config.hidden_size // model.config.num_attention_heads)
+                cr = anchor_freq + (1.0 - anchor_freq) * (compressed_bits / (full_bits * head_dim))
+
             example = {}
             example["prompt"] = batch_prompts[j]
             example["input"] = batch_inputs[j]
             example["answers"] = batch_answers[j]
             example["pred"] = batch_generations[j]
             example["length"] = batch_lengths[j]
+            example["compression_ratio"] = float(f"{cr:.4f}")
+            example["latency"] = float(f"{latency:.4f}")
+            example["tps"] = float(f"{tps:.4f}")
 
             predictions.append(example)
 
@@ -346,7 +374,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_capacity_prompts_ratio", type=float, default=-1, help="")
     parser.add_argument("--pruning_ratio", type=float, default=0.4, help="")
     parser.add_argument("--recent_size", type=int, default=32, help="")
-    parser.add_argument("--merge", action="store_true", help="Whether to merge KV states in certain methods.")
+    parser.add_argument("--merge", type=str, default=None, help="kv merge method(look-m)")
     parser.add_argument("--floor", type=float, default=0.2, help="Floor for importance scoring.")
     parser.add_argument("--steps", type=int, default=-1, help="maximum number of examples to evaluate per task.")
     parser.add_argument("--max_datasets", type=int, default=-1, help="maximum number of datasets to evaluate.")
@@ -528,9 +556,12 @@ if __name__ == "__main__":
                 main(args)
     else:
         # Just run the single dataset requested by the command line
+        user_data_file = args.data_file
         for context_length in target_context_lengths:
             args.context_length = context_length
             print(f"Working on max_capacity_prompts {args.max_capacity_prompts} dataset {args.dataset} - Context {context_length}")
-            if not args.data_file:
+            if user_data_file:
+                args.data_file = user_data_file
+            else:
                 args.data_file = f"data/RULER/{context_length}/{args.dataset}.jsonl"
             main(args)

@@ -106,17 +106,34 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         """Lazy initialization of codebooks once head_dim is known."""
         self.head_dim = head_dim
         # Initialize codebooks randomly for now (Calibration usually fits these)
-        # Using a fixed seed for consistency in prototype
-        torch.manual_seed(42)
+        # Using a local generator avoids perturbing the global RNG state.
+        gen = torch.Generator(device=device)
+        gen.manual_seed(42)
         
         # Create M codebooks for K
         for _ in range(self.apkvc_config.K_num_codebooks):
-            cb = nn.Parameter(torch.randn(self.apkvc_config.codebook_size, head_dim, device=device, dtype=dtype) * 0.01)
+            cb = nn.Parameter(
+                torch.randn(
+                    self.apkvc_config.codebook_size,
+                    head_dim,
+                    device=device,
+                    dtype=dtype,
+                    generator=gen,
+                ) * 0.01
+            )
             self.codebooks_K.append(cb)
             
         # Create M codebooks for V
         for _ in range(self.apkvc_config.V_num_codebooks):
-            cb = nn.Parameter(torch.randn(self.apkvc_config.codebook_size, head_dim, device=device, dtype=dtype) * 0.01)
+            cb = nn.Parameter(
+                torch.randn(
+                    self.apkvc_config.codebook_size,
+                    head_dim,
+                    device=device,
+                    dtype=dtype,
+                    generator=gen,
+                ) * 0.01
+            )
             self.codebooks_V.append(cb)
             
         self.initialized = True
@@ -186,6 +203,16 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         # Max absolute discrepancy across batch/heads
         return torch.max(torch.abs(score_true - score_comp)).item()
 
+    def _residual_norm_exceeds(self, delta_K, delta_V):
+        """Residual magnitude gate used by the anchor reset policy."""
+        k_norm = delta_K.norm(dim=-1).mean().item()
+        v_norm = delta_V.norm(dim=-1).mean().item()
+        self.last_residual_norm = max(k_norm, v_norm)
+        return (
+            k_norm > self.apkvc_config.residual_norm_threshold_K
+            or v_norm > self.apkvc_config.residual_norm_threshold_V
+        )
+
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
         """
         APKVC Update Step.
@@ -232,6 +259,13 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         # 4. Compressing residuals
         delta_K = K_true - K_hat
         delta_V = V_true - V_hat
+        residual_too_large = self._residual_norm_exceeds(delta_K, delta_V)
+        if residual_too_large:
+            self.entries.append({'is_anchor': True, 'position': t})
+            self.last_anchor_t = t
+            self.last_distortion = 0.0
+            self._update_rolling(K_true, V_true)
+            return K_true, V_true
         
         if self.apkvc_config.use_rope_aware_aq:
             delta_K_base = rope_derotate(delta_K, t)
