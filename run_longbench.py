@@ -142,6 +142,20 @@ def estimate_commonkv_memory_fraction(model, fallback=1.0):
     except Exception:
         return fallback
 
+
+def truncate_token_ids(token_ids, max_len, policy):
+    if len(token_ids) <= max_len:
+        return token_ids, False
+    if policy == "none":
+        return token_ids, False
+    if policy == "tail_only":
+        return token_ids[-max_len:], True
+    if policy == "head_only":
+        return token_ids[:max_len], True
+    first = max_len // 2
+    second = max_len - first
+    return token_ids[:first] + token_ids[-second:], True
+
 # def build_prompt(prompt, dataset):
     
 #     SYSTEM_PROMPT = model2prompt[dataset]
@@ -270,17 +284,21 @@ def main(args):
         batch_all_classes = all_classes[i:i+args.eval_batch_size]
         batch__ids = _ids[i:i+args.eval_batch_size]
         
-        tokenized_prompts = tokenizer(batch_prompts, padding="longest", return_tensors="pt", add_special_tokens=True).to(get_device())
+        orig_prompt_token_lens = []
+        effective_prompt_token_lens = []
+        truncated_flags = []
+        processed_batch_prompts = []
+        for prompt in batch_prompts:
+            ids = tokenizer(prompt, add_special_tokens=True).input_ids
+            orig_prompt_token_lens.append(len(ids))
+            kept_ids, was_truncated = truncate_token_ids(ids, model_max_len, args.truncation_policy)
+            effective_prompt_token_lens.append(len(kept_ids))
+            truncated_flags.append(was_truncated)
+            processed_batch_prompts.append(tokenizer.decode(kept_ids, skip_special_tokens=True))
+
+        tokenized_prompts = tokenizer(processed_batch_prompts, padding="longest", return_tensors="pt", add_special_tokens=True).to(get_device())
         batch_input_ids = tokenized_prompts.input_ids
         attention_mask = tokenized_prompts.attention_mask
-
-        if len(batch_input_ids[0]) > model_max_len:
-            half = int(model_max_len/2)
-            prompt = tokenizer.decode(batch_input_ids[0][:half], skip_special_tokens=True)+tokenizer.decode(batch_input_ids[0][-half:], skip_special_tokens=True)
-            
-            tokenized_prompts = tokenizer(prompt, padding="longest", return_tensors="pt", add_special_tokens=True).to(get_device())
-            batch_input_ids = tokenized_prompts.input_ids
-            attention_mask = tokenized_prompts.attention_mask
 
         # # default to True
         # if args.method == "DynamicKV":
@@ -308,9 +326,10 @@ def main(args):
 
         if args.method.lower() not in ["fullkv", "ours", "commonkv", "apkvc", "custom"] :
             if args.method.lower() in ["snapkv","pyramidkv","h2o","cam", "l2norm", "adakv", "headkv", "think", "palu", "minicache"]:
-                window_sizes = 8
+                window_sizes = args.window_size if args.window_size is not None else 8
             elif args.method.lower() in ["streamingllm"]:
-                window_sizes = max_capacity_prompts - 4
+                default_window = max_capacity_prompts - 4
+                window_sizes = args.window_size if args.window_size is not None else default_window
 
             if args.method.lower() =='headkv':
                 with open(args.head_path, 'r') as file:
@@ -323,8 +342,8 @@ def main(args):
                 head_capacity = torch.round(total_attention * total_pool_capacity + min_num).int()
                 model.model.config.head_capacity = head_capacity    
 
-            kernel_sizes = 7
-            pooling = "maxpool"
+            kernel_sizes = args.kernel_size
+            pooling = args.pooling
             ratio = args.pruning_ratio
             recent_size = args.recent_size
 
@@ -425,6 +444,10 @@ def main(args):
             example["all_classes"] = batch_all_classes[j]
             example["_id"] = batch__ids[j]
             example["compression_ratio"] = float(f"{cr:.4f}")
+            example["orig_prompt_tokens"] = int(orig_prompt_token_lens[j])
+            example["effective_prompt_tokens"] = int(effective_prompt_token_lens[j])
+            example["was_truncated"] = bool(truncated_flags[j])
+            example["truncation_policy"] = args.truncation_policy
             if args.method.lower() in ["apkvc", "custom"]:
                 example["apkvc_use_rope_aware_aq"] = bool(args.apkvc_use_rope_aware_aq)
                 example["compression_ratio_definition"] = "apkvc_estimate_from_codebooks_and_anchor_interval"
@@ -480,10 +503,14 @@ if __name__ == "__main__":
         help="Safety cap for prompt prefill tokens on memory-heavy custom methods (snapkv/think/palu/minicache/etc.).",
     )
     parser.add_argument("--enforce_uniform_prefill_cap", type=int, default=0, choices=[0, 1], help="Apply the same prefill cap across all methods for fair comparisons")
+    parser.add_argument("--truncation_policy", type=str, default="head_tail", choices=["head_tail", "tail_only", "head_only", "none"], help="Prompt truncation policy when prompt exceeds model_max_len")
     parser.add_argument("--max_capacity_prompts_ratio", type=float, default=-1, help="")
     parser.add_argument("--steps", type=int, default=-1, help="maximum number of examples to evaluate per task.")
     parser.add_argument("--max_datasets", type=int, default=-1, help="maximum number of datasets to evaluate.")
     parser.add_argument("--merge", type=str, default=None, help="kv merge method(look-m)")
+    parser.add_argument("--window_size", type=int, default=None, help="Override token-selection window size for token-compression methods")
+    parser.add_argument("--kernel_size", type=int, default=7, help="Pooling kernel size for token-compression methods")
+    parser.add_argument("--pooling", type=str, default="maxpool", choices=["avgpool", "maxpool"], help="Pooling strategy for token-compression methods")
     parser.add_argument('--floor', type=float, default=0.2, help='hyper-parameter used in AdaKV')
     parser.add_argument('--head_path', type=str, default='./data/heads_score/Meta-Llama-3-8B-Instruct_retrieval_reasoning_heads.json', help='Path to head score (HeadKV)')
     parser.add_argument('--head_beta', type=float, default=1.01, help='hyper-parameter used on HeadKV')
