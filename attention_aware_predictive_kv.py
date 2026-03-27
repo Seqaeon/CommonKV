@@ -83,6 +83,7 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
     _trace_max_samples = 400000
     _trace_delta_k: List[torch.Tensor] = []
     _trace_delta_v: List[torch.Tensor] = []
+    _reported_calibration_loads = set()
 
     def __init__(self, **kwargs):
         super().__init__()
@@ -209,7 +210,9 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
             self.codebooks_V = nn.ParameterList(
                 [nn.Parameter(v_cbs[i].to(device=device, dtype=dtype).contiguous()) for i in range(v_cbs.shape[0])]
             )
-            print(f"[APKVC] Loaded calibrated codebooks from: {path}")
+            if path not in AttentionAwarePredictiveKVCluster._reported_calibration_loads:
+                print(f"[APKVC] Loaded calibrated codebooks from: {path}")
+                AttentionAwarePredictiveKVCluster._reported_calibration_loads.add(path)
             return True
         except Exception as e:
             print(f"[APKVC][WARN] failed to load calibration file '{path}': {e}. Using random codebooks.")
