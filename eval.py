@@ -105,14 +105,17 @@ def parse_args(args=None):
     parser.add_argument('--longbench_e', action='store_true', help="Evaluate on LongBench-E")
     return parser.parse_args(args)
 
-def scorer_e(dataset, predictions, answers, lengths, all_classes, ratios=None):
+def scorer_e(dataset, predictions, answers, lengths, all_classes_list=None, ratios=None):
     scores = {"0-4k": [], "4-8k": [], "8k+": []}
-    for (prediction, ground_truths, length) in zip(predictions, answers, lengths):
+    for idx, (prediction, ground_truths, length) in enumerate(zip(predictions, answers, lengths)):
         score = 0.
+        current_classes = None
+        if all_classes_list is not None and len(all_classes_list) > idx:
+            current_classes = all_classes_list[idx]
         if dataset in ["trec", "triviaqa", "samsum", "lsht"]:
             prediction = prediction.lstrip('\n').split('\n')[0]
         for ground_truth in ground_truths:
-            score = max(score, dataset2metric[dataset](prediction, ground_truth, all_classes=all_classes))
+            score = max(score, dataset2metric[dataset](prediction, ground_truth, all_classes=current_classes))
         if length < 4000:
             scores["0-4k"].append(score)
         elif length < 8000:
@@ -123,14 +126,17 @@ def scorer_e(dataset, predictions, answers, lengths, all_classes, ratios=None):
         final_scores[key] = round(100 * np.mean(scores[key]), 2) if len(scores[key]) > 0 else 0.0
     return final_scores, avg_ratio
 
-def scorer(dataset, predictions, answers, all_classes, ratios=None):
+def scorer(dataset, predictions, answers, all_classes_list=None, ratios=None):
     total_score = 0.
-    for (prediction, ground_truths) in zip(predictions, answers):
+    for idx, (prediction, ground_truths) in enumerate(zip(predictions, answers)):
         score = 0.
+        current_classes = None
+        if all_classes_list is not None and len(all_classes_list) > idx:
+            current_classes = all_classes_list[idx]
         if dataset in ["trec", "triviaqa", "samsum", "lsht"]:
             prediction = prediction.lstrip('\n').split('\n')[0]
         for ground_truth in ground_truths:
-            score = max(score, dataset2metric[dataset](prediction, ground_truth, all_classes=all_classes))
+            score = max(score, dataset2metric[dataset](prediction, ground_truth, all_classes=current_classes))
         total_score += score
     
     avg_score = round(100 * total_score / len(predictions), 2) if len(predictions) > 0 else 0.0
@@ -186,14 +192,14 @@ if __name__ == '__main__':
                     cr_row.append(-1)
                     continue
 
-                predictions, answers, lengths, ratios, latencies, tpss = [], [], [], [], [], []
+                predictions, answers, lengths, ratios, latencies, tpss, all_classes_list = [], [], [], [], [], [], []
                 with open(args.eval_file, "r", encoding="utf-8") as f:
                     for line in f:
                         try:
                             data = json.loads(line)
                             predictions.append(data["pred"])
                             answers.append(data["answers"])
-                            all_classes = data["all_classes"]
+                            all_classes_list.append(data.get("all_classes"))
                             if "length" in data:
                                 lengths.append(data["length"])
                             if "compression_ratio" in data:
@@ -211,9 +217,9 @@ if __name__ == '__main__':
                     continue
 
                 if args.longbench_e:
-                    score, cr = scorer_e(args.dataset, predictions, answers, lengths, all_classes, ratios=ratios)
+                    score, cr = scorer_e(args.dataset, predictions, answers, lengths, all_classes_list=all_classes_list, ratios=ratios)
                 else:
-                    score, cr = scorer(args.dataset, predictions, answers, all_classes, ratios=ratios)
+                    score, cr = scorer(args.dataset, predictions, answers, all_classes_list=all_classes_list, ratios=ratios)
                     
                 row.append(score)
                 cr_row.append(cr)
