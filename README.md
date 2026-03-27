@@ -105,6 +105,7 @@ By default, `metrics.sh` auto-detects method files present in your results direc
 
 For APKVC, optional trace-based codebook calibration is documented in `apkvc_calibration_guide.md`.
 You can also export APKVC residual traces during benchmarking with `--apkvc_trace_output_path`.
+For fair cross-method comparisons, you can enforce a uniform prompt prefill cap via `--enforce_uniform_prefill_cap 1`.
 
 ## Citation
 If you find this work is useful for your research, please cite our paper:

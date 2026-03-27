@@ -125,6 +125,23 @@ def canonicalize_method_name(method_name: str) -> str:
     }
     return canonical_map.get(method_name.lower(), method_name)
 
+
+def estimate_commonkv_memory_fraction(model, fallback=1.0):
+    try:
+        fractions = []
+        for layer in model.model.layers:
+            attn = layer.self_attn
+            rank = getattr(attn, "k_rank", None) or getattr(attn, "v_rank", None) or getattr(attn.config, "rank", None)
+            kv_width = attn.num_key_value_heads * attn.head_dim
+            if rank is None or kv_width <= 0:
+                continue
+            fractions.append(max(1.0 / kv_width, min(1.0, float(rank) / float(kv_width))))
+        if not fractions:
+            return fallback
+        return float(sum(fractions) / len(fractions))
+    except Exception:
+        return fallback
+
 # def build_prompt(prompt, dataset):
     
 #     SYSTEM_PROMPT = model2prompt[dataset]
@@ -159,10 +176,13 @@ def main(args):
         if key in model_path:
             model_max_len = model2maxlen[key]
 
-    if args.method and args.method.lower() in OOM_PRONE_METHODS and model_max_len > args.max_prefill_tokens_for_custom_methods:
+    apply_uniform_cap = bool(getattr(args, "enforce_uniform_prefill_cap", 0))
+    if model_max_len > args.max_prefill_tokens_for_custom_methods and (
+        apply_uniform_cap or (args.method and args.method.lower() in OOM_PRONE_METHODS)
+    ):
         print(
             f"[WARN] Capping prefill length from {model_max_len} to {args.max_prefill_tokens_for_custom_methods} "
-            f"for method={args.method} to avoid OOM in custom attention forward."
+            f"for method={args.method} ({'uniform-fairness-cap' if apply_uniform_cap else 'oom-prone-method'})."
         )
         model_max_len = args.max_prefill_tokens_for_custom_methods
             
@@ -233,6 +253,10 @@ def main(args):
     jsonl_output_path = os.path.join(output_dir, f"{args.method}.jsonl")
     predictions = []
      
+    commonkv_memory_fraction = 1.0
+    if args.method.lower() in ["commonkv", "ours"]:
+        commonkv_memory_fraction = estimate_commonkv_memory_fraction(model, fallback=1.0)
+
     for i in tqdm(range(0, len(prompts), args.eval_batch_size)):
         if args.steps != -1 and i >= args.steps: break
         batch_prompts = prompts[i:i+args.eval_batch_size]
@@ -378,6 +402,8 @@ def main(args):
             elif args.method.lower() == "palu":
                 # ratio is used to determine rank in Palu
                 cr = getattr(args, "pruning_ratio", 1.0) # Palu typically uses pruning_ratio for Rank/Width
+            elif args.method.lower() in ["commonkv", "ours"]:
+                cr = commonkv_memory_fraction
             elif args.method.lower() in ["apkvc", "custom"]:
                 # APKVC Ratio Estimate
                 full_bits = 16
@@ -399,6 +425,11 @@ def main(args):
             example["all_classes"] = batch_all_classes[j]
             example["_id"] = batch__ids[j]
             example["compression_ratio"] = float(f"{cr:.4f}")
+            if args.method.lower() in ["apkvc", "custom"]:
+                example["apkvc_use_rope_aware_aq"] = bool(args.apkvc_use_rope_aware_aq)
+                example["compression_ratio_definition"] = "apkvc_estimate_from_codebooks_and_anchor_interval"
+            elif args.method.lower() in ["commonkv", "ours"]:
+                example["compression_ratio_definition"] = "commonkv_estimate_mean_rank_over_kv_width"
             example["latency"] = float(f"{latency:.4f}")
             example["tps"] = float(f"{tps:.4f}")
             predictions.append(example)
@@ -448,6 +479,7 @@ if __name__ == "__main__":
         default=2048,
         help="Safety cap for prompt prefill tokens on memory-heavy custom methods (snapkv/think/palu/minicache/etc.).",
     )
+    parser.add_argument("--enforce_uniform_prefill_cap", type=int, default=0, choices=[0, 1], help="Apply the same prefill cap across all methods for fair comparisons")
     parser.add_argument("--max_capacity_prompts_ratio", type=float, default=-1, help="")
     parser.add_argument("--steps", type=int, default=-1, help="maximum number of examples to evaluate per task.")
     parser.add_argument("--max_datasets", type=int, default=-1, help="maximum number of datasets to evaluate.")
