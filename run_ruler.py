@@ -2,6 +2,7 @@ import os
 import json
 import random
 import argparse
+import time
 import numpy as np
 import torch
 
@@ -91,8 +92,29 @@ def canonicalize_method_name(method_name: str) -> str:
         "think": "ThinK",
         "palu": "Palu",
         "minicache": "MiniCache",
+        "apkvc": "apkvc",
+        "custom": "custom",
+        "commonkv": "commonkv",
+        "ours": "commonkv",
     }
     return canonical_map.get(method_name.lower(), method_name)
+
+
+def estimate_commonkv_memory_fraction(model, fallback=1.0):
+    try:
+        fractions = []
+        for layer in model.model.layers:
+            attn = layer.self_attn
+            rank = getattr(attn, "k_rank", None) or getattr(attn, "v_rank", None) or getattr(attn.config, "rank", None)
+            kv_width = attn.num_key_value_heads * attn.head_dim
+            if rank is None or kv_width <= 0:
+                continue
+            fractions.append(max(1.0 / kv_width, min(1.0, float(rank) / float(kv_width))))
+        if not fractions:
+            return fallback
+        return float(sum(fractions) / len(fractions))
+    except Exception:
+        return fallback
 
 
 
@@ -118,12 +140,15 @@ def main(args):
     
     # Parity with run_longbench.py: Cap prefill length for OOM-prone methods
     OOM_PRONE_METHODS = {
-    "snapkv", "pyramidkv", "h2o", "cam", "l2norm", "adakv", "headkv", "streamingllm", "think", "palu", "minicache", "custom"
+    "snapkv", "pyramidkv", "h2o", "cam", "l2norm", "adakv", "headkv", "streamingllm", "think", "palu", "minicache", "custom", "apkvc"
 }
-    if args.method and args.method.lower() in OOM_PRONE_METHODS and model_max_len > args.max_prefill_tokens_for_custom_methods:
+    apply_uniform_cap = bool(getattr(args, "enforce_uniform_prefill_cap", 0))
+    if model_max_len > args.max_prefill_tokens_for_custom_methods and (
+        apply_uniform_cap or (args.method and args.method.lower() in OOM_PRONE_METHODS)
+    ):
         print(
             f"[WARN] Capping prefill length from {model_max_len} to {args.max_prefill_tokens_for_custom_methods} "
-            f"for custom method '{args.method}' to avoid OOM."
+            f"for method '{args.method}' ({'uniform-fairness-cap' if apply_uniform_cap else 'oom-prone-method'})."
         )
         model_max_len = args.max_prefill_tokens_for_custom_methods
     
@@ -186,6 +211,10 @@ def main(args):
     jsonl_output_path = os.path.join(output_dir, f"{args.method}.jsonl")
     predictions = []
     
+    commonkv_memory_fraction = 1.0
+    if args.method.lower() in ["commonkv", "ours"]:
+        commonkv_memory_fraction = estimate_commonkv_memory_fraction(model, fallback=1.0)
+
     for i in tqdm(range(0, len(prompt_list), args.eval_batch_size)):
         if args.steps != -1 and i >= args.steps: break
         batch_prompts = prompt_list[i:i+args.eval_batch_size]
@@ -224,6 +253,10 @@ def main(args):
                 model.model.layers[i].self_attn.config.max_anchor_interval = args.max_anchor_interval
                 model.model.layers[i].self_attn.config.K_num_codebooks = args.K_num_codebooks
                 model.model.layers[i].self_attn.config.V_num_codebooks = args.V_num_codebooks
+                model.model.layers[i].self_attn.config.use_rope_aware_aq = bool(args.apkvc_use_rope_aware_aq)
+                model.model.layers[i].self_attn.config.apkvc_calibration_path = args.apkvc_calibration_path
+                model.model.layers[i].self_attn.config.apkvc_trace_output_path = args.apkvc_trace_output_path
+                model.model.layers[i].self_attn.config.apkvc_trace_max_samples = args.apkvc_trace_max_samples
 
         if args.method.lower() not in ["fullkv", "ours", "commonkv", "apkvc", "custom"] :
             if args.method.lower() in ["snapkv","pyramidkv","h2o","cam", "l2norm", "think", "palu", "minicache"]:
@@ -262,6 +295,7 @@ def main(args):
                 model.model.layers[i].self_attn.config.rank = args.rank
 
         context_length = batch_input_ids.shape[-1]
+        start_time = time.time()
         if args.quant_method == None:        
             output = model.generate(
                 **tokenized_prompts,
@@ -286,6 +320,10 @@ def main(args):
                 cache_implementation="quantized", 
                 cache_config={"nbits": args.nbits, "backend": "HQQ","device":"cuda","residual_length":output_max_len,"axis_key":1,"q_group_size":64},
             )
+        end_time = time.time()
+        latency = end_time - start_time
+        num_tokens = output.shape[-1] - context_length
+        tps = num_tokens / latency if latency > 0 else 0
 
         batch_outputs = tokenizer.batch_decode(output[:, context_length:], skip_special_tokens=True)
         batch_generations = batch_outputs
@@ -293,13 +331,38 @@ def main(args):
         cleanup_memory()
         
         for j in range(len(batch_prompts)):
-            
+            # Keep compression_ratio semantics aligned with run_longbench.py
+            cr = 1.0
+            if args.method.lower() == "fullkv":
+                cr = 1.0
+            elif args.method.lower() in ["snapkv", "pyramidkv", "h2o", "think", "minicache", "streamingllm"]:
+                avg_cap = sum(max_capacity_prompts) / len(max_capacity_prompts) if isinstance(max_capacity_prompts, list) else max_capacity_prompts
+                cr = min(1.0, avg_cap / (batch_lengths[j] + output_max_len))
+            elif args.method.lower() == "palu":
+                cr = getattr(args, "pruning_ratio", 1.0)
+            elif args.method.lower() in ["commonkv", "ours"]:
+                cr = commonkv_memory_fraction
+            elif args.method.lower() in ["apkvc", "custom"]:
+                full_bits = 16
+                compressed_bits = (args.K_num_codebooks * 4 + args.V_num_codebooks * 4) / 2
+                anchor_freq = 1.0 / args.max_anchor_interval
+                head_dim = getattr(model.config, "head_dim", model.config.hidden_size // model.config.num_attention_heads)
+                cr = anchor_freq + (1.0 - anchor_freq) * (compressed_bits / (full_bits * head_dim))
+
             example = {}
             example["prompt"] = batch_prompts[j]
             example["input"] = batch_inputs[j]
             example["answers"] = batch_answers[j]
             example["pred"] = batch_generations[j]
             example["length"] = batch_lengths[j]
+            example["compression_ratio"] = float(f"{cr:.4f}")
+            if args.method.lower() in ["apkvc", "custom"]:
+                example["apkvc_use_rope_aware_aq"] = bool(args.apkvc_use_rope_aware_aq)
+                example["compression_ratio_definition"] = "apkvc_estimate_from_codebooks_and_anchor_interval"
+            elif args.method.lower() in ["commonkv", "ours"]:
+                example["compression_ratio_definition"] = "commonkv_estimate_mean_rank_over_kv_width"
+            example["latency"] = float(f"{latency:.4f}")
+            example["tps"] = float(f"{tps:.4f}")
 
             predictions.append(example)
 
@@ -343,10 +406,11 @@ if __name__ == "__main__":
     parser.add_argument("--nbits", type=int, default=8, help="")
     parser.add_argument("--max_capacity_prompts", type=int, default=512, help="")
     parser.add_argument("--max_prefill_tokens_for_custom_methods", type=int, default=2048, help="")
+    parser.add_argument("--enforce_uniform_prefill_cap", type=int, default=0, choices=[0, 1], help="Apply the same prefill cap across all methods for fair comparisons")
     parser.add_argument("--max_capacity_prompts_ratio", type=float, default=-1, help="")
     parser.add_argument("--pruning_ratio", type=float, default=0.4, help="")
     parser.add_argument("--recent_size", type=int, default=32, help="")
-    parser.add_argument("--merge", action="store_true", help="Whether to merge KV states in certain methods.")
+    parser.add_argument("--merge", type=str, default=None, help="kv merge method(look-m)")
     parser.add_argument("--floor", type=float, default=0.2, help="Floor for importance scoring.")
     parser.add_argument("--steps", type=int, default=-1, help="maximum number of examples to evaluate per task.")
     parser.add_argument("--max_datasets", type=int, default=-1, help="maximum number of datasets to evaluate.")
@@ -355,10 +419,14 @@ if __name__ == "__main__":
     
     # APKVC Specific Arguments
     parser.add_argument("--predictor_type", type=str, default="identity", choices=["identity", "linear"], help="APKVC predictor type")
+    parser.add_argument("--apkvc_use_rope_aware_aq", type=int, default=1, choices=[0, 1], help="APKVC toggle for RoPE-aware AQ: 1=enable, 0=disable")
     parser.add_argument("--rd_threshold", type=float, default=0.05, help="APKVC rate-distortion threshold")
     parser.add_argument("--max_anchor_interval", type=int, default=16, help="APKVC max tokens between anchors")
     parser.add_argument("--K_num_codebooks", type=int, default=4, help="APKVC codebooks for keys")
     parser.add_argument("--V_num_codebooks", type=int, default=2, help="APKVC codebooks for values")
+    parser.add_argument("--apkvc_calibration_path", type=str, default=None, help="Optional path to calibrated APKVC codebooks (.pt)")
+    parser.add_argument("--apkvc_trace_output_path", type=str, default=None, help="Optional path to dump APKVC residual traces (.pt)")
+    parser.add_argument("--apkvc_trace_max_samples", type=int, default=400000, help="Max residual samples to keep when dumping APKVC traces")
 
     parser.add_argument("--context_lengths", type=int, nargs="+", default=None, help="Context lengths to evaluate. Defaults to DEFAULT_CONTEXT_LENGTHS.")
     parser.add_argument(
@@ -528,9 +596,12 @@ if __name__ == "__main__":
                 main(args)
     else:
         # Just run the single dataset requested by the command line
+        user_data_file = args.data_file
         for context_length in target_context_lengths:
             args.context_length = context_length
             print(f"Working on max_capacity_prompts {args.max_capacity_prompts} dataset {args.dataset} - Context {context_length}")
-            if not args.data_file:
+            if user_data_file:
+                args.data_file = user_data_file
+            else:
                 args.data_file = f"data/RULER/{context_length}/{args.dataset}.jsonl"
             main(args)

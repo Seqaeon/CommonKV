@@ -103,6 +103,10 @@ sh scripts/scripts_longBench/metrics.sh <results_dir> /path/to/LongBench/eval.py
 ```
 By default, `metrics.sh` auto-detects method files present in your results directory and patches the evaluator's `methods` list for that run (to avoid `scores None` for methods you did not run). Pass a third argument `0` to disable this behavior.
 
+For APKVC, optional trace-based codebook calibration is documented in `apkvc_calibration_guide.md`.
+You can also export APKVC residual traces during benchmarking with `--apkvc_trace_output_path`.
+For fair cross-method comparisons, you can enforce a uniform prompt prefill cap via `--enforce_uniform_prefill_cap 1`.
+
 ## Citation
 If you find this work is useful for your research, please cite our paper:
 ```
