@@ -277,6 +277,10 @@ def main(args):
                 model.model.layers[i].self_attn.config.max_anchor_interval = args.max_anchor_interval
                 model.model.layers[i].self_attn.config.K_num_codebooks = args.K_num_codebooks
                 model.model.layers[i].self_attn.config.V_num_codebooks = args.V_num_codebooks
+                model.model.layers[i].self_attn.config.use_rope_aware_aq = bool(args.apkvc_use_rope_aware_aq)
+                model.model.layers[i].self_attn.config.apkvc_calibration_path = args.apkvc_calibration_path
+                model.model.layers[i].self_attn.config.apkvc_trace_output_path = args.apkvc_trace_output_path
+                model.model.layers[i].self_attn.config.apkvc_trace_max_samples = args.apkvc_trace_max_samples
 
         if args.method.lower() not in ["fullkv", "ours", "commonkv", "apkvc", "custom"] :
             if args.method.lower() in ["snapkv","pyramidkv","h2o","cam", "l2norm", "adakv", "headkv", "think", "palu", "minicache"]:
@@ -458,10 +462,14 @@ if __name__ == "__main__":
     
     # APKVC Specific Arguments
     parser.add_argument("--predictor_type", type=str, default="identity", choices=["identity", "linear"], help="APKVC predictor type")
+    parser.add_argument("--apkvc_use_rope_aware_aq", type=int, default=1, choices=[0, 1], help="APKVC toggle for RoPE-aware AQ: 1=enable, 0=disable")
     parser.add_argument("--rd_threshold", type=float, default=0.05, help="APKVC rate-distortion threshold")
     parser.add_argument("--max_anchor_interval", type=int, default=16, help="APKVC max tokens between anchors")
     parser.add_argument("--K_num_codebooks", type=int, default=4, help="APKVC codebooks for keys")
     parser.add_argument("--V_num_codebooks", type=int, default=2, help="APKVC codebooks for values")
+    parser.add_argument("--apkvc_calibration_path", type=str, default=None, help="Optional path to calibrated APKVC codebooks (.pt)")
+    parser.add_argument("--apkvc_trace_output_path", type=str, default=None, help="Optional path to dump APKVC residual traces (.pt)")
+    parser.add_argument("--apkvc_trace_max_samples", type=int, default=400000, help="Max residual samples to keep when dumping APKVC traces")
 
     parser.add_argument(
         "--require_head_wise_ranks",
