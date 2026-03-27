@@ -323,6 +323,7 @@ def main(args):
                 model.model.layers[i].self_attn.config.apkvc_calibration_path = args.apkvc_calibration_path
                 model.model.layers[i].self_attn.config.apkvc_trace_output_path = args.apkvc_trace_output_path
                 model.model.layers[i].self_attn.config.apkvc_trace_max_samples = args.apkvc_trace_max_samples
+                model.model.layers[i].self_attn.config.apkvc_trace_chunk_size = args.apkvc_trace_chunk_size
 
         if args.method.lower() not in ["fullkv", "ours", "commonkv", "apkvc", "custom"] :
             if args.method.lower() in ["snapkv","pyramidkv","h2o","cam", "l2norm", "adakv", "headkv", "think", "palu", "minicache"]:
@@ -529,6 +530,7 @@ if __name__ == "__main__":
     parser.add_argument("--apkvc_calibration_path", type=str, default=None, help="Optional path to calibrated APKVC codebooks (.pt)")
     parser.add_argument("--apkvc_trace_output_path", type=str, default=None, help="Optional path to dump APKVC residual traces (.pt)")
     parser.add_argument("--apkvc_trace_max_samples", type=int, default=400000, help="Max residual samples to keep when dumping APKVC traces")
+    parser.add_argument("--apkvc_trace_chunk_size", type=int, default=0, help="If >0, flush trace chunks to <path>.partXXXX.pt after this many samples")
 
     parser.add_argument(
         "--require_head_wise_ranks",

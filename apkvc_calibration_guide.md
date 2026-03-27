@@ -46,7 +46,8 @@ python run_longbench.py \
   --steps 100 \
   --apkvc_use_rope_aware_aq 1 \
   --apkvc_trace_output_path traces/lb_mix.pt \
-  --apkvc_trace_max_samples 400000
+  --apkvc_trace_max_samples 400000 \
+  --apkvc_trace_chunk_size 50000
 ```
 
 ### RULER trace dump
@@ -63,13 +64,15 @@ python run_ruler.py \
 ```
 
 The trace file is written at process exit.
+If `--apkvc_trace_chunk_size > 0`, chunks are flushed during runtime as:
+`<trace_output_path>.part0000.pt`, `<trace_output_path>.part0001.pt`, ...
 When comparing `apkvc_use_rope_aware_aq=0` vs `1`, generate traces and run inference with the same setting for consistency.
 
 ## 4) Build codebooks from traces
 
 ```bash
 python scripts/calibrate_apkvc_codebooks.py \
-  --trace_paths traces/lb_mix.pt traces/ruler_16k.pt \
+  --trace_paths traces/lb_mix.pt.part0000.pt traces/lb_mix.pt.part0001.pt traces/ruler_16k.pt \
   --output_path artifacts/apkvc_codebooks.pt \
   --K_num_codebooks 4 \
   --V_num_codebooks 2 \

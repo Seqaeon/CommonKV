@@ -30,6 +30,7 @@ class APKVCConfig:
     calibration_path: Optional[str] = None
     trace_output_path: Optional[str] = None
     trace_max_samples: int = 400000
+    trace_chunk_size: int = 0
 
 def rope_rotate(x: torch.Tensor, position: int, base: float = 10000.0) -> torch.Tensor:
     """Apply forward RoPE rotation."""
@@ -81,9 +82,11 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
     _trace_registered = False
     _trace_output_path = None
     _trace_max_samples = 400000
+    _trace_chunk_size = 0
     _trace_delta_k: List[torch.Tensor] = []
     _trace_delta_v: List[torch.Tensor] = []
     _reported_calibration_loads = set()
+    _trace_part_idx = 0
 
     def __init__(self, **kwargs):
         super().__init__()
@@ -97,6 +100,7 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
             calibration_path=kwargs.get("apkvc_calibration_path", kwargs.get("calibration_path", None)),
             trace_output_path=kwargs.get("apkvc_trace_output_path", kwargs.get("trace_output_path", None)),
             trace_max_samples=int(kwargs.get("apkvc_trace_max_samples", kwargs.get("trace_max_samples", 400000))),
+            trace_chunk_size=int(kwargs.get("apkvc_trace_chunk_size", kwargs.get("trace_chunk_size", 0))),
         )
         
         self.head_dim = None
@@ -119,28 +123,37 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         self._setup_trace_dump()
 
     @classmethod
+    def _save_trace_payload(cls, out_path, delta_k, delta_v):
+        out_dir = os.path.dirname(out_path) or "."
+        os.makedirs(out_dir, exist_ok=True)
+        torch.save(
+            {
+                "delta_K_base": delta_k.cpu().half(),
+                "delta_V": delta_v.cpu().half(),
+                "metadata": {
+                    "num_samples": int(min(delta_k.shape[0], delta_v.shape[0])),
+                    "head_dim": int(delta_k.shape[-1]),
+                },
+            },
+            out_path,
+        )
+        print(f"[APKVC] dumped trace residuals -> {out_path}")
+
+    @classmethod
     def _dump_traces_at_exit(cls):
         if not cls._trace_output_path:
             return
         if len(cls._trace_delta_k) == 0 or len(cls._trace_delta_v) == 0:
             return
         try:
-            out_dir = os.path.dirname(cls._trace_output_path) or "."
-            os.makedirs(out_dir, exist_ok=True)
             delta_k = torch.cat(cls._trace_delta_k, dim=0)[: cls._trace_max_samples].contiguous()
             delta_v = torch.cat(cls._trace_delta_v, dim=0)[: cls._trace_max_samples].contiguous()
-            torch.save(
-                {
-                    "delta_K_base": delta_k.cpu().half(),
-                    "delta_V": delta_v.cpu().half(),
-                    "metadata": {
-                        "num_samples": int(min(delta_k.shape[0], delta_v.shape[0])),
-                        "head_dim": int(delta_k.shape[-1]),
-                    },
-                },
-                cls._trace_output_path,
-            )
-            print(f"[APKVC] dumped trace residuals -> {cls._trace_output_path}")
+            if cls._trace_chunk_size > 0:
+                out_path = f"{cls._trace_output_path}.part{cls._trace_part_idx:04d}.pt"
+                cls._trace_part_idx += 1
+            else:
+                out_path = cls._trace_output_path
+            cls._save_trace_payload(out_path, delta_k, delta_v)
         except Exception as e:
             print(f"[APKVC][WARN] failed to dump traces: {e}")
 
@@ -151,6 +164,9 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         AttentionAwarePredictiveKVCluster._trace_output_path = path
         AttentionAwarePredictiveKVCluster._trace_max_samples = max(
             1, int(self.apkvc_config.trace_max_samples)
+        )
+        AttentionAwarePredictiveKVCluster._trace_chunk_size = max(
+            0, int(self.apkvc_config.trace_chunk_size)
         )
         if not AttentionAwarePredictiveKVCluster._trace_registered:
             atexit.register(AttentionAwarePredictiveKVCluster._dump_traces_at_exit)
@@ -175,6 +191,18 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
                 dropped = AttentionAwarePredictiveKVCluster._trace_delta_k.pop(0).shape[0]
                 AttentionAwarePredictiveKVCluster._trace_delta_v.pop(0)
                 total -= dropped
+        chunk_size = AttentionAwarePredictiveKVCluster._trace_chunk_size
+        if chunk_size > 0 and total >= chunk_size:
+            try:
+                delta_k = torch.cat(AttentionAwarePredictiveKVCluster._trace_delta_k, dim=0).contiguous()
+                delta_v = torch.cat(AttentionAwarePredictiveKVCluster._trace_delta_v, dim=0).contiguous()
+                out_path = f"{AttentionAwarePredictiveKVCluster._trace_output_path}.part{AttentionAwarePredictiveKVCluster._trace_part_idx:04d}.pt"
+                AttentionAwarePredictiveKVCluster._trace_part_idx += 1
+                AttentionAwarePredictiveKVCluster._save_trace_payload(out_path, delta_k, delta_v)
+                AttentionAwarePredictiveKVCluster._trace_delta_k = []
+                AttentionAwarePredictiveKVCluster._trace_delta_v = []
+            except Exception as e:
+                print(f"[APKVC][WARN] failed to flush trace chunk: {e}")
 
     def _try_load_calibrated_codebooks(self, head_dim, device, dtype):
         path = self.apkvc_config.calibration_path
