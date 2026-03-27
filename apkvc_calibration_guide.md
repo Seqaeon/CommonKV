@@ -80,7 +80,8 @@ python scripts/calibrate_apkvc_codebooks.py \
 python run_longbench.py \
   --method apkvc \
   --model_path <model_path> \
-  --apkvc_calibration_path artifacts/apkvc_codebooks.pt
+  --apkvc_calibration_path artifacts/apkvc_codebooks.pt \
+  --apkvc_use_rope_aware_aq 1
 ```
 
 ### RULER
@@ -88,7 +89,10 @@ python run_longbench.py \
 python run_ruler.py \
   --method apkvc \
   --model_path <model_path> \
-  --apkvc_calibration_path artifacts/apkvc_codebooks.pt
+  --apkvc_calibration_path artifacts/apkvc_codebooks.pt \
+  --apkvc_use_rope_aware_aq 1
+
+Set `--apkvc_use_rope_aware_aq 0` to disable RoPE-aware AQ.
 ```
 
 ## Notes
