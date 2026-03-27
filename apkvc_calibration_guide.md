@@ -44,6 +44,7 @@ python run_longbench.py \
   --model_path <model_path> \
   --dataset hotpotqa \
   --steps 100 \
+  --apkvc_use_rope_aware_aq 1 \
   --apkvc_trace_output_path traces/lb_mix.pt \
   --apkvc_trace_max_samples 400000
 ```
@@ -56,11 +57,13 @@ python run_ruler.py \
   --dataset niah_single_1 \
   --context_lengths 16384 \
   --steps 100 \
+  --apkvc_use_rope_aware_aq 1 \
   --apkvc_trace_output_path traces/ruler_16k.pt \
   --apkvc_trace_max_samples 400000
 ```
 
 The trace file is written at process exit.
+When comparing `apkvc_use_rope_aware_aq=0` vs `1`, generate traces and run inference with the same setting for consistency.
 
 ## 4) Build codebooks from traces
 
