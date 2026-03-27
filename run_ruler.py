@@ -307,7 +307,8 @@ def main(args):
         cleanup_memory()
         
         for j in range(len(batch_prompts)):
-            # Keep compression_ratio semantics aligned with run_longbench.py
+            # Estimated compression ratio (formula v1): derived from cache budget/codebook/anchor settings only.
+            # This is not an effective measured storage ratio and intentionally excludes AQ mode effects.
             cr = 1.0
             if args.method.lower() == "fullkv":
                 cr = 1.0
@@ -330,6 +331,9 @@ def main(args):
             example["pred"] = batch_generations[j]
             example["length"] = batch_lengths[j]
             example["compression_ratio"] = float(f"{cr:.4f}")
+            example["compression_ratio_effective"] = None  # Placeholder for future measured accounting.
+            example["apkvc_use_rope_aware_aq"] = bool(args.apkvc_use_rope_aware_aq)
+            example["apkvc_ratio_formula_version"] = "estimate_v1_codebook_anchor_only"
             example["latency"] = float(f"{latency:.4f}")
             example["tps"] = float(f"{tps:.4f}")
 

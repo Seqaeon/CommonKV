@@ -169,7 +169,8 @@ def main(args):
 
     
     output_max_len = dataset2maxlen[args.dataset]
-    # Initializing compression_ratio here, and refining it later in the loop.
+    # compression_ratio remains an estimate and is refined per-example below.
+    # Current estimate is based on codebook/anchor settings only (AQ mode does not alter this estimate).
     compression_ratio = 1.0
     if args.method.lower() == "fullkv":
         compression_ratio = 1.0
@@ -368,7 +369,8 @@ def main(args):
         cleanup_memory()
 
         for j in range(len(batch_prompts)):
-            # Calculate effective compression ratio for this batch example
+            # Estimated compression ratio (formula v1): derived from cache budget/codebook/anchor settings only.
+            # This is not an effective measured storage ratio and intentionally excludes AQ mode effects.
             cr = 1.0
             if args.method.lower() == "fullkv":
                 cr = 1.0
@@ -399,6 +401,9 @@ def main(args):
             example["all_classes"] = batch_all_classes[j]
             example["_id"] = batch__ids[j]
             example["compression_ratio"] = float(f"{cr:.4f}")
+            example["compression_ratio_effective"] = None  # Placeholder for future measured accounting.
+            example["apkvc_use_rope_aware_aq"] = bool(args.apkvc_use_rope_aware_aq)
+            example["apkvc_ratio_formula_version"] = "estimate_v1_codebook_anchor_only"
             example["latency"] = float(f"{latency:.4f}")
             example["tps"] = float(f"{tps:.4f}")
             predictions.append(example)

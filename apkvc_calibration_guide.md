@@ -64,6 +64,7 @@ python run_ruler.py \
 
 The trace file is written at process exit.
 When comparing `apkvc_use_rope_aware_aq=0` vs `1`, generate traces and run inference with the same setting for consistency.
+`apkvc_use_rope_aware_aq` affects AQ/reconstruction quality behavior; it does **not** currently change the reported `compression_ratio` estimate field in benchmark JSON output.
 
 ## 4) Build codebooks from traces
 
@@ -94,9 +95,9 @@ python run_ruler.py \
   --model_path <model_path> \
   --apkvc_calibration_path artifacts/apkvc_codebooks.pt \
   --apkvc_use_rope_aware_aq 1
+```
 
 Set `--apkvc_use_rope_aware_aq 0` to disable RoPE-aware AQ.
-```
 
 ## Notes
 
