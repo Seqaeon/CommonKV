@@ -467,6 +467,20 @@ def main(args):
         for example in predictions:
             fout_jsonl.write(json.dumps(example, ensure_ascii=False) + "\n")
 
+    # Save distortion history if requested
+    if args.apkvc_save_history_path:
+        history_data = {}
+        from attention_aware_predictive_kv import AttentionAwarePredictiveKVCluster
+        for i, layer in enumerate(model.model.layers):
+            if hasattr(layer.self_attn, "kv_cluster") and isinstance(layer.self_attn.kv_cluster, AttentionAwarePredictiveKVCluster):
+                history_data[i] = layer.self_attn.kv_cluster.distortion_history
+        
+        if history_data:
+            torch.save(history_data, args.apkvc_save_history_path)
+            print(f"[APKVC] Saved distortion history for {len(history_data)} layers to {args.apkvc_save_history_path}")
+        else:
+            print("[APKVC] [WARN] No APKVC distortion history found to save.")
+
 
 
 if __name__ == "__main__":
@@ -531,6 +545,7 @@ if __name__ == "__main__":
     parser.add_argument("--apkvc_trace_output_path", type=str, default=None, help="Optional path to dump APKVC residual traces (.pt)")
     parser.add_argument("--apkvc_trace_max_samples", type=int, default=400000, help="Max residual samples to keep when dumping APKVC traces")
     parser.add_argument("--apkvc_trace_chunk_size", type=int, default=0, help="If >0, flush trace chunks to <path>.partXXXX.pt after this many samples")
+    parser.add_argument("--apkvc_save_history_path", type=str, default=None, help="Save APKVC distortion history of all layers to this path (.pt)")
 
     parser.add_argument(
         "--require_head_wise_ranks",
