@@ -401,6 +401,11 @@ def main(args):
 
     # Save distortion history if requested
     if args.apkvc_save_history_path:
+        # Ensure parent directory exists
+        parent_dir = os.path.dirname(args.apkvc_save_history_path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+
         history_data = {}
         from attention_aware_predictive_kv import AttentionAwarePredictiveKVCluster
         for i, layer in enumerate(model.model.layers):
