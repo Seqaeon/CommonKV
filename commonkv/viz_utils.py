@@ -31,7 +31,17 @@ def plot_distortion_distributions(clusters, layer_names: Optional[List[str]] = N
     plt.grid(True, alpha=0.3)
     plt.show()
 
-def plot_distortion_timeline(clusters, layer_names: Optional[List[str]] = None, title: str = "Distortion over Time"):
+def get_baseline_clusters(num_layers, seq_len):
+    """
+    Creates mock clusters with zero distortion for baseline comparison (e.g., FullKV).
+    """
+    class MockCluster:
+        def __init__(self, history):
+            self.distortion_history = history
+            
+    return [MockCluster([0.0] * seq_len) for _ in range(num_layers)]
+
+def plot_distortion_timeline(clusters, layer_names: Optional[List[str]] = None, title: str = "Distortion over Time", baseline_clusters=None):
     """
     Plots distortion values vs token index.
     
@@ -51,6 +61,11 @@ def plot_distortion_timeline(clusters, layer_names: Optional[List[str]] = None, 
         
         plt.plot(history, label=label, alpha=0.8)
         
+        # Plot baseline if provided
+        if baseline_clusters and i < len(baseline_clusters):
+            base_history = baseline_clusters[i].distortion_history
+            plt.plot(base_history, label=f'Baseline (Layer {i})', linestyle='--', color='gray', alpha=0.4)
+
         # Mark anchors (where distortion is 0)
         anchors = [j for j, val in enumerate(history) if val == 0]
         if anchors:
