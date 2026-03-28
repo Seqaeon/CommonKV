@@ -34,6 +34,8 @@ def test_apkvc():
     print(f"Prefill Output Shapes: K={k_out.shape}, V={v_out.shape}")
     assert k_out.shape == k_prefill.shape
     assert len(cluster.entries) == 10
+    assert len(cluster.distortion_history) == 10
+    assert all(d == 0.0 for d in cluster.distortion_history)
     
     # 2. Decoding Step 1
     print("Testing Decoding Step 1 (S=1)...")
@@ -45,6 +47,7 @@ def test_apkvc():
     print(f"Decoding Step 1 Output Shapes: K={k_out1.shape}, V={v_out1.shape}")
     assert k_out1.shape == k1.shape
     assert len(cluster.entries) == 11
+    assert len(cluster.distortion_history) == 11
     
     # 3. Decoding Step 2 (Check prediction/quantization loop)
     print("Testing Decoding Step 2...")
@@ -67,6 +70,15 @@ def test_apkvc():
         cluster.update_kv(k_i, q_i, v_i, None, 1)
     
     print(f"Final Count of Entries: {len(cluster.entries)}")
+    print(f"Final Count of Distortion History: {len(cluster.distortion_history)}")
+    assert len(cluster.distortion_history) == len(cluster.entries)
+    
+    # Check for non-zero distortions (when compression happens)
+    non_zero_distortions = [d for d in cluster.distortion_history if d > 0]
+    print(f"Non-zero distortions count: {len(non_zero_distortions)}")
+    if len(non_zero_distortions) > 0:
+        print(f"Sample distortion: {non_zero_distortions[0]}")
+    
     print("APKVC Test Passed!")
 
 if __name__ == "__main__":
