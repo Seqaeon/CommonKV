@@ -22,12 +22,12 @@ class APKVCConfig:
     codebook_size: int       = 256
     
     rd_metric: str       = 'key_dot' # 'key_dot' or 'sampled_attention_output'
-    rd_threshold: float  = 0.05
+    rd_threshold: float  = 0.1
     rd_sample_heads: int = 4
 
     max_anchor_interval: int         = 16
-    residual_norm_threshold_K: float = 1.5
-    residual_norm_threshold_V: float = 3.0
+    residual_norm_threshold_K: float = 15.0
+    residual_norm_threshold_V: float = 15.0
     calibration_path: Optional[str] = None
     trace_output_path: Optional[str] = None
     trace_max_samples: int = 400000
@@ -412,7 +412,7 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
                 self._append_trace_samples(prefill_delta_k, prefill_delta_v)
             for i in range(key_states.shape[-2]):
                 self.entries.append({'is_anchor': True, 'position': t + i})
-                self.distortion_history.append(0.0)
+                
             self.last_anchor_t = t + key_states.shape[-2] - 1
             
             K_true_last = key_states[:, :, -1:]
