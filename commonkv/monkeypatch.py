@@ -19,6 +19,7 @@ from commonkv.llama_model import (
     llama_attn_forward_MiniCache,
     llama_attn_forward_Palu,
     llama_attn_forward_Custom,
+    llama_sdpa_attn_forward_APKVC,
 )
 from commonkv.mistral_model import (
     prepare_inputs_for_generation_mistral_new,
@@ -48,7 +49,7 @@ def _replace_llama_attention_forward(method):
         "palu": llama_attn_forward_Palu,
         "minicache": llama_attn_forward_MiniCache,
         "custom": llama_attn_forward_Custom,
-        "apkvc": llama_attn_forward_Custom,
+        "apkvc": llama_sdpa_attn_forward_APKVC,
     }
     forward_fn = attn_method_map.get(method)
     if forward_fn is None:

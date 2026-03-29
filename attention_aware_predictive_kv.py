@@ -9,7 +9,12 @@ from pyramidkv.pyramidkv_utils import BaseCluster
 
 @dataclass
 class APKVCConfig:
-    predictor_type: str  = 'attention' # 'identity', 'linear', or 'attention'
+    predictor_type: str  = 'attention' # 'identity', 'linear', 'attention', or 'none'
+    per_layer_codebooks: bool = False
+    compress_K: bool = True
+    compress_V: bool = True
+    use_scale_normalization: bool = True
+    
     attention_window_size: int = 64
     alpha_K: float       = 1.5
     beta_K: float        = -0.5
@@ -85,16 +90,21 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
     _trace_output_path = None
     _trace_max_samples = 400000
     _trace_chunk_size = 0
-    _trace_delta_k: List[torch.Tensor] = []
-    _trace_delta_v: List[torch.Tensor] = []
+    _trace_delta_k: Dict[int, List[torch.Tensor]] = {}
+    _trace_delta_v: Dict[int, List[torch.Tensor]] = {}
     _reported_calibration_loads = set()
     _trace_part_idx = 0
 
     def __init__(self, **kwargs):
         super().__init__()
+        self.layer_idx = kwargs.get('layer_idx', 0)
         # Extract config from kwargs or use defaults
         self.apkvc_config = APKVCConfig(
             predictor_type=kwargs.get("predictor_type", 'identity'),
+            per_layer_codebooks=bool(int(kwargs.get("apkvc_per_layer_codebooks", 0))),
+            compress_K=bool(int(kwargs.get("apkvc_compress_K", 1))),
+            compress_V=bool(int(kwargs.get("apkvc_compress_V", 1))),
+            use_scale_normalization=bool(int(kwargs.get("apkvc_use_scale_normalization", 1))),
             attention_window_size=kwargs.get("attention_window_size", 16),
             rd_threshold=kwargs.get("rd_threshold", 0.05),
             max_anchor_interval=kwargs.get("max_anchor_interval", 16),
@@ -131,21 +141,28 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         self._setup_trace_dump()
 
     @classmethod
-    def _save_trace_payload(cls, out_path, delta_k, delta_v):
+    def _save_trace_payload(cls, out_path, delta_k_dict, delta_v_dict):
         out_dir = os.path.dirname(out_path) or "."
         os.makedirs(out_dir, exist_ok=True)
+        # Determine head_dim from the first available tensor
+        head_dim = 128
+        for k_tensor in delta_k_dict.values():
+            if k_tensor.shape[0] > 0:
+                head_dim = int(k_tensor.shape[-1])
+                break
+                
         torch.save(
             {
-                "delta_K_base": delta_k.cpu().half(),
-                "delta_V": delta_v.cpu().half(),
+                "delta_K_base": {k: v.cpu().half() for k, v in delta_k_dict.items()},
+                "delta_V": {k: v.cpu().half() for k, v in delta_v_dict.items()},
                 "metadata": {
-                    "num_samples": int(min(delta_k.shape[0], delta_v.shape[0])),
-                    "head_dim": int(delta_k.shape[-1]),
+                    "num_layers": len(delta_k_dict),
+                    "head_dim": head_dim,
                 },
             },
             out_path,
         )
-        print(f"[APKVC] dumped trace residuals -> {out_path}")
+        print(f"[APKVC] dumped trace residuals (layers: {len(delta_k_dict)}) -> {out_path}")
 
     @classmethod
     def _dump_traces_at_exit(cls):
@@ -154,14 +171,20 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         if len(cls._trace_delta_k) == 0 or len(cls._trace_delta_v) == 0:
             return
         try:
-            delta_k = torch.cat(cls._trace_delta_k, dim=0)[: cls._trace_max_samples].contiguous()
-            delta_v = torch.cat(cls._trace_delta_v, dim=0)[: cls._trace_max_samples].contiguous()
+            k_dict, v_dict = {}, {}
+            for l_idx in cls._trace_delta_k.keys():
+                if len(cls._trace_delta_k[l_idx]) == 0: continue
+                k_dict[l_idx] = torch.cat(cls._trace_delta_k[l_idx], dim=0)[: cls._trace_max_samples].contiguous()
+                v_dict[l_idx] = torch.cat(cls._trace_delta_v[l_idx], dim=0)[: cls._trace_max_samples].contiguous()
+            
+            if len(k_dict) == 0: return
+
             if cls._trace_chunk_size > 0:
                 out_path = f"{cls._trace_output_path}.part{cls._trace_part_idx:04d}.pt"
                 cls._trace_part_idx += 1
             else:
                 out_path = cls._trace_output_path
-            cls._save_trace_payload(out_path, delta_k, delta_v)
+            cls._save_trace_payload(out_path, k_dict, v_dict)
         except Exception as e:
             print(f"[APKVC][WARN] failed to dump traces: {e}")
 
@@ -187,28 +210,40 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         v = delta_V.reshape(-1, delta_V.shape[-1]).detach().to("cpu", dtype=torch.float32)
         if k.numel() == 0 or v.numel() == 0:
             return
-        AttentionAwarePredictiveKVCluster._trace_delta_k.append(k)
-        AttentionAwarePredictiveKVCluster._trace_delta_v.append(v)
-        total = sum(x.shape[0] for x in AttentionAwarePredictiveKVCluster._trace_delta_k)
+            
+        l_idx = self.layer_idx
+        if l_idx not in AttentionAwarePredictiveKVCluster._trace_delta_k:
+            AttentionAwarePredictiveKVCluster._trace_delta_k[l_idx] = []
+            AttentionAwarePredictiveKVCluster._trace_delta_v[l_idx] = []
+            
+        AttentionAwarePredictiveKVCluster._trace_delta_k[l_idx].append(k)
+        AttentionAwarePredictiveKVCluster._trace_delta_v[l_idx].append(v)
+        
+        total = sum(x.shape[0] for x in AttentionAwarePredictiveKVCluster._trace_delta_k[l_idx])
         if total > AttentionAwarePredictiveKVCluster._trace_max_samples:
             # keep only recent chunks under budget
             while (
-                len(AttentionAwarePredictiveKVCluster._trace_delta_k) > 1
+                len(AttentionAwarePredictiveKVCluster._trace_delta_k[l_idx]) > 1
                 and total > AttentionAwarePredictiveKVCluster._trace_max_samples
             ):
-                dropped = AttentionAwarePredictiveKVCluster._trace_delta_k.pop(0).shape[0]
-                AttentionAwarePredictiveKVCluster._trace_delta_v.pop(0)
+                dropped = AttentionAwarePredictiveKVCluster._trace_delta_k[l_idx].pop(0).shape[0]
+                AttentionAwarePredictiveKVCluster._trace_delta_v[l_idx].pop(0)
                 total -= dropped
+                
         chunk_size = AttentionAwarePredictiveKVCluster._trace_chunk_size
         if chunk_size > 0 and total >= chunk_size:
             try:
-                delta_k = torch.cat(AttentionAwarePredictiveKVCluster._trace_delta_k, dim=0).contiguous()
-                delta_v = torch.cat(AttentionAwarePredictiveKVCluster._trace_delta_v, dim=0).contiguous()
+                # Flush ALL layers if any layer hits chunk size to keep geometry aligned
+                k_dict, v_dict = {}, {}
+                for idx in AttentionAwarePredictiveKVCluster._trace_delta_k.keys():
+                    if len(AttentionAwarePredictiveKVCluster._trace_delta_k[idx]) == 0: continue
+                    k_dict[idx] = torch.cat(AttentionAwarePredictiveKVCluster._trace_delta_k[idx], dim=0).contiguous()
+                    v_dict[idx] = torch.cat(AttentionAwarePredictiveKVCluster._trace_delta_v[idx], dim=0).contiguous()
+                    AttentionAwarePredictiveKVCluster._trace_delta_k[idx] = []
+                    AttentionAwarePredictiveKVCluster._trace_delta_v[idx] = []
                 out_path = f"{AttentionAwarePredictiveKVCluster._trace_output_path}.part{AttentionAwarePredictiveKVCluster._trace_part_idx:04d}.pt"
                 AttentionAwarePredictiveKVCluster._trace_part_idx += 1
-                AttentionAwarePredictiveKVCluster._save_trace_payload(out_path, delta_k, delta_v)
-                AttentionAwarePredictiveKVCluster._trace_delta_k = []
-                AttentionAwarePredictiveKVCluster._trace_delta_v = []
+                AttentionAwarePredictiveKVCluster._save_trace_payload(out_path, k_dict, v_dict)
             except Exception as e:
                 print(f"[APKVC][WARN] failed to flush trace chunk: {e}")
 
@@ -227,9 +262,21 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
                 k_cbs = torch.stack(k_cbs, dim=0)
             if isinstance(v_cbs, list):
                 v_cbs = torch.stack(v_cbs, dim=0)
+                
+            # If per_layer_codebooks is config'ed, expect [L, M, S, D]
+            if self.apkvc_config.per_layer_codebooks:
+                if k_cbs.dim() != 4 or v_cbs.dim() != 4:
+                    raise ValueError(f"per_layer_codebooks=True but calibration file is rank-{k_cbs.dim()} (expected 4)")
+                l_idx = self.layer_idx
+                # Fallback to last layer if L doesn't match evaluation layer count
+                if l_idx >= k_cbs.shape[0]: l_idx = k_cbs.shape[0] - 1
+                k_cbs = k_cbs[l_idx]
+                v_cbs = v_cbs[l_idx]
+            else:
+                if k_cbs.dim() != 3 or v_cbs.dim() != 3:
+                    raise ValueError(f"per_layer_codebooks=False but calibration file is rank-{k_cbs.dim()} (expected 3)")
+
             # expected: [num_codebooks, codebook_size, head_dim]
-            if k_cbs.dim() != 3 or v_cbs.dim() != 3:
-                raise ValueError("calibrated codebooks must be rank-3 tensors")
             if k_cbs.shape[-1] != head_dim or v_cbs.shape[-1] != head_dim:
                 raise ValueError(
                     f"head_dim mismatch: expected {head_dim}, got K={k_cbs.shape[-1]}, V={v_cbs.shape[-1]}"
@@ -484,6 +531,10 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
             V_hat = torch.nn.functional.scaled_dot_product_attention(
                 Q_base, self.anchor_buffer_K, self.anchor_buffer_V
             )
+        elif self.apkvc_config.predictor_type == 'none':
+            # Ablation: Zero prediction, directly quantize the raw KV matrices
+            K_hat_base = torch.zeros_like(K_true_base)
+            V_hat = torch.zeros_like(V_true)
         else:
             # Identity (last step)
             K_hat_base, V_hat = self.last_K.clone(), self.last_V.clone()
@@ -491,24 +542,54 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         # 4. Compressing residuals
         delta_K_base = K_true_base - K_hat_base
         delta_V = V_true - V_hat
-        residual_too_large = self._residual_norm_exceeds(delta_K_base, delta_V)
+        
+        # Scaling Normalization Fix
+        scale_K = None
+        scale_V = None
+        if self.apkvc_config.use_scale_normalization:
+            scale_K = delta_K_base.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            delta_K_normed = delta_K_base / scale_K
+            scale_V = delta_V.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            delta_V_normed = delta_V / scale_V
+        else:
+            delta_K_normed = delta_K_base
+            delta_V_normed = delta_V
+            
+        residual_too_large = self._residual_norm_exceeds(delta_K_normed, delta_V_normed)
         if residual_too_large:
             self.entries.append({'is_anchor': True, 'position': t})
             self.distortion_history.append(self.last_residual_norm) # Proxy graph value
+
             self.last_anchor_t = t
             self.last_distortion = 0.0
             self._update_rolling(K_true_base, V_true)
             self._append_anchor(K_true_base, V_true)
             return K_true, V_true
         
-        self._append_trace_samples(delta_K_base, delta_V)
+        # We trace the NORMED residuals (what codebooks train on)
+        self._append_trace_samples(delta_K_normed, delta_V_normed)
 
-        codes_K = self.additive_quantize(delta_K_base.squeeze(2), self.codebooks_K)
-        codes_V = self.additive_quantize(delta_V.squeeze(2), self.codebooks_V)
+        if self.apkvc_config.compress_K:
+            codes_K = self.additive_quantize(delta_K_normed.squeeze(2), self.codebooks_K)
+            recon_delta_K_normed = self.additive_decode(codes_K, self.codebooks_K).unsqueeze(2)
+        else:
+            codes_K = None
+            recon_delta_K_normed = delta_K_normed
+            
+        if self.apkvc_config.compress_V:
+            codes_V = self.additive_quantize(delta_V_normed.squeeze(2), self.codebooks_V)
+            recon_delta_V_normed = self.additive_decode(codes_V, self.codebooks_V).unsqueeze(2)
+        else:
+            codes_V = None
+            recon_delta_V_normed = delta_V_normed
 
         # 5. Reconstruction for local feedback
-        recon_delta_K_base = self.additive_decode(codes_K, self.codebooks_K).unsqueeze(2)
-        recon_delta_V = self.additive_decode(codes_V, self.codebooks_V).unsqueeze(2)
+        if self.apkvc_config.use_scale_normalization:
+            recon_delta_K_base = recon_delta_K_normed * scale_K
+            recon_delta_V = recon_delta_V_normed * scale_V
+        else:
+            recon_delta_K_base = recon_delta_K_normed
+            recon_delta_V = recon_delta_V_normed
         
         K_recon_base = K_hat_base + recon_delta_K_base
         
@@ -540,6 +621,8 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
                 'is_anchor': False,
                 'codes_K': codes_K,
                 'codes_V': codes_V,
+                'scale_K': scale_K.squeeze(2).half() if scale_K is not None else None,
+                'scale_V': scale_V.squeeze(2).half() if scale_V is not None else None,
                 'position': t
             })
             self._update_rolling(K_recon_base, V_recon)

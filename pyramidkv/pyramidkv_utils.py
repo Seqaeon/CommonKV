@@ -1358,4 +1358,5 @@ def init_custom(self):
     from attention_aware_predictive_kv import AttentionAwarePredictiveKVCluster
     # Pass all relevant config to the custom cluster
     config_dict = self.config.to_dict() if hasattr(self.config, "to_dict") else {}
+    config_dict['layer_idx'] = self.layer_idx
     return AttentionAwarePredictiveKVCluster(**config_dict)

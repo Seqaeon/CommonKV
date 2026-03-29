@@ -11,19 +11,32 @@ def _flatten_last_dim(x: torch.Tensor) -> torch.Tensor:
     return x.reshape(-1, x.shape[-1])
 
 
-def _load_trace_tensors(paths: List[str], key: str, max_samples: int) -> torch.Tensor:
-    chunks = []
+def _load_trace_tensors(paths: List[str], key: str, max_samples: int) -> dict:
+    """Loads traces and returns a dict mapping layer_idx -> [N, D] tensor."""
+    dict_out = {}
     for p in paths:
         payload = torch.load(p, map_location="cpu")
         if key not in payload:
             raise KeyError(f"Missing key '{key}' in trace file: {p}")
-        t = _flatten_last_dim(payload[key]).float()
-        chunks.append(t)
-    X = torch.cat(chunks, dim=0)
-    if X.shape[0] > max_samples:
-        idx = torch.randperm(X.shape[0])[:max_samples]
-        X = X[idx]
-    return X
+            
+        val = payload[key]
+        if isinstance(val, dict):
+            # New format: {layer_idx: tensor}
+            for l_idx, t in val.items():
+                if l_idx not in dict_out: dict_out[l_idx] = []
+                dict_out[l_idx].append(_flatten_last_dim(t).float())
+        else:
+            # Legacy monolithic format
+            if 0 not in dict_out: dict_out[0] = []
+            dict_out[0].append(_flatten_last_dim(val).float())
+            
+    for l_idx in dict_out:
+        X = torch.cat(dict_out[l_idx], dim=0)
+        if X.shape[0] > max_samples:
+            idx = torch.randperm(X.shape[0])[:max_samples]
+            X = X[idx]
+        dict_out[l_idx] = X
+    return dict_out
 
 
 def _argmin_dist_chunked(X: torch.Tensor, centers: torch.Tensor, chunk_size: int = 8192):
@@ -101,6 +114,7 @@ def parse_args():
     p.add_argument("--max_samples", type=int, default=120000)
     p.add_argument("--chunk_size", type=int, default=8192, help="Chunk size for memory-safe distance assignment")
     p.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"], help="Device for k-means calibration")
+    p.add_argument("--per_layer_codebooks", action="store_true", help="Train completely independent AQ codebooks per layer")
     return p.parse_args()
 
 
@@ -110,28 +124,46 @@ def main():
         if not os.path.isfile(p):
             raise FileNotFoundError(p)
 
-    K = _load_trace_tensors(args.trace_paths, "delta_K_base", args.max_samples)
-    V = _load_trace_tensors(args.trace_paths, "delta_V", args.max_samples)
+    K_dicts = _load_trace_tensors(args.trace_paths, "delta_K_base", args.max_samples)
+    V_dicts = _load_trace_tensors(args.trace_paths, "delta_V", args.max_samples)
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("--device cuda requested but CUDA is not available")
     device = torch.device(args.device)
-    K = K.to(device)
-    V = V.to(device)
 
-    K_codebooks = _residual_kmeans(
-        K,
-        num_codebooks=args.K_num_codebooks,
-        codebook_size=args.codebook_size,
-        iters=args.iters,
-        chunk_size=args.chunk_size,
-    )
-    V_codebooks = _residual_kmeans(
-        V,
-        num_codebooks=args.V_num_codebooks,
-        codebook_size=args.codebook_size,
-        iters=args.iters,
-        chunk_size=args.chunk_size,
-    )
+    if args.per_layer_codebooks:
+        print("[APKVC] Training Layer-Specific Codebooks...")
+        num_layers = max([0] + list(K_dicts.keys()) + list(V_dicts.keys())) + 1
+        
+        K_cbs_list, V_cbs_list = [], []
+        for l_idx in range(num_layers):
+            print(f" -> Layer {l_idx}/{num_layers-1} ...")
+            
+            # fallback to layer 0 if missing
+            kl = K_dicts.get(l_idx, K_dicts.get(0))
+            if kl is not None: kl = kl.to(device)
+            else: kl = torch.zeros((10, args.codebook_size), device=device) # dummy
+                
+            vl = V_dicts.get(l_idx, V_dicts.get(0))
+            if vl is not None: vl = vl.to(device)
+            else: vl = torch.zeros((10, args.codebook_size), device=device)
+            
+            Ck = _residual_kmeans(kl, args.K_num_codebooks, args.codebook_size, args.iters, args.chunk_size)
+            K_cbs_list.append(Ck)
+            Cv = _residual_kmeans(vl, args.V_num_codebooks, args.codebook_size, args.iters, args.chunk_size)
+            V_cbs_list.append(Cv)
+            
+        K_codebooks = torch.stack(K_cbs_list, dim=0) # [L, M, S, D]
+        V_codebooks = torch.stack(V_cbs_list, dim=0)
+    else:
+        print("[APKVC] Training Unified Monolithic Codebook...")
+        K_all = torch.cat(list(K_dicts.values()), dim=0)
+        V_all = torch.cat(list(V_dicts.values()), dim=0)
+        if K_all.shape[0] > args.max_samples: K_all = K_all[torch.randperm(K_all.shape[0])[:args.max_samples]]
+        if V_all.shape[0] > args.max_samples: V_all = V_all[torch.randperm(V_all.shape[0])[:args.max_samples]]
+        
+        K_all, V_all = K_all.to(device), V_all.to(device)
+        K_codebooks = _residual_kmeans(K_all, args.K_num_codebooks, args.codebook_size, args.iters, args.chunk_size)
+        V_codebooks = _residual_kmeans(V_all, args.V_num_codebooks, args.codebook_size, args.iters, args.chunk_size)
 
     payload = {
         "K_codebooks": K_codebooks.half(),
