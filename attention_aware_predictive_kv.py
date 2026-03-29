@@ -10,7 +10,7 @@ from pyramidkv.pyramidkv_utils import BaseCluster
 @dataclass
 class APKVCConfig:
     predictor_type: str  = 'linear' # 'identity', 'linear', or 'attention'
-    attention_window_size: int = 16
+    attention_window_size: int = 64
     alpha_K: float       = 1.5
     beta_K: float        = -0.5
     alpha_V: float       = 1.5
@@ -21,7 +21,7 @@ class APKVCConfig:
     V_num_codebooks: int     = 2
     codebook_size: int       = 256
     
-    rd_metric: str       = 'key_dot' # 'key_dot' or 'sampled_attention_output'
+    rd_metric: str       = 'sampled_attention_output' # 'key_dot' or 'sampled_attention_output'
     rd_threshold: float  = 0.1
     rd_sample_heads: int = 4
 
