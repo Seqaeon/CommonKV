@@ -366,15 +366,15 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         return interval_reset
 
     def compute_distortion(self, Q, K_true, K_reconstructed):
-        """Compute key-dot distortion proxy."""
-        # Q: [B, H, 1, D]
-        # K_true, K_reconstructed: [B, H, 1, D]
-        scale = math.sqrt(self.head_dim)
-        # Faster dot product: [B, H, 1, 1]
-        score_true = torch.sum(Q * K_true, dim=-1, keepdim=True) / scale
-        score_comp = torch.sum(Q * K_reconstructed, dim=-1, keepdim=True) / scale
-        # Max absolute discrepancy across batch/heads
-        return torch.max(torch.abs(score_true - score_comp)).item()
+        """Compute distortion metric."""
+        if self.apkvc_config.rd_metric == 'key_dot':
+            scale = math.sqrt(self.head_dim)
+            score_true = torch.sum(Q * K_true, dim=-1, keepdim=True) / scale
+            score_comp = torch.sum(Q * K_reconstructed, dim=-1, keepdim=True) / scale
+            return torch.max(torch.abs(score_true - score_comp)).item()
+        else:
+            # Robust MSE loss prevents catastrophic null-space hallucination
+            return torch.nn.functional.mse_loss(K_true, K_reconstructed).item()
 
     def _residual_norm_exceeds(self, delta_K, delta_V):
         """Residual magnitude gate used by the anchor reset policy."""
@@ -419,6 +419,7 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
                 self._append_trace_samples(prefill_delta_k, prefill_delta_v)
             for i in range(key_states.shape[-2]):
                 self.entries.append({'is_anchor': True, 'position': t + i})
+                self.distortion_history.append(0.0)
                 
             self.last_anchor_t = t + key_states.shape[-2] - 1
             
