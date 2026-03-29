@@ -153,8 +153,8 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
                 
         torch.save(
             {
-                "delta_K_base": {k: v.cpu().half() for k, v in delta_k_dict.items()},
-                "delta_V": {k: v.cpu().half() for k, v in delta_v_dict.items()},
+                "delta_K_base": {k: v for k, v in delta_k_dict.items()},
+                "delta_V": {k: v for k, v in delta_v_dict.items()},
                 "metadata": {
                     "num_layers": len(delta_k_dict),
                     "head_dim": head_dim,
@@ -172,10 +172,15 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
             return
         try:
             k_dict, v_dict = {}, {}
-            for l_idx in cls._trace_delta_k.keys():
-                if len(cls._trace_delta_k[l_idx]) == 0: continue
-                k_dict[l_idx] = torch.cat(cls._trace_delta_k[l_idx], dim=0)[: cls._trace_max_samples].contiguous()
-                v_dict[l_idx] = torch.cat(cls._trace_delta_v[l_idx], dim=0)[: cls._trace_max_samples].contiguous()
+            for l_idx in list(cls._trace_delta_k.keys()):
+                k_list = cls._trace_delta_k[l_idx]
+                v_list = cls._trace_delta_v[l_idx]
+                if len(k_list) == 0: continue
+                # Free memory before cat by clearing the class dictionary
+                cls._trace_delta_k[l_idx] = [] 
+                cls._trace_delta_v[l_idx] = []
+                k_dict[l_idx] = torch.cat(k_list, dim=0)[: cls._trace_max_samples].contiguous()
+                v_dict[l_idx] = torch.cat(v_list, dim=0)[: cls._trace_max_samples].contiguous()
             
             if len(k_dict) == 0: return
 
@@ -206,8 +211,8 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
     def _append_trace_samples(self, delta_K_base, delta_V):
         if not self.apkvc_config.trace_output_path:
             return
-        k = delta_K_base.reshape(-1, delta_K_base.shape[-1]).detach().to("cpu", dtype=torch.float32)
-        v = delta_V.reshape(-1, delta_V.shape[-1]).detach().to("cpu", dtype=torch.float32)
+        k = delta_K_base.reshape(-1, delta_K_base.shape[-1]).detach().to("cpu", dtype=torch.float16)
+        v = delta_V.reshape(-1, delta_V.shape[-1]).detach().to("cpu", dtype=torch.float16)
         if k.numel() == 0 or v.numel() == 0:
             return
             
