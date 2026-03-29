@@ -26,8 +26,8 @@ class APKVCConfig:
     rd_sample_heads: int = 4
 
     max_anchor_interval: int         = 16
-    residual_norm_threshold_K: float = 15.0
-    residual_norm_threshold_V: float = 15.0
+    residual_norm_threshold_K: float = 1000.0
+    residual_norm_threshold_V: float = 1000.0
     calibration_path: Optional[str] = None
     trace_output_path: Optional[str] = None
     trace_max_samples: int = 400000
@@ -438,6 +438,7 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         # Check for anchor reset
         if t == 0 or self.should_reset(t):
             self.entries.append({'is_anchor': True, 'position': t})
+            # For pure interval anchors, log 0.0 since it was never compressed
             self.distortion_history.append(0.0)
             self.last_anchor_t = t
             self.last_distortion = 0.0
@@ -472,7 +473,7 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         residual_too_large = self._residual_norm_exceeds(delta_K_base, delta_V)
         if residual_too_large:
             self.entries.append({'is_anchor': True, 'position': t})
-            self.distortion_history.append(0.0)
+            self.distortion_history.append(self.last_residual_norm) # Proxy graph value
             self.last_anchor_t = t
             self.last_distortion = 0.0
             self._update_rolling(K_true_base, V_true)
@@ -501,10 +502,12 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         distortion = self.compute_distortion(Q, K_true, K_recon)
         self.last_distortion = distortion
         
+        # Always log the actual calculated distortion for the graph, even if it gets downgraded!
+        self.distortion_history.append(distortion)
+        
         if distortion > self.apkvc_config.rd_threshold:
-            # Quality too low -> Downgrade to Anchor
+            # Quality too low -> Downgrade to Anchor logs as an anchor structurally, but graph shows attempt
             self.entries.append({'is_anchor': True, 'position': t})
-            self.distortion_history.append(0.0)
             self.last_anchor_t = t
             self.last_distortion = 0.0
             self._update_rolling(K_true_base, V_true)
@@ -518,6 +521,5 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
                 'codes_V': codes_V,
                 'position': t
             })
-            self.distortion_history.append(distortion)
             self._update_rolling(K_recon_base, V_recon)
             return K_recon, V_recon
