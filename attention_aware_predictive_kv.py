@@ -9,7 +9,8 @@ from pyramidkv.pyramidkv_utils import BaseCluster
 
 @dataclass
 class APKVCConfig:
-    predictor_type: str  = 'linear' # 'identity' or 'linear'
+    predictor_type: str  = 'linear' # 'identity', 'linear', or 'attention'
+    attention_window_size: int = 16
     alpha_K: float       = 1.5
     beta_K: float        = -0.5
     alpha_V: float       = 1.5
@@ -93,6 +94,7 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         # Extract config from kwargs or use defaults
         self.apkvc_config = APKVCConfig(
             predictor_type=kwargs.get("predictor_type", 'identity'),
+            attention_window_size=kwargs.get("attention_window_size", 16),
             rd_threshold=kwargs.get("rd_threshold", 0.05),
             max_anchor_interval=kwargs.get("max_anchor_interval", 16),
             K_num_codebooks=kwargs.get("K_num_codebooks", 4),
@@ -119,6 +121,8 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         self.last_V = None
         self.last_K2 = None
         self.last_V2 = None
+        self.anchor_buffer_K = None
+        self.anchor_buffer_V = None
         
         self.initialized = False
         self._setup_trace_dump()
@@ -335,6 +339,20 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         self.last_K = K.clone()
         self.last_V = V.clone()
 
+    def _append_anchor(self, K_base, V):
+        """Append to the anchor buffer for attention prediction."""
+        if self.anchor_buffer_K is None:
+            self.anchor_buffer_K = K_base.clone()
+            self.anchor_buffer_V = V.clone()
+        else:
+            self.anchor_buffer_K = torch.cat([self.anchor_buffer_K, K_base.clone()], dim=-2)
+            self.anchor_buffer_V = torch.cat([self.anchor_buffer_V, V.clone()], dim=-2)
+            
+        W = self.apkvc_config.attention_window_size
+        if self.anchor_buffer_K.shape[-2] > W:
+            self.anchor_buffer_K = self.anchor_buffer_K[..., -W:, :]
+            self.anchor_buffer_V = self.anchor_buffer_V[..., -W:, :]
+
     def should_reset(self, t):
         """Check if distance-based or interval-based reset is needed."""
         interval_reset = (t - self.last_anchor_t) >= self.apkvc_config.max_anchor_interval
@@ -385,7 +403,15 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
                 self.entries.append({'is_anchor': True, 'position': t + i})
                 self.distortion_history.append(0.0)
             self.last_anchor_t = t + key_states.shape[-2] - 1
-            self._update_rolling(key_states[:, :, -1:], value_states[:, :, -1:])
+            
+            K_true_last = key_states[:, :, -1:]
+            if self.apkvc_config.use_rope_aware_aq:
+                K_true_last_base = rope_derotate(K_true_last, self.last_anchor_t)
+            else:
+                K_true_last_base = K_true_last
+                
+            self._update_rolling(K_true_last_base, value_states[:, :, -1:])
+            self._append_anchor(K_true_last_base, value_states[:, :, -1:])
             return key_states, value_states
 
         # 2. Decoding Step (Single token)
@@ -393,40 +419,55 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         V_true = value_states
         Q = query_states
         
+        if self.apkvc_config.use_rope_aware_aq:
+            K_true_base = rope_derotate(K_true, t)
+        else:
+            K_true_base = K_true
+        
         # Check for anchor reset
         if t == 0 or self.should_reset(t):
             self.entries.append({'is_anchor': True, 'position': t})
             self.distortion_history.append(0.0)
             self.last_anchor_t = t
             self.last_distortion = 0.0
-            self._update_rolling(K_true, V_true)
+            self._update_rolling(K_true_base, V_true)
+            self._append_anchor(K_true_base, V_true)
             return K_true, V_true
 
-        # 3. Predict K_hat and V_hat
+        # 3. Predict K_hat_base and V_hat
         if self.apkvc_config.predictor_type == 'linear' and self.last_K2 is not None:
             # 2nd order extrapolation
-            K_hat = self.apkvc_config.alpha_K * self.last_K + self.apkvc_config.beta_K * self.last_K2
+            K_hat_base = self.apkvc_config.alpha_K * self.last_K + self.apkvc_config.beta_K * self.last_K2
             V_hat = self.apkvc_config.alpha_V * self.last_V + self.apkvc_config.beta_V * self.last_V2
+        elif self.apkvc_config.predictor_type == 'attention' and self.anchor_buffer_K is not None:
+            if self.apkvc_config.use_rope_aware_aq:
+                Q_base = rope_derotate(Q, t)
+            else:
+                Q_base = Q
+                
+            K_hat_base = torch.nn.functional.scaled_dot_product_attention(
+                Q_base, self.anchor_buffer_K, self.anchor_buffer_K
+            )
+            V_hat = torch.nn.functional.scaled_dot_product_attention(
+                Q_base, self.anchor_buffer_K, self.anchor_buffer_V
+            )
         else:
             # Identity (last step)
-            K_hat, V_hat = self.last_K.clone(), self.last_V.clone()
+            K_hat_base, V_hat = self.last_K.clone(), self.last_V.clone()
 
         # 4. Compressing residuals
-        delta_K = K_true - K_hat
+        delta_K_base = K_true_base - K_hat_base
         delta_V = V_true - V_hat
-        residual_too_large = self._residual_norm_exceeds(delta_K, delta_V)
+        residual_too_large = self._residual_norm_exceeds(delta_K_base, delta_V)
         if residual_too_large:
             self.entries.append({'is_anchor': True, 'position': t})
             self.distortion_history.append(0.0)
             self.last_anchor_t = t
             self.last_distortion = 0.0
-            self._update_rolling(K_true, V_true)
+            self._update_rolling(K_true_base, V_true)
+            self._append_anchor(K_true_base, V_true)
             return K_true, V_true
         
-        if self.apkvc_config.use_rope_aware_aq:
-            delta_K_base = rope_derotate(delta_K, t)
-        else:
-            delta_K_base = delta_K
         self._append_trace_samples(delta_K_base, delta_V)
 
         codes_K = self.additive_quantize(delta_K_base.squeeze(2), self.codebooks_K)
@@ -436,12 +477,13 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         recon_delta_K_base = self.additive_decode(codes_K, self.codebooks_K).unsqueeze(2)
         recon_delta_V = self.additive_decode(codes_V, self.codebooks_V).unsqueeze(2)
         
+        K_recon_base = K_hat_base + recon_delta_K_base
+        
         if self.apkvc_config.use_rope_aware_aq:
-            recon_delta_K = rope_rotate(recon_delta_K_base, t)
+            K_recon = rope_rotate(K_recon_base, t)
         else:
-            recon_delta_K = recon_delta_K_base
+            K_recon = K_recon_base
             
-        K_recon = K_hat + recon_delta_K
         V_recon = V_hat + recon_delta_V
 
         # 6. Attention-Aware distortion check
@@ -454,7 +496,8 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
             self.distortion_history.append(0.0)
             self.last_anchor_t = t
             self.last_distortion = 0.0
-            self._update_rolling(K_true, V_true)
+            self._update_rolling(K_true_base, V_true)
+            self._append_anchor(K_true_base, V_true)
             return K_true, V_true
         else:
             # Success -> Store compressed indices
@@ -465,5 +508,5 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
                 'position': t
             })
             self.distortion_history.append(distortion)
-            self._update_rolling(K_recon, V_recon)
+            self._update_rolling(K_recon_base, V_recon)
             return K_recon, V_recon
