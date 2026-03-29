@@ -563,7 +563,7 @@ if __name__ == "__main__":
     parser.add_argument("--layer_step", type=int, default=2, help="how many layers connect to one")
     
     # APKVC Specific Arguments
-    parser.add_argument("--predictor_type", type=str, default="identity", choices=["identity", "linear", "attention"], help="APKVC predictor type")
+    parser.add_argument("--predictor_type", type=str, default="identity", choices=["identity", "linear", "attention", "none"], help="APKVC predictor type")
     parser.add_argument("--apkvc_attention_window_size", type=int, default=64, help="Window size for 'attention' predictor type")
     parser.add_argument("--apkvc_use_rope_aware_aq", type=int, default=1, choices=[0, 1], help="APKVC toggle for RoPE-aware AQ: 1=enable, 0=disable")
     parser.add_argument("--rd_threshold", type=float, default=0.05, help="APKVC rate-distortion threshold")
