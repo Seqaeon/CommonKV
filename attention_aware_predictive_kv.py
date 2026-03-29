@@ -9,7 +9,7 @@ from pyramidkv.pyramidkv_utils import BaseCluster
 
 @dataclass
 class APKVCConfig:
-    predictor_type: str  = 'linear' # 'identity', 'linear', or 'attention'
+    predictor_type: str  = 'attention' # 'identity', 'linear', or 'attention'
     attention_window_size: int = 64
     alpha_K: float       = 1.5
     beta_K: float        = -0.5
