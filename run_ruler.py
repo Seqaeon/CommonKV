@@ -267,6 +267,7 @@ def main(args):
         if args.method.lower() in ["apkvc", "custom"]:
             for i in range(len(model.model.layers)):
                 model.model.layers[i].self_attn.config.predictor_type = args.predictor_type
+                model.model.layers[i].self_attn.config.attention_window_size = args.apkvc_attention_window_size
                 model.model.layers[i].self_attn.config.rd_threshold = args.rd_threshold
                 model.model.layers[i].self_attn.config.max_anchor_interval = args.max_anchor_interval
                 model.model.layers[i].self_attn.config.K_num_codebooks = args.K_num_codebooks
@@ -276,6 +277,7 @@ def main(args):
                 model.model.layers[i].self_attn.config.apkvc_trace_output_path = args.apkvc_trace_output_path
                 model.model.layers[i].self_attn.config.apkvc_trace_max_samples = args.apkvc_trace_max_samples
                 model.model.layers[i].self_attn.config.apkvc_trace_chunk_size = args.apkvc_trace_chunk_size
+                model.model.layers[i].self_attn.config.linear_window_size = args.apkvc_linear_window_size
 
         if args.method.lower() not in ["fullkv", "ours", "commonkv", "apkvc", "custom"] :
             if args.method.lower() in ["snapkv","pyramidkv","h2o","cam", "l2norm", "think", "palu", "minicache"]:
@@ -365,9 +367,25 @@ def main(args):
             elif args.method.lower() in ["apkvc", "custom"]:
                 full_bits = 16
                 compressed_bits = (args.K_num_codebooks * 4 + args.V_num_codebooks * 4) / 2
-                anchor_freq = 1.0 / args.max_anchor_interval
                 head_dim = getattr(model.config, "head_dim", model.config.hidden_size // model.config.num_attention_heads)
-                cr = anchor_freq + (1.0 - anchor_freq) * (compressed_bits / (full_bits * head_dim))
+                compression_factor = compressed_bits / (full_bits * head_dim)
+                
+                layer_crs = []
+                from attention_aware_predictive_kv import AttentionAwarePredictiveKVCluster
+                for layer in model.model.layers:
+                    if hasattr(layer.self_attn, "kv_cluster") and isinstance(layer.self_attn.kv_cluster, AttentionAwarePredictiveKVCluster):
+                        cluster = layer.self_attn.kv_cluster
+                        total = len(cluster.entries)
+                        if total > 0:
+                            num_anchors = sum(1 for e in cluster.entries if e.get('is_anchor', False))
+                            freq = num_anchors / total
+                            layer_crs.append(freq + (1.0 - freq) * compression_factor)
+                            
+                if layer_crs:
+                    cr = sum(layer_crs) / len(layer_crs)
+                else:
+                    anchor_freq = 1.0 / args.max_anchor_interval
+                    cr = anchor_freq + (1.0 - anchor_freq) * compression_factor
 
             example = {}
             example["prompt"] = batch_prompts[j]
@@ -382,7 +400,7 @@ def main(args):
             example["truncation_policy"] = args.truncation_policy
             if args.method.lower() in ["apkvc", "custom"]:
                 example["apkvc_use_rope_aware_aq"] = bool(args.apkvc_use_rope_aware_aq)
-                example["compression_ratio_definition"] = "apkvc_estimate_from_codebooks_and_anchor_interval"
+                example["compression_ratio_definition"] = "apkvc_dynamic_anchor_frequency"
             elif args.method.lower() in ["commonkv", "ours"]:
                 example["compression_ratio_definition"] = "commonkv_estimate_mean_rank_over_kv_width"
             example["latency"] = float(f"{latency:.4f}")
@@ -466,6 +484,7 @@ if __name__ == "__main__":
     
     # APKVC Specific Arguments
     parser.add_argument("--predictor_type", type=str, default="identity", choices=["identity", "linear", "attention"], help="APKVC predictor type")
+    parser.add_argument("--apkvc_attention_window_size", type=int, default=64, help="Window size for 'attention' predictor type")
     parser.add_argument("--apkvc_use_rope_aware_aq", type=int, default=1, choices=[0, 1], help="APKVC toggle for RoPE-aware AQ: 1=enable, 0=disable")
     parser.add_argument("--rd_threshold", type=float, default=0.05, help="APKVC rate-distortion threshold")
     parser.add_argument("--max_anchor_interval", type=int, default=16, help="APKVC max tokens between anchors")
@@ -476,6 +495,7 @@ if __name__ == "__main__":
     parser.add_argument("--apkvc_trace_max_samples", type=int, default=400000, help="Max residual samples to keep when dumping APKVC traces")
     parser.add_argument("--apkvc_trace_chunk_size", type=int, default=0, help="If >0, flush trace chunks to <path>.partXXXX.pt after this many samples")
     parser.add_argument("--apkvc_save_history_path", type=str, default=None, help="Save APKVC distortion history of all layers to this path (.pt)")
+    parser.add_argument("--apkvc_linear_window_size", type=int, default=2, help="Number of past anchors used for linear trajectory prediction (default: 2)")
 
     parser.add_argument("--context_lengths", type=int, nargs="+", default=None, help="Context lengths to evaluate. Defaults to DEFAULT_CONTEXT_LENGTHS.")
     parser.add_argument(

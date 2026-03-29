@@ -26,6 +26,7 @@ class APKVCConfig:
     rd_sample_heads: int = 4
 
     max_anchor_interval: int         = 16
+    linear_window_size: int          = 2
     residual_norm_threshold_K: float = 1000.0
     residual_norm_threshold_V: float = 1000.0
     calibration_path: Optional[str] = None
@@ -121,6 +122,8 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         self.last_V = None
         self.last_K2 = None
         self.last_V2 = None
+        self.anchor_window_K = [] # Rolling buffer for linear predictor
+        self.anchor_window_V = []
         self.anchor_buffer_K = None
         self.anchor_buffer_V = None
         
@@ -331,13 +334,17 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         return out
 
     def _update_rolling(self, K, V):
-        """Update last two anchors for linear trajectory prediction."""
-        # Shift old states
-        self.last_K2 = self.last_K
         self.last_V2 = self.last_V
         # Store new anchors
         self.last_K = K.clone()
         self.last_V = V.clone()
+        
+        # New: Rolling window for multi-token linear predictor
+        self.anchor_window_K.append(K.clone())
+        self.anchor_window_V.append(V.clone())
+        if len(self.anchor_window_K) > self.apkvc_config.linear_window_size:
+            self.anchor_window_K.pop(0)
+            self.anchor_window_V.pop(0)
 
     def _append_anchor(self, K_base, V):
         """Append to the anchor buffer for attention prediction."""
@@ -447,10 +454,23 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
             return K_true, V_true
 
         # 3. Predict K_hat_base and V_hat
-        if self.apkvc_config.predictor_type == 'linear' and self.last_K2 is not None:
-            # 2nd order extrapolation
-            K_hat_base = self.apkvc_config.alpha_K * self.last_K + self.apkvc_config.beta_K * self.last_K2
-            V_hat = self.apkvc_config.alpha_V * self.last_V + self.apkvc_config.beta_V * self.last_V2
+        if self.apkvc_config.predictor_type == 'linear' and len(self.anchor_window_K) >= 2:
+            if self.apkvc_config.linear_window_size == 2 or len(self.anchor_window_K) == 2:
+                # Standard 2nd order extrapolation: 1.5*K_recent - 0.5*K_prev
+                K_hat_base = self.apkvc_config.alpha_K * self.anchor_window_K[-1] + self.apkvc_config.beta_K * self.anchor_window_K[-2]
+                V_hat = self.apkvc_config.alpha_V * self.anchor_window_V[-1] + self.apkvc_config.beta_V * self.anchor_window_V[-2]
+            else:
+                # Multi-point linear trend prediction (Mean Delta approach)
+                # Calculates average increment over the window and projects it
+                window_k = self.anchor_window_K # List of [B, H, 1, D]
+                deltas_k = [(window_k[i] - window_k[i-1]) for i in range(1, len(window_k))]
+                avg_delta_k = torch.stack(deltas_k).mean(dim=0)
+                K_hat_base = window_k[-1] + 0.5 * avg_delta_k # Predict "halfway" forward into the next segment
+                
+                window_v = self.anchor_window_V
+                deltas_v = [(window_v[i] - window_v[i-1]) for i in range(1, len(window_v))]
+                avg_delta_v = torch.stack(deltas_v).mean(dim=0)
+                V_hat = window_v[-1] + 0.5 * avg_delta_v
         elif self.apkvc_config.predictor_type == 'attention' and self.anchor_buffer_K is not None:
             if self.apkvc_config.use_rope_aware_aq:
                 Q_base = rope_derotate(Q, t)
