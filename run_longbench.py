@@ -326,6 +326,12 @@ def main(args):
                 model.model.layers[i].self_attn.config.apkvc_trace_max_samples = args.apkvc_trace_max_samples
                 model.model.layers[i].self_attn.config.apkvc_trace_chunk_size = args.apkvc_trace_chunk_size
                 model.model.layers[i].self_attn.config.linear_window_size = args.apkvc_linear_window_size
+                model.model.layers[i].self_attn.config.per_layer_codebooks = bool(args.apkvc_per_layer_codebooks)
+                model.model.layers[i].self_attn.config.compress_K = bool(args.apkvc_compress_K)
+                model.model.layers[i].self_attn.config.compress_V = bool(args.apkvc_compress_V)
+                model.model.layers[i].self_attn.config.use_scale_normalization = bool(args.apkvc_use_scale_normalization)
+                model.model.layers[i].self_attn.config.residual_norm_threshold_K = args.apkvc_residual_norm_threshold_K
+                model.model.layers[i].self_attn.config.residual_norm_threshold_V = args.apkvc_residual_norm_threshold_V
 
         if args.method.lower() not in ["fullkv", "ours", "commonkv", "apkvc", "custom"] :
             if args.method.lower() in ["snapkv","pyramidkv","h2o","cam", "l2norm", "adakv", "headkv", "think", "palu", "minicache"]:
@@ -570,6 +576,14 @@ if __name__ == "__main__":
     parser.add_argument("--apkvc_trace_chunk_size", type=int, default=0, help="If >0, flush trace chunks to <path>.partXXXX.pt after this many samples")
     parser.add_argument("--apkvc_save_history_path", type=str, default=None, help="Save APKVC distortion history of all layers to this path (.pt)")
     parser.add_argument("--apkvc_linear_window_size", type=int, default=2, help="Number of past anchors used for linear trajectory prediction (default: 2)")
+    
+    # New Ablation Arguments
+    parser.add_argument("--apkvc_per_layer_codebooks", type=int, default=0, choices=[0, 1], help="Use separate codebooks per layer")
+    parser.add_argument("--apkvc_compress_K", type=int, default=1, choices=[0, 1], help="Toggle quantizing Keys")
+    parser.add_argument("--apkvc_compress_V", type=int, default=1, choices=[0, 1], help="Toggle quantizing Values")
+    parser.add_argument("--apkvc_use_scale_normalization", type=int, default=1, choices=[0, 1], help="Toggle normalizing quantization residuals by head magnitude")
+    parser.add_argument("--apkvc_residual_norm_threshold_K", type=float, default=1000.0, help="Max euclidean norm of K residual before fallback")
+    parser.add_argument("--apkvc_residual_norm_threshold_V", type=float, default=1000.0, help="Max euclidean norm of V residual before fallback")
 
     parser.add_argument(
         "--require_head_wise_ranks",
