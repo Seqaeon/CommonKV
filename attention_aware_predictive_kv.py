@@ -394,6 +394,17 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         
         # 1. Prefill / Multi-token fallback
         if key_states.shape[-2] > 1:
+            # A large chunk implies a new sample's prefill. Flush transient sequence state.
+            self.entries = []
+            self.last_anchor_t = -1
+            self.last_K = None
+            self.last_V = None
+            self.last_K2 = None
+            self.last_V2 = None
+            self.anchor_buffer_K = None
+            self.anchor_buffer_V = None
+            t = 0
+            
             if self.apkvc_config.trace_output_path and key_states.shape[-2] > 1:
                 prefill_delta_k = key_states[:, :, 1:, :] - key_states[:, :, :-1, :]
                 prefill_delta_v = value_states[:, :, 1:, :] - value_states[:, :, :-1, :]
