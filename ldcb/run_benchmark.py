@@ -13,13 +13,14 @@ from ldcb.tasks.reasoning import run_reasoning
 from ldcb.tasks.multiturn import run_multiturn
 from ldcb.plots import plot1_compression_vs_length, plot2_pareto_frontier, plot3_vram_over_turns
 
-def load_model(model_id, device="cuda"):
-    print(f"Loading model {model_id}...")
+def load_model(model_id, device_map="cuda"):
+    print(f"Loading model {model_id} (device_map={device_map})...")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=torch.float16,
-        device_map=device,
+        device_map=device_map,
+        trust_remote_code=True,
     )
     model.eval()
     return model, tokenizer
@@ -28,14 +29,14 @@ def main():
     parser = argparse.ArgumentParser(description="Run Long-Decode Compression Benchmark (LDCB)")
     parser.add_argument("--model_id", type=str, default="meta-llama/Llama-2-7b-hf", help="Model ID to benchmark")
     parser.add_argument("--output_dir", type=str, default="ldcb/results", help="Directory to save results")
-    parser.add_argument("--device", type=str, default="cuda", help="Device to use")
+    parser.add_argument("--device_map", type=str, default="auto", help="Device map to use (e.g. 'auto', 'cuda:0')")
     parser.add_argument("--tasks", type=str, default="continuation,reasoning,multiturn", help="Comma-separated list of tasks to run")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    model, tokenizer = load_model(args.model_id, args.device)
+    model, tokenizer = load_model(args.model_id, args.device_map)
 
     # Define methods to benchmark
     methods = {

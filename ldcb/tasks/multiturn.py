@@ -42,7 +42,7 @@ def run_multiturn(method, model, tokenizer) -> dict:
             checkpoint_steps=[RESPONSE_TOKENS_PER_TURN],
         )
 
-        vram_gb = torch.cuda.max_memory_allocated() / 1e9
+        vram_gb = sum(torch.cuda.max_memory_allocated(i) for i in range(torch.cuda.device_count())) / 1e9
 
         turn_results.append({
             "turn": turn_idx + 1,
