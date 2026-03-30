@@ -438,9 +438,22 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
             or v_norm > self.apkvc_config.residual_norm_threshold_V
         )
 
+    def _flush_sequence_state(self):
+        """Reset transient sequence tracking for a new prompt."""
+        self.entries = []
+        self.last_anchor_t = -1
+        self.last_K = None
+        self.last_V = None
+        self.last_K2 = None
+        self.last_V2 = None
+        self.anchor_buffer_K = None
+        self.anchor_buffer_V = None
+        self.anchor_window_K = []
+        self.anchor_window_V = []
+
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
         """
-        APKVC Update Step.
+        APKVC Update Step (Handles both chunked Prefill and Single-Token Decoding).
         """
         bsz, num_heads, q_len, head_dim = query_states.shape
         device = query_states.device
@@ -449,41 +462,30 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         if not self.initialized:
             self._init_lazy(head_dim, device, dtype)
 
-        t = len(self.entries)
+        seq_len = key_states.shape[-2]
         
-        # 1. Prefill / Multi-token fallback
-        if key_states.shape[-2] > 1:
+        if seq_len > 1:
             # A large chunk implies a new sample's prefill. Flush transient sequence state.
-            self.entries = []
-            self.last_anchor_t = -1
-            self.last_K = None
-            self.last_V = None
-            self.last_K2 = None
-            self.last_V2 = None
-            self.anchor_buffer_K = None
-            self.anchor_buffer_V = None
-            t = 0
+            self._flush_sequence_state()
             
-            if self.apkvc_config.trace_output_path and key_states.shape[-2] > 1:
-                prefill_delta_k = key_states[:, :, 1:, :] - key_states[:, :, :-1, :]
-                prefill_delta_v = value_states[:, :, 1:, :] - value_states[:, :, :-1, :]
-                # For prefill traces we keep deltas in current space; decode-time traces remain RoPE-base.
-                self._append_trace_samples(prefill_delta_k, prefill_delta_v)
-            for i in range(key_states.shape[-2]):
-                self.entries.append({'is_anchor': True, 'position': t + i})
-                self.distortion_history.append(0.0)
+            K_out_list, V_out_list = [], []
+            for t_step in range(seq_len):
+                K_t = key_states[:, :, t_step:t_step+1, :]
+                Q_t = query_states[:, :, t_step:t_step+1, :]
+                V_t = value_states[:, :, t_step:t_step+1, :]
                 
-            self.last_anchor_t = t + key_states.shape[-2] - 1
+                # Progressively process each token in the prompt exactly as if it were decoding
+                k, v = self._process_single_token(K_t, Q_t, V_t, attention_mask, num_key_value_groups)
+                K_out_list.append(k)
+                V_out_list.append(v)
+                
+            return torch.cat(K_out_list, dim=-2), torch.cat(V_out_list, dim=-2)
             
-            K_true_last = key_states[:, :, -1:]
-            if self.apkvc_config.use_rope_aware_aq:
-                K_true_last_base = rope_derotate(K_true_last, self.last_anchor_t)
-            else:
-                K_true_last_base = K_true_last
-                
-            self._update_rolling(K_true_last_base, value_states[:, :, -1:])
-            self._append_anchor(K_true_last_base, value_states[:, :, -1:])
-            return key_states, value_states
+        else:
+            return self._process_single_token(key_states, query_states, value_states, attention_mask, num_key_value_groups)
+
+    def _process_single_token(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
+        t = len(self.entries)
 
         # 2. Decoding Step (Single token)
         K_true = key_states
