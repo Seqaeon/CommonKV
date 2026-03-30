@@ -1,4 +1,5 @@
 import torch
+from ..utils import get_total_vram_gb
 from ..metrics import compute_perplexity, aggregate_task_results
 
 CHECKPOINT_STEPS = [250, 500, 1000, 2000, 4000]
@@ -48,7 +49,7 @@ def run_continuation(method, model, tokenizer) -> dict:
                 for step, snap in zip(CHECKPOINT_STEPS, snapshots)
             ],
             "final_compression_ratio": final_state.compressed_bytes / final_state.fullkv_bytes,
-            "peak_vram_gb": sum(torch.cuda.max_memory_allocated(i) for i in range(torch.cuda.device_count())) / 1e9,
+            "peak_vram_gb": get_total_vram_gb(),
             "perplexity": compute_perplexity(model, tokenizer, generated_text),
             "distortion_mean": float(torch.tensor(final_state.distortions).mean())
                                if final_state.distortions else 0.0,

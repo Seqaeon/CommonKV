@@ -1,5 +1,6 @@
 import torch
 import random
+from ..utils import get_total_vram_gb
 from ..metrics import aggregate_task_results
 
 MAX_NEW_TOKENS = 2000
@@ -76,7 +77,7 @@ def run_reasoning(method, model, tokenizer) -> dict:
                 for step, snap in zip(CHECKPOINT_STEPS, snapshots)
             ],
             "final_compression_ratio": final_state.compressed_bytes / final_state.fullkv_bytes,
-            "peak_vram_gb": sum(torch.cuda.max_memory_allocated(i) for i in range(torch.cuda.device_count())) / 1e9,
+            "peak_vram_gb": get_total_vram_gb(),
             "perplexity": 0.0, # Reasoning task focuses on logic rather than PPL
         }
         all_results.append(result)

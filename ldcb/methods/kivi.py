@@ -1,5 +1,6 @@
 import torch
 from .base import KVCacheMethod, CacheState
+from ldcb.utils import get_kv_iterator
 
 class KIVIMethod(KVCacheMethod):
 
@@ -49,7 +50,7 @@ class KIVIMethod(KVCacheMethod):
             past_kv = outputs.past_key_values  
             
             quant_cache = []
-            for layer_K, layer_V in past_kv:
+            for _, (layer_K, layer_V) in get_kv_iterator(past_kv):
                 K_q, K_scale = self._quantize_K(layer_K)
                 V_q, V_scale = self._quantize_V(layer_V)
                 quant_cache.append((K_q, K_scale, V_q, V_scale))
@@ -69,7 +70,7 @@ class KIVIMethod(KVCacheMethod):
                 new_kv_full = outputs.past_key_values
                 
                 quant_cache = []
-                for layer_idx, (layer_K, layer_V) in enumerate(new_kv_full):
+                for _, (layer_K, layer_V) in get_kv_iterator(new_kv_full):
                     K_q, K_scale = self._quantize_K(layer_K)
                     V_q, V_scale = self._quantize_V(layer_V)
                     quant_cache.append((K_q, K_scale, V_q, V_scale))
