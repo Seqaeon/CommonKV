@@ -1,0 +1,151 @@
+import torch
+from transformers.cache_utils import DynamicCache
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+class HybridAPKVCCache(DynamicCache):
+    """
+    A hybridized KV cache designed to physically save VRAM by compressing 
+    the Prompt prefill down to INT8 per-channel quantization, and managing
+    autoregressive Decode using APKVC codebooks.
+    """
+    def __init__(self, model_config, apkvc_kwargs=None):
+        super().__init__()
+        # Pre-allocate caches
+        self.prefill_K_int8 = []
+        self.prefill_K_scale = []
+        self.prefill_V_int8 = []
+        self.prefill_V_scale = []
+        
+        self.decode_states = []
+        
+        self.apkvc_kwargs = apkvc_kwargs if apkvc_kwargs is not None else {}
+        self.model_config = model_config
+        self._seen_tokens = 0
+        
+    def _init_layer(self, layer_idx):
+        from attention_aware_predictive_kv import AttentionAwarePredictiveKVCluster
+        while len(self.decode_states) <= layer_idx:
+            # Inject layer-specific config
+            layer_kwargs = dict(self.apkvc_kwargs)
+            layer_kwargs['layer_idx'] = len(self.decode_states)
+            cluster = AttentionAwarePredictiveKVCluster(**layer_kwargs)
+            
+            # Hybrid states dictionary strictly for the decoding pipeline (replaces HF full fp16 tracking)
+            state = {
+                'cluster': cluster,
+                'entries': [],            # Only holds {'is_anchor', 'K'/'V' or 'codes_K'/'codes_V'}
+                'recon_cache': {},        # Key=position, Value=(K, V) tuple rebuilt from history
+                'last_anchor_t': -1,
+                'last_distortion': 0.0,
+                'last_K': None,
+                'last_V': None,
+                'last_K2': None,
+                'last_V2': None,
+            }
+            self.decode_states.append(state)
+            self.prefill_K_int8.append(None)
+            self.prefill_K_scale.append(None)
+            self.prefill_V_int8.append(None)
+            self.prefill_V_scale.append(None)
+
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        if len(self.decode_states) <= layer_idx:
+            return 0
+        
+        prefill_len = 0
+        if self.prefill_K_int8[layer_idx] is not None:
+            prefill_len = self.prefill_K_int8[layer_idx].shape[-2]
+            
+        decode_len = len(self.decode_states[layer_idx]['entries'])
+        return prefill_len + decode_len
+
+    def quantize_prefill_kv(self, K: torch.Tensor, V: torch.Tensor):
+        # Per-channel: scale over token dimension (dim=2)
+        K_scale = K.abs().amax(dim=2, keepdim=True) / 127.0
+        V_scale = V.abs().amax(dim=2, keepdim=True) / 127.0
+        # Prevent zero division
+        K_scale = K_scale.clamp(min=1e-5)
+        V_scale = V_scale.clamp(min=1e-5)
+        
+        K_int8 = (K / K_scale).round().clamp(-128, 127).to(torch.int8)
+        V_int8 = (V / V_scale).round().clamp(-128, 127).to(torch.int8)
+        return K_int8, K_scale.half(), V_int8, V_scale.half()
+
+    def dequantize_prefill_kv(self, layer_idx: int):
+        K_int8 = self.prefill_K_int8[layer_idx]
+        K_scale = self.prefill_K_scale[layer_idx]
+        V_int8 = self.prefill_V_int8[layer_idx]
+        V_scale = self.prefill_V_scale[layer_idx]
+        
+        K = K_int8.half() * K_scale
+        V = V_int8.half() * V_scale
+        return K, V
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        
+        self._init_layer(layer_idx)
+        if layer_idx == 0:
+            self._seen_tokens += key_states.shape[-2]
+            
+        is_prefill = key_states.shape[-2] > 1
+        
+        if is_prefill:
+            # 1. Quantize and save prefill arrays in physical memory
+            K_int8, K_scale, V_int8, V_scale = self.quantize_prefill_kv(key_states, value_states)
+            self.prefill_K_int8[layer_idx] = K_int8
+            self.prefill_K_scale[layer_idx] = K_scale
+            self.prefill_V_int8[layer_idx] = V_int8
+            self.prefill_V_scale[layer_idx] = V_scale
+            
+            # Instantiate prediction states so decoded tokens can securely predict
+            state = self.decode_states[layer_idx]
+            cluster = state['cluster']
+            Q = cache_kwargs.get("query_states", None)
+            
+            # The cluster manages codes statically, pass identity to bootstrap
+            state['last_K'] = key_states[:, :, -1:, :]
+            state['last_V'] = value_states[:, :, -1:, :]
+            
+            # Return full tensors for this instantaneous attention calculation
+            # PyTorch immediately discards this temporary fp16 array!
+            return key_states, value_states
+            
+        else:
+            # 2. Decode Sequence Processing
+            state = self.decode_states[layer_idx]
+            cluster = state['cluster']
+            Q = cache_kwargs.get("query_states", None)
+            
+            t = len(state['entries'])
+            
+            # We defer the actual codebook heavy lifting completely into the cluster module
+            # Let it write its mathematical outputs (Anchors & Dictionaries) securely into `state`
+            K_recon, V_recon = cluster.compress_decode_token(key_states, value_states, Q, t, state)
+            
+            # Finally, rebuild the complete sequence tensor to feed to scaled-dot-product attention.
+            K_prefill, V_prefill = self.dequantize_prefill_kv(layer_idx)
+            
+            # Gather decode history from recon_cache
+            # Because PyTorch requires contiguous arrays, we must materialize them
+            # O(T) materialization is required here as HF past_key_value inherently requires the entire history!
+            decode_len = t + 1
+            K_decode_list = []
+            V_decode_list = []
+            for position in range(decode_len):
+                K_t, V_t = state['recon_cache'][position]
+                K_decode_list.append(K_t)
+                V_decode_list.append(V_t)
+                
+            K_decode = torch.cat(K_decode_list, dim=-2)
+            V_decode = torch.cat(V_decode_list, dim=-2)
+            
+            final_K = torch.cat([K_prefill, K_decode], dim=-2)
+            final_V = torch.cat([V_prefill, V_decode], dim=-2)
+            
+            return final_K, final_V

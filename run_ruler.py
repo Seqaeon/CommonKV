@@ -318,6 +318,13 @@ def main(args):
 
         context_length = batch_input_ids.shape[-1]
         start_time = time.time()
+        
+        apkvc_cache = None
+        if args.method.lower() == "apkvc":
+            from commonkv.apkvc_cache import HybridAPKVCCache
+            apkvc_cache = HybridAPKVCCache(model.config, apkvc_kwargs=model.config.to_dict())
+            tokenized_prompts["past_key_values"] = apkvc_cache
+            
         if args.quant_method == None:        
             output = model.generate(
                 **tokenized_prompts,
@@ -364,7 +371,30 @@ def main(args):
                 cr = getattr(args, "pruning_ratio", 1.0)
             elif args.method.lower() in ["commonkv", "ours"]:
                 cr = commonkv_memory_fraction
-            elif args.method.lower() in ["apkvc", "custom"]:
+            elif args.method.lower() == "apkvc":
+                codebytes_K = (256 * 128 * 2 * args.K_num_codebooks) if getattr(args, 'compress_K', False) else 0
+                codebytes_V = (256 * 128 * 2 * args.V_num_codebooks) if getattr(args, 'compress_V', False) else 0
+                compressed_bits = getattr(args, 'K_num_codebooks', 0) * 8 + getattr(args, 'V_num_codebooks', 0) * 8 
+                full_bits = 32
+                head_dim = 128
+                compression_factor = compressed_bits / (full_bits * head_dim)
+                
+                layer_crs = []
+                if apkvc_cache is not None:
+                    for layer_idx, state in enumerate(apkvc_cache.decode_states):
+                        decoding_entries = [e for e in state['entries'] if not e.get('is_prefill', False)]
+                        total_decoding = len(decoding_entries)
+                        
+                        if total_decoding > 0:
+                            num_anchors = sum(1 for e in decoding_entries if e.get('is_anchor', False))
+                            freq = num_anchors / total_decoding
+                            layer_crs.append(freq + (1.0 - freq) * compression_factor)
+                        elif len(state['entries']) > 0:
+                            layer_crs.append(1.0)
+                            
+                if layer_crs:
+                    cr = sum(layer_crs) / len(layer_crs)
+            elif args.method.lower() == "custom":
                 full_bits = 16
                 compressed_bits = (args.K_num_codebooks * 4 + args.V_num_codebooks * 4) / 2
                 head_dim = getattr(model.config, "head_dim", model.config.hidden_size // model.config.num_attention_heads)

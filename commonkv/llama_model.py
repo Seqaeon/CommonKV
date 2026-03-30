@@ -3371,10 +3371,7 @@ def llama_sdpa_attn_forward_APKVC(
             position_embeddings=position_embeddings,
         )
 
-    # APKVC Native Instantiation
-    if not hasattr(self, "kv_cluster"):
-        from pyramidkv.pyramidkv_utils import init_custom
-        self.kv_cluster = init_custom(self)
+    # Instantiation handled safely by Hybrid Cache architecture
 
     bsz, q_len, _ = hidden_states.size()
 
@@ -3411,20 +3408,16 @@ def llama_sdpa_attn_forward_APKVC(
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
     if past_key_value is not None:
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        # Standard HuggingFace Cache interface alignment
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position, "query_states": query_states}
         
-        # APKVC Decoding Bypass Patch
-        if key_states.shape[-2] == kv_seq_len:
-            self.kv_seq_len = kv_seq_len
-            kc, vc = self.kv_cluster.update_kv(key_states, query_states, value_states, attention_mask, self.num_key_value_groups)
-            # Must catch the return value which is the FULL cache!
-            key_states, value_states = past_key_value.update(kc, vc, self.layer_idx, cache_kwargs)
+        # Hybrid Cache intercepts this transparently
+        key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        
+        if hasattr(past_key_value, "get_seq_length"):
+            self.kv_seq_len = past_key_value.get_seq_length(self.layer_idx)
         else:
             self.kv_seq_len += q_len
-            # APKVC dynamically compresses the NEW token
-            kc, vc = self.kv_cluster.update_kv(key_states, query_states, value_states, attention_mask, self.num_key_value_groups)
-            # Cache appends the compressed token and returns the FULL cache
-            key_states, value_states = past_key_value.update(kc, vc, self.layer_idx, cache_kwargs)
             
         past_key_value._seen_tokens = self.kv_seq_len
         

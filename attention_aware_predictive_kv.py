@@ -438,121 +438,91 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
             or v_norm > self.apkvc_config.residual_norm_threshold_V
         )
 
-    def _flush_sequence_state(self):
-        """Reset transient sequence tracking for a new prompt."""
-        self.entries = []
-        self.last_anchor_t = -1
-        self.last_K = None
-        self.last_V = None
-        self.last_K2 = None
-        self.last_V2 = None
-        self.anchor_buffer_K = None
-        self.anchor_buffer_V = None
-        self.anchor_window_K = []
-        self.anchor_window_V = []
-
-    def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
-        """
-        APKVC Update Step (Handles both chunked Prefill and Single-Token Decoding).
-        """
-        bsz, num_heads, q_len, head_dim = query_states.shape
-        device = query_states.device
-        dtype = query_states.dtype
+    def _update_rolling(self, state, K_recon, V_recon):
+        """Maintains the immediate N past anchors inside the state object."""
+        state['last_K2'] = state['last_K']
+        state['last_K'] = K_recon.clone()
+        state['last_V2'] = state['last_V']
+        state['last_V'] = V_recon.clone()
         
-        if not self.initialized:
-            self._init_lazy(head_dim, device, dtype)
-
-        seq_len = key_states.shape[-2]
-        
-        if seq_len > 1:
-            # A large chunk implies a new sample's prefill. Flush transient sequence state.
-            self._flush_sequence_state()
+        # Keep window size N
+        W = self.apkvc_config.linear_window_size
+        if 'anchor_window_K' not in state:
+            state['anchor_window_K'] = []
+            state['anchor_window_V'] = []
             
-            K_out_list, V_out_list = [], []
-            for t_step in range(seq_len):
-                K_t = key_states[:, :, t_step:t_step+1, :]
-                Q_t = query_states[:, :, t_step:t_step+1, :]
-                V_t = value_states[:, :, t_step:t_step+1, :]
-                
-                # Progressively process each token in the prompt exactly as if it were decoding
-                k, v = self._process_single_token(K_t, Q_t, V_t, attention_mask, num_key_value_groups)
-                K_out_list.append(k)
-                V_out_list.append(v)
-                
-            return torch.cat(K_out_list, dim=-2), torch.cat(V_out_list, dim=-2)
-            
-        else:
-            return self._process_single_token(key_states, query_states, value_states, attention_mask, num_key_value_groups)
+        state['anchor_window_K'].append(state['last_K'])
+        state['anchor_window_V'].append(state['last_V'])
+        if len(state['anchor_window_K']) > W:
+            state['anchor_window_K'].pop(0)
+            state['anchor_window_V'].pop(0)
 
-    def _process_single_token(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
-        t = len(self.entries)
+    def _should_reset_state(self, t, state):
+        interval = self.apkvc_config.max_anchor_interval
+        if interval > 0 and (t - state['last_anchor_t']) >= interval:
+            return True
+        return False
 
-        # 2. Decoding Step (Single token)
+    def compress_decode_token(self, key_states, value_states, Q, t, state):
+        """
+        K_true, V_true: [B, H, 1, D] — true KV for this token
+        Q: [B, H, 1, D] - true Q for this token 
+        state: running state dict safely isolated by HybridAPKVCCache
+        """
         K_true = key_states
         V_true = value_states
-        Q = query_states
         
         if self.apkvc_config.use_rope_aware_aq:
             K_true_base = rope_derotate(K_true, t)
         else:
             K_true_base = K_true
-        
-        # Check for anchor reset
-        if t == 0 or self.should_reset(t):
-            self.entries.append({'is_anchor': True, 'position': t})
-            # For pure interval anchors, log 0.0 since it was never compressed
+            
+        # 1. Anchor Reset Check
+        if t == 0 or self._should_reset_state(t, state):
+            state['entries'].append({
+                'is_anchor': True,
+                'K': K_true.half(),
+                'V': V_true.half(),
+                'position': t
+            })
+            state['recon_cache'][t] = (K_true, V_true)
+            state['last_anchor_t'] = t
+            state['last_distortion'] = 0.0
             self.distortion_history.append(0.0)
-            self.last_anchor_t = t
-            self.last_distortion = 0.0
-            self._update_rolling(K_true_base, V_true)
-            self._append_anchor(K_true_base, V_true)
+            self._update_rolling(state, K_true_base, V_true)
             return K_true, V_true
 
-        # 3. Predict K_hat_base and V_hat
-        if self.apkvc_config.predictor_type == 'linear' and len(self.anchor_window_K) >= 2:
-            if self.apkvc_config.linear_window_size == 2 or len(self.anchor_window_K) == 2:
-                # Standard 2nd order extrapolation: 1.5*K_recent - 0.5*K_prev
-                K_hat_base = self.apkvc_config.alpha_K * self.anchor_window_K[-1] + self.apkvc_config.beta_K * self.anchor_window_K[-2]
-                V_hat = self.apkvc_config.alpha_V * self.anchor_window_V[-1] + self.apkvc_config.beta_V * self.anchor_window_V[-2]
+        # 2. Predict KV via state trajectories
+        if self.apkvc_config.predictor_type == 'linear' and len(state.get('anchor_window_K', [])) >= 2:
+            win_K = state['anchor_window_K']
+            win_V = state['anchor_window_V']
+            if self.apkvc_config.linear_window_size == 2 or len(win_K) == 2:
+                K_hat_base = self.apkvc_config.alpha_K * win_K[-1] + self.apkvc_config.beta_K * win_K[-2]
+                V_hat = self.apkvc_config.alpha_V * win_V[-1] + self.apkvc_config.beta_V * win_V[-2]
             else:
-                # Multi-point linear trend prediction (Mean Delta approach)
-                # Calculates average increment over the window and projects it
-                window_k = self.anchor_window_K # List of [B, H, 1, D]
-                deltas_k = [(window_k[i] - window_k[i-1]) for i in range(1, len(window_k))]
+                deltas_k = [(win_K[i] - win_K[i-1]) for i in range(1, len(win_K))]
                 avg_delta_k = torch.stack(deltas_k).mean(dim=0)
-                K_hat_base = window_k[-1] + 0.5 * avg_delta_k # Predict "halfway" forward into the next segment
-                
-                window_v = self.anchor_window_V
-                deltas_v = [(window_v[i] - window_v[i-1]) for i in range(1, len(window_v))]
+                K_hat_base = win_K[-1] + 0.5 * avg_delta_k
+                deltas_v = [(win_V[i] - win_V[i-1]) for i in range(1, len(win_V))]
                 avg_delta_v = torch.stack(deltas_v).mean(dim=0)
-                V_hat = window_v[-1] + 0.5 * avg_delta_v
-        elif self.apkvc_config.predictor_type == 'attention' and self.anchor_buffer_K is not None:
-            if self.apkvc_config.use_rope_aware_aq:
-                Q_base = rope_derotate(Q, t)
-            else:
-                Q_base = Q
-                
-            K_hat_base = torch.nn.functional.scaled_dot_product_attention(
-                Q_base, self.anchor_buffer_K, self.anchor_buffer_K
-            )
-            V_hat = torch.nn.functional.scaled_dot_product_attention(
-                Q_base, self.anchor_buffer_K, self.anchor_buffer_V
-            )
+                V_hat = win_V[-1] + 0.5 * avg_delta_v
+        elif self.apkvc_config.predictor_type == 'attention' and state.get('anchor_buffer_K') is not None:
+             # Legacy attention path disabled for clean implementation to match guide
+             K_hat_base = state['last_K']
+             V_hat = state['last_V']
         elif self.apkvc_config.predictor_type == 'none':
-            # Ablation: Zero prediction, directly quantize the raw KV matrices
             K_hat_base = torch.zeros_like(K_true_base)
             V_hat = torch.zeros_like(V_true)
         else:
-            # Identity (last step)
-            K_hat_base, V_hat = self.last_K.clone(), self.last_V.clone()
+            # Identity predictor fallback (highest performance/stability)
+            K_hat_base = state.get('last_K', torch.zeros_like(K_true_base))
+            V_hat = state.get('last_V', torch.zeros_like(V_true))
 
-        # 4. Compressing residuals
         delta_K_base = K_true_base - K_hat_base
         delta_V = V_true - V_hat
         
-        # Scaling Normalization Fix
-        scale_K = None
-        scale_V = None
+        # 3. Scale Normalization (Fixed #2)
+        scale_K, scale_V = None, None
         if self.apkvc_config.use_scale_normalization:
             scale_K = delta_K_base.norm(dim=-1, keepdim=True).clamp(min=1e-6)
             delta_K_normed = delta_K_base / scale_K
@@ -561,21 +531,21 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         else:
             delta_K_normed = delta_K_base
             delta_V_normed = delta_V
-            
+
         residual_too_large = self._residual_norm_exceeds(delta_K_normed, delta_V_normed)
         if residual_too_large:
-            self.entries.append({'is_anchor': True, 'position': t})
-            self.distortion_history.append(self.last_residual_norm) # Proxy graph value
-
-            self.last_anchor_t = t
-            self.last_distortion = 0.0
-            self._update_rolling(K_true_base, V_true)
-            self._append_anchor(K_true_base, V_true)
+            state['entries'].append({'is_anchor': True, 'position': t})
+            self.distortion_history.append(self.last_residual_norm)
+            state['recon_cache'][t] = (K_true, V_true)
+            state['last_anchor_t'] = t
+            state['last_distortion'] = 0.0
+            self._update_rolling(state, K_true_base, V_true)
             return K_true, V_true
-        
-        # We trace the NORMED residuals (what codebooks train on)
+            
+        # We trace the NORMED residuals for Codebook RVQ calibration
         self._append_trace_samples(delta_K_normed, delta_V_normed)
-
+        
+        # 4. Additive Quantization (AQ)
         if self.apkvc_config.compress_K:
             codes_K = self.additive_quantize(delta_K_normed.squeeze(2), self.codebooks_K)
             recon_delta_K_normed = self.additive_decode(codes_K, self.codebooks_K).unsqueeze(2)
@@ -589,42 +559,36 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         else:
             codes_V = None
             recon_delta_V_normed = delta_V_normed
-
-        # 5. Reconstruction for local feedback
+            
+        # 5. Reconstruction
         if self.apkvc_config.use_scale_normalization:
             recon_delta_K_base = recon_delta_K_normed * scale_K
             recon_delta_V = recon_delta_V_normed * scale_V
         else:
             recon_delta_K_base = recon_delta_K_normed
             recon_delta_V = recon_delta_V_normed
-        
+            
         K_recon_base = K_hat_base + recon_delta_K_base
-        
         if self.apkvc_config.use_rope_aware_aq:
             K_recon = rope_rotate(K_recon_base, t)
         else:
             K_recon = K_recon_base
-            
         V_recon = V_hat + recon_delta_V
-
-        # 6. Attention-Aware distortion check
-        distortion = self.compute_distortion(Q, K_true, K_recon)
-        self.last_distortion = distortion
         
-        # Always log the actual calculated distortion for the graph, even if it gets downgraded!
+        # 6. Attention Distortion Fallback Check
+        distortion = self.compute_distortion(Q, K_true, K_recon)
+        state['last_distortion'] = distortion
         self.distortion_history.append(distortion)
         
         if distortion > self.apkvc_config.rd_threshold:
-            # Quality too low -> Downgrade to Anchor logs as an anchor structurally, but graph shows attempt
-            self.entries.append({'is_anchor': True, 'position': t})
-            self.last_anchor_t = t
-            self.last_distortion = 0.0
-            self._update_rolling(K_true_base, V_true)
-            self._append_anchor(K_true_base, V_true)
+            state['entries'].append({'is_anchor': True, 'position': t})
+            state['recon_cache'][t] = (K_true, V_true)
+            state['last_anchor_t'] = t
+            state['last_distortion'] = 0.0
+            self._update_rolling(state, K_true_base, V_true)
             return K_true, V_true
         else:
-            # Success -> Store compressed indices
-            self.entries.append({
+            state['entries'].append({
                 'is_anchor': False,
                 'codes_K': codes_K,
                 'codes_V': codes_V,
@@ -632,5 +596,6 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
                 'scale_V': scale_V.squeeze(2).half() if scale_V is not None else None,
                 'position': t
             })
-            self._update_rolling(K_recon_base, V_recon)
+            state['recon_cache'][t] = (K_recon, V_recon)
+            self._update_rolling(state, K_recon_base, V_recon)
             return K_recon, V_recon
