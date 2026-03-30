@@ -1,4 +1,5 @@
 import torch
+from transformers.cache_utils import DynamicCache
 from .base import KVCacheMethod, CacheState
 from ldcb.utils import get_kv_iterator
 
@@ -60,11 +61,12 @@ class KIVIMethod(KVCacheMethod):
             tokens_generated += 1
 
             while tokens_generated < max_new_tokens:
-                past_kv_deq = tuple(
+                past_kv_tuple = tuple(
                     (self._dequantize(K_q, K_scale, self.bits).to(model.dtype),
                      self._dequantize(V_q, V_scale, self.bits).to(model.dtype))
                     for K_q, K_scale, V_q, V_scale in quant_cache
                 )
+                past_kv_deq = DynamicCache.from_legacy_cache(past_kv_tuple)
 
                 outputs = model(next_token, past_key_values=past_kv_deq, use_cache=True)
                 new_kv_full = outputs.past_key_values
