@@ -27,7 +27,7 @@ def load_model(model_id, device_map="cuda"):
 
 def main():
     parser = argparse.ArgumentParser(description="Run Long-Decode Compression Benchmark (LDCB)")
-    parser.add_argument("--model_id", type=str, default="meta-llama/Llama-2-7b-hf", help="Model ID to benchmark")
+    parser.add_argument("--model_id", type=str, default="meta-llama/Llama-3.2-3B-Instruct", help="Model ID to benchmark")
     parser.add_argument("--output_dir", type=str, default="ldcb/results", help="Directory to save results")
     parser.add_argument("--device_map", type=str, default="auto", help="Device map to use (e.g. 'auto', 'cuda:0')")
     parser.add_argument("--tasks", type=str, default="continuation,reasoning,multiturn", help="Comma-separated list of tasks to run")
