@@ -119,8 +119,7 @@ def plot2_pareto_frontier(pareto_data: list, save_path: str = None):
     return fig
 
 
-def plot3_vram_over_turns(turn_results_by_method: dict, gpu_limit_gb: float = 22.0,
-                           save_path: str = None):
+def plot3_vram_over_turns(turn_results_by_method: dict, save_path: str = None):
     """
     Plot 3: Two-panel view of memory over conversation turns.
 
@@ -180,8 +179,6 @@ def plot3_vram_over_turns(turn_results_by_method: dict, gpu_limit_gb: float = 22
         ax_vram.plot(xs, ys, label=method_name, color=color,
                      linewidth=2, marker="o", ms=5)
 
-    ax_vram.axhline(y=gpu_limit_gb, color="#E24B4A", linestyle="--",
-                    linewidth=1.5, label=f"GPU limit ({gpu_limit_gb} GB)")
     ax_vram.set_xlabel("Conversation turn", fontsize=12)
     ax_vram.set_ylabel("Peak VRAM (GB)", fontsize=12)
     ax_vram.set_title(
