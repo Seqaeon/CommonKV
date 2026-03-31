@@ -80,7 +80,7 @@ def main():
                 pareto_data.append({
                     "method": name,
                     "compression_ratio": r.get("final_compression_ratio", {}).get("mean", 1.0),
-                    "perplexity": r.get("perplexity", {}).get("mean", 0.0),
+                    "perplexity": r.get("base_ppl", {}).get("mean", float("nan")),
                     "rouge_l": r.get("rouge_l", {}).get("mean", float("nan")),
                     "config_label": name,
                 })
@@ -101,9 +101,17 @@ def main():
         print("TASK 1: Long continuation")
         print("=" * 60)
         task1_results = {}
+        fullkv_texts = None  # captured from FullKV, used as ROUGE-L reference
         for name, method in methods.items():
             print(f"\nRunning {name}...")
-            task1_results[name] = run_continuation(method, model, tokenizer, max_new_tokens=safe_continuation_max)
+            aggregated, gen_texts = run_continuation(
+                method, model, tokenizer,
+                max_new_tokens=safe_continuation_max,
+                reference_texts=fullkv_texts,  # None for FullKV itself
+            )
+            task1_results[name] = aggregated
+            if name == "FullKV":
+                fullkv_texts = gen_texts  # store as reference for all others
             # Memory Cleanup
             torch.cuda.empty_cache()
             import gc
@@ -160,12 +168,19 @@ def main():
         print("\n" + "=" * 60)
         print("SUMMARY — Task 1 (Continuation)")
         print("=" * 60)
-        print(f"{'Method':<20} {'Compression':>12} {'Perplexity':>12}")
-        print("-" * 46)
+        # base_ppl is a model sanity check — identical for all methods by design
+        # (same base model, same reference text, no cache state involved).
+        first = next(iter(all_results["task1_continuation"].values()))
+        sanity_ppl = first.get("base_ppl", {}).get("mean", float("nan"))
+        print(f"Base model PPL on WikiText-2 (sanity check, same for all): {sanity_ppl:.2f}")
+        print()
+        print(f"{'Method':<20} {'Compression':>12} {'ROUGE-L vs FullKV':>18}")
+        print("-" * 52)
         for name, r in all_results["task1_continuation"].items():
             cr = r.get("final_compression_ratio", {}).get("mean", 0)
-            pp = r.get("perplexity", {}).get("mean", 0)
-            print(f"{name:<20} {cr:>12.3f} {pp:>12.2f}")
+            rl = r.get("rouge_l", {}).get("mean", float("nan"))
+            rl_str = f"{rl:.3f}" if rl == rl else "N/A (FullKV baseline)"
+            print(f"{name:<20} {cr:>12.3f} {rl_str:>18}")
 
 if __name__ == "__main__":
     main()

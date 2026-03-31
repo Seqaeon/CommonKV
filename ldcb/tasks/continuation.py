@@ -1,6 +1,6 @@
 import torch
 from ..utils import get_total_vram_gb
-from ..metrics import compute_perplexity_on_reference, aggregate_task_results
+from ..metrics import compute_perplexity_on_reference, compute_rouge_l, aggregate_task_results
 
 CHECKPOINT_STEPS = [250, 500, 1000, 2000, 4000]
 MAX_NEW_TOKENS = 4000
@@ -22,16 +22,38 @@ CONTINUATION_PROMPTS = [
     "in an economy with a large informal sector.",
 ]
 
-def run_continuation(method, model, tokenizer, max_new_tokens=None) -> dict:
+
+def run_continuation(method, model, tokenizer, max_new_tokens=None,
+                     reference_texts=None) -> tuple:
+    """
+    Run the continuation task for a single method.
+
+    Parameters
+    ----------
+    reference_texts : list[str] or None
+        One generated string per prompt from FullKV, used to compute
+        ROUGE-L.  Pass None for the FullKV run itself (ROUGE-L will be 1.0
+        by definition and is omitted).  Pass the list returned by the FullKV
+        run for every other method.
+
+    Returns
+    -------
+    (aggregated_results : dict, generated_texts : list[str])
+        generated_texts contains the raw decoded output for each prompt,
+        in the same order as CONTINUATION_PROMPTS.  The caller should
+        capture this from the FullKV run and pass it as reference_texts
+        for all subsequent methods.
+    """
     all_results = []
-    
+    generated_texts = []
+
     # Calculate limits based on model capacity if provided
     limit = max_new_tokens or MAX_NEW_TOKENS
     # Filter and cap checkpoint steps
     active_steps = [s for s in CHECKPOINT_STEPS if s < limit]
     active_steps.append(limit)
 
-    for prompt in CONTINUATION_PROMPTS:
+    for prompt_idx, prompt in enumerate(CONTINUATION_PROMPTS):
         # Tokenize and verify prompt is short
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids
         assert input_ids.shape[1] <= 128, \
@@ -44,6 +66,7 @@ def run_continuation(method, model, tokenizer, max_new_tokens=None) -> dict:
             max_new_tokens=limit,
             checkpoint_steps=active_steps,
         )
+        generated_texts.append(generated_text)
 
         result = {
             "prompt": prompt[:60] + "...",
@@ -57,15 +80,23 @@ def run_continuation(method, model, tokenizer, max_new_tokens=None) -> dict:
             ],
             "final_compression_ratio": final_state.compressed_bytes / final_state.fullkv_bytes,
             "peak_vram_gb": get_total_vram_gb(),
-            # Fixed WikiText-2 reference — same text for every method so results
-            # are actually comparable.  (Using generated_text here would give
-            # KIVI a spurious advantage for producing more predictable output.)
-            "perplexity": compute_perplexity_on_reference(model, tokenizer, n_tokens=2048),
+            # WikiText-2 reference perplexity — identical for all methods (same
+            # base model, no cache state involved).  Use as a sanity check that
+            # the model loaded correctly (~5–7 for LLaMA-class models), NOT as
+            # a differentiating quality signal.  ROUGE-L is the quality metric.
+            "base_ppl": compute_perplexity_on_reference(model, tokenizer, n_tokens=2048),
             "distortion_mean": float(torch.tensor(final_state.distortions).mean())
                                if final_state.distortions else 0.0,
             "distortion_p95": float(torch.tensor(final_state.distortions).quantile(0.95))
                               if final_state.distortions else 0.0,
         }
+
+        # ROUGE-L vs FullKV — the real quality signal for compression methods.
+        # Measures how faithfully the compressed method reproduces the text
+        # that FullKV would have generated for the same prompt.
+        if reference_texts is not None and prompt_idx < len(reference_texts):
+            result["rouge_l"] = compute_rouge_l(generated_text, reference_texts[prompt_idx])
+
         all_results.append(result)
 
-    return aggregate_task_results(all_results)
+    return aggregate_task_results(all_results), generated_texts
