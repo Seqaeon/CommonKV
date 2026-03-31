@@ -39,6 +39,9 @@ CALIBRATION_PROMPTS = [
     "The development of large language models has transformed natural language processing. Models trained on vast corpora of text have demonstrated remarkable abilities in translation, summarisation, question answering, and creative writing. These capabilities emerge from learning statistical patterns across billions of tokens.",
     "Modern operating systems manage hardware resources through layers of abstraction. The kernel handles memory allocation, process scheduling, and I/O operations. User applications interact with the kernel through system calls, which provide a controlled interface to hardware without exposing low-level details.",
     "Economic inequality has grown substantially in many countries over the past four decades. While technological progress has created enormous wealth, the gains have been concentrated among a small fraction of the population. Policymakers debate the appropriate role of taxation, education, and social programmes in addressing this disparity.",
+    "The human immune system is a complex network of cells, tissues, and organs that work together to defend the body against pathogens. When a foreign antigen is detected, B cells produce antibodies while T cells coordinate the adaptive immune response. Vaccines exploit this mechanism by training the immune system without causing disease.",
+    "Quantum computing leverages the principles of superposition and entanglement to perform computations that are intractable for classical computers. A qubit can represent both zero and one simultaneously, allowing quantum algorithms to explore many solutions in parallel. Error correction remains one of the central engineering challenges in building fault-tolerant quantum computers.",
+    "The Renaissance was a period of profound cultural and intellectual transformation in Europe, spanning roughly the fourteenth to seventeenth centuries. It witnessed a revival of interest in classical antiquity, advancements in art and architecture, and the emergence of humanism as a philosophical framework. Figures such as Leonardo da Vinci, Michelangelo, and Galileo exemplified the era's spirit of inquiry.",
 ]
 
 
@@ -164,10 +167,10 @@ def main():
     parser.add_argument("--tasks",      type=str, default="continuation,reasoning,multiturn")
     parser.add_argument("--skip_calibration", action="store_true",
                         help="Skip APKVC codebook calibration (uses random codebooks)")
-    parser.add_argument("--calibration_prompts", type=int, default=5,
-                        help="Number of prompts to use for APKVC calibration (default 5)")
-    parser.add_argument("--calibration_tokens", type=int, default=300,
-                        help="Tokens to generate per calibration prompt (default 300)")
+    parser.add_argument("--calibration_prompts", type=int, default=8,
+                        help="Number of prompts to use for APKVC calibration (default 8)")
+    parser.add_argument("--calibration_tokens", type=int, default=1000,
+                        help="Tokens to generate per calibration prompt (default 1000)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
