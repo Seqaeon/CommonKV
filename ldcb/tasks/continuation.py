@@ -32,6 +32,7 @@ def run_continuation(method, model, tokenizer) -> dict:
             f"Prompt too long: {input_ids.shape[1]} tokens. Trim it."
 
         torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
         generated_text, snapshots, final_state = method.generate(
             model, tokenizer, prompt,
             max_new_tokens=MAX_NEW_TOKENS,

@@ -59,6 +59,10 @@ def main():
         for name, method in methods.items():
             print(f"\nRunning {name}...")
             task1_results[name] = run_continuation(method, model, tokenizer)
+            # Memory Cleanup
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
         all_results["task1_continuation"] = task1_results
 
     # ----- Task 2: Reasoning -----
@@ -70,6 +74,10 @@ def main():
         for name, method in methods.items():
             print(f"\nRunning {name}...")
             task2_results[name] = run_reasoning(method, model, tokenizer)
+            # Memory Cleanup
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
         all_results["task2_reasoning"] = task2_results
 
     # ----- Task 3: Multi-turn -----
@@ -81,6 +89,10 @@ def main():
         for name, method in methods.items():
             print(f"\nRunning {name}...")
             task3_results[name] = run_multiturn(method, model, tokenizer)
+            # Memory Cleanup
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
         all_results["task3_multiturn"] = task3_results
 
     # ----- Save raw results -----

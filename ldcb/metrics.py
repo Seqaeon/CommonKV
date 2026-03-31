@@ -7,12 +7,19 @@ def compute_perplexity(model, tokenizer, text: str) -> float:
     Compute perplexity of the generated text under the model.
     Lower = model considers the text more probable = better quality.
     """
+    import gc
     encodings = tokenizer(text, return_tensors="pt")
     input_ids = encodings.input_ids.to(model.device)
 
-    max_length = 2048
+    # Respect model context limits and VRAM safety
+    max_pos = getattr(model.config, "max_position_embeddings", 2048)
+    max_length = min(1024, max_pos) 
     stride = 512
     nlls = []
+    
+    # Guard: Truncate input if it exceeds model's max architecture limit
+    if input_ids.shape[1] > max_pos:
+        input_ids = input_ids[:, :max_pos]
 
     for i in range(0, input_ids.shape[1], stride):
         begin_loc = max(i + stride - max_length, 0)
@@ -25,6 +32,11 @@ def compute_perplexity(model, tokenizer, text: str) -> float:
             neg_log_likelihood = outputs.loss * trg_len
 
         nlls.append(neg_log_likelihood)
+        
+        # Aggressive memory cleanup after each forward pass
+        del outputs
+        torch.cuda.empty_cache()
+        gc.collect()
 
     return torch.exp(torch.stack(nlls).sum() / end_loc).item()
 
