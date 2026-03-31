@@ -11,6 +11,7 @@ class CacheState:
     anchor_count: int = 0         # APKVC only; 0 for others
     residual_count: int = 0       # APKVC only; 0 for others
     distortions: list = field(default_factory=list)  # per-step distortion values
+    anchor_positions: list = field(default_factory=list)  # optional token positions for anchor diagnostics
 
 
 class KVCacheMethod(ABC):

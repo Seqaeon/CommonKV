@@ -6,14 +6,15 @@ class APKVCMethod(KVCacheMethod):
     def __init__(self, predictor_type="identity", **kwargs):
         self.apkvc_kwargs = {
             "predictor_type": predictor_type,
-            "max_anchor_interval": 16,
-            "rd_threshold": 1.5,
+            "max_anchor_interval": 4,
+            "rd_threshold": 0.05,
             "compress_K": True,
             "compress_V": True,
             "K_num_codebooks": 4,
-            "V_num_codebooks": 4,
+            "V_num_codebooks": 2,
             "use_scale_normalization": True,
             "use_rope_aware_aq": True,
+            "per_layer_codebooks": True,
         }
         self.apkvc_kwargs.update(kwargs)
         self.name = f"APKVC-{predictor_type}"
@@ -107,13 +108,19 @@ class APKVCMethod(KVCacheMethod):
                             if e.get('is_anchor', False): anchors += 1
                             else: residuals += 1
                         distortions.extend(s['cluster'].distortion_history)
+                    anchor_positions = [
+                        e.get("position", -1)
+                        for e in cache.decode_states[0]['entries']
+                        if e.get("is_anchor", False)
+                    ] if cache.decode_states else []
                         
                     snapshots.append(CacheState(
                         compressed_bytes=compressed, 
                         fullkv_bytes=fullkv,
                         anchor_count=anchors,
                         residual_count=residuals,
-                        distortions=distortions
+                        distortions=distortions,
+                        anchor_positions=anchor_positions,
                     ))
                     current_checkpoint = next(next_checkpoint, None)
                 
@@ -133,13 +140,19 @@ class APKVCMethod(KVCacheMethod):
                 if e.get('is_anchor', False): anchors += 1
                 else: residuals += 1
             distortions.extend(s['cluster'].distortion_history)
+        anchor_positions = [
+            e.get("position", -1)
+            for e in cache.decode_states[0]['entries']
+            if e.get("is_anchor", False)
+        ] if cache.decode_states else []
             
         final_state = CacheState(
             compressed_bytes=compressed, 
             fullkv_bytes=fullkv,
             anchor_count=anchors,
             residual_count=residuals,
-            distortions=distortions
+            distortions=distortions,
+            anchor_positions=anchor_positions,
         )
         
         while len(snapshots) < len(checkpoint_steps):

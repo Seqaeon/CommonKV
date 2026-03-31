@@ -75,17 +75,21 @@ def plot2_pareto_frontier(pareto_data: list, save_path: str = None):
             m = point["method"]
             color = COLORS.get(m, "#333")
             label = m if m not in plotted_methods else None
-            ax.scatter(point["compression_ratio"], point[metric],
+            val = point.get(metric, np.nan)
+            if val is None or np.isnan(val):
+                continue
+            ax.scatter(point["compression_ratio"], val,
                        color=color, s=80, label=label, zorder=3)
             ax.annotate(point.get("config_label", ""),
-                        (point["compression_ratio"], point[metric]),
+                        (point["compression_ratio"], val),
                         textcoords="offset points", xytext=(6, 4),
                         fontsize=8, color=color)
             plotted_methods.add(m)
 
         # Draw Pareto frontier for APKVC points
         apkvc_points = [(p["compression_ratio"], p[metric])
-                        for p in pareto_data if "APKVC" in p["method"]]
+                        for p in pareto_data
+                        if "APKVC" in p["method"] and p.get(metric) is not None and not np.isnan(p.get(metric))]
         if apkvc_points:
             apkvc_points.sort(key=lambda x: x[0])
             # Pareto: no point dominated on both axes

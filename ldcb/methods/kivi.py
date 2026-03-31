@@ -52,9 +52,15 @@ class KIVIMethod(KVCacheMethod):
             
             quant_cache = []
             for _, (layer_K, layer_V) in get_kv_iterator(past_kv):
-                K_q, K_scale = self._quantize_K(layer_K)
-                V_q, V_scale = self._quantize_V(layer_V)
-                quant_cache.append((K_q, K_scale, V_q, V_scale))
+                split = max(layer_K.shape[-2] - self.residual_buffer, 0)
+                K_old, K_res = layer_K[:, :, :split, :], layer_K[:, :, split:, :]
+                V_old, V_res = layer_V[:, :, :split, :], layer_V[:, :, split:, :]
+                if K_old.shape[-2] > 0:
+                    K_q, K_scale = self._quantize_K(K_old)
+                    V_q, V_scale = self._quantize_V(V_old)
+                else:
+                    K_q = V_q = K_scale = V_scale = None
+                quant_cache.append((K_q, K_scale, V_q, V_scale, K_res, V_res))
 
             next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
             generated_ids = torch.cat([generated_ids, next_token], dim=1)
@@ -62,9 +68,15 @@ class KIVIMethod(KVCacheMethod):
 
             while tokens_generated < max_new_tokens:
                 past_kv_deq = DynamicCache()
-                for i, (K_q, K_scale, V_q, V_scale) in enumerate(quant_cache):
-                    k_deq = self._dequantize(K_q, K_scale, self.bits).to(model.dtype)
-                    v_deq = self._dequantize(V_q, V_scale, self.bits).to(model.dtype)
+                for i, (K_q, K_scale, V_q, V_scale, K_res, V_res) in enumerate(quant_cache):
+                    if K_q is not None:
+                        k_old = self._dequantize(K_q, K_scale, self.bits).to(model.dtype)
+                        v_old = self._dequantize(V_q, V_scale, self.bits).to(model.dtype)
+                        k_deq = torch.cat([k_old, K_res.to(model.dtype)], dim=-2)
+                        v_deq = torch.cat([v_old, V_res.to(model.dtype)], dim=-2)
+                    else:
+                        k_deq = K_res.to(model.dtype)
+                        v_deq = V_res.to(model.dtype)
                     # update() is the official state-management API for Transformers Cache objects
                     past_kv_deq.update(k_deq, v_deq, i)
 
@@ -73,9 +85,15 @@ class KIVIMethod(KVCacheMethod):
                 
                 quant_cache = []
                 for _, (layer_K, layer_V) in get_kv_iterator(new_kv_full):
-                    K_q, K_scale = self._quantize_K(layer_K)
-                    V_q, V_scale = self._quantize_V(layer_V)
-                    quant_cache.append((K_q, K_scale, V_q, V_scale))
+                    split = max(layer_K.shape[-2] - self.residual_buffer, 0)
+                    K_old, K_res = layer_K[:, :, :split, :], layer_K[:, :, split:, :]
+                    V_old, V_res = layer_V[:, :, :split, :], layer_V[:, :, split:, :]
+                    if K_old.shape[-2] > 0:
+                        K_q, K_scale = self._quantize_K(K_old)
+                        V_q, V_scale = self._quantize_V(V_old)
+                    else:
+                        K_q = V_q = K_scale = V_scale = None
+                    quant_cache.append((K_q, K_scale, V_q, V_scale, K_res, V_res))
 
                 next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
                 generated_ids = torch.cat([generated_ids, next_token], dim=1)
