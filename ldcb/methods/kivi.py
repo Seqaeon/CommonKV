@@ -80,6 +80,13 @@ class KIVIMethod(KVCacheMethod):
                     # update() is the official state-management API for Transformers Cache objects
                     past_kv_deq.update(k_deq, v_deq, i)
 
+                # Free quantized tensors BEFORE the forward pass so we don't
+                # have both int8 and fp16 copies live in VRAM simultaneously.
+                # Note: full VRAM parity with fused-kernel KIVI would require
+                # custom CUDA kernels; this is the best we can do in pure Python.
+                del quant_cache
+                torch.cuda.empty_cache()
+
                 outputs = model(next_token, past_key_values=past_kv_deq, use_cache=True)
                 new_kv_full = outputs.past_key_values
                 

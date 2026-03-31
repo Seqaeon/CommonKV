@@ -1,6 +1,6 @@
 import torch
 from ..utils import get_total_vram_gb
-from ..metrics import compute_perplexity, aggregate_task_results
+from ..metrics import compute_perplexity_on_reference, aggregate_task_results
 
 CHECKPOINT_STEPS = [250, 500, 1000, 2000, 4000]
 MAX_NEW_TOKENS = 4000
@@ -57,7 +57,10 @@ def run_continuation(method, model, tokenizer, max_new_tokens=None) -> dict:
             ],
             "final_compression_ratio": final_state.compressed_bytes / final_state.fullkv_bytes,
             "peak_vram_gb": get_total_vram_gb(),
-            "perplexity": compute_perplexity(model, tokenizer, generated_text),
+            # Fixed WikiText-2 reference — same text for every method so results
+            # are actually comparable.  (Using generated_text here would give
+            # KIVI a spurious advantage for producing more predictable output.)
+            "perplexity": compute_perplexity_on_reference(model, tokenizer, n_tokens=2048),
             "distortion_mean": float(torch.tensor(final_state.distortions).mean())
                                if final_state.distortions else 0.0,
             "distortion_p95": float(torch.tensor(final_state.distortions).quantile(0.95))
