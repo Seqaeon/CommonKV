@@ -22,15 +22,18 @@ USER_MESSAGES = [
 RESPONSE_TOKENS_PER_TURN = 100
 N_TURNS = 15
 
-def run_multiturn(method, model, tokenizer) -> dict:
+def run_multiturn(method, model, tokenizer, n_turns=None) -> dict:
     """
     Simulates a conversation by appending each user message + response to
     a growing context. Cache is maintained across turns.
     """
     turn_results = []
     conversation_context = ""
+    
+    # Cap turns based on model capacity if provided
+    active_turns = n_turns or N_TURNS
 
-    for turn_idx, user_msg in enumerate(USER_MESSAGES[:N_TURNS]):
+    for turn_idx, user_msg in enumerate(USER_MESSAGES[:active_turns]):
         torch.cuda.reset_peak_memory_stats()
 
         prompt = conversation_context + f"User: {user_msg}\nAssistant:"

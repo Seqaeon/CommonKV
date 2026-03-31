@@ -37,6 +37,18 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     model, tokenizer = load_model(args.model_id, args.device_map)
+    
+    # Detect architectural context limit and calculate safe benchmark targets
+    max_pos = getattr(model.config, "max_position_embeddings", 2048)
+    print(f"Model capacity: {max_pos} tokens")
+
+    # Continuation: Reserve ~128 tokens for prompt
+    safe_continuation_max = min(4000, max_pos - 128)
+    # Reasoning: Reserve ~128 tokens for prompt 
+    safe_reasoning_max = min(2000, max_pos - 128)
+    # Multiturn: Ensure (turns * 150) + prompt < max_pos
+    # Heuristic: 100 tokens response + 50 tokens avg user msg
+    safe_multiturn_turns = min(15, (max_pos - 100) // 150)
 
     # Define methods to benchmark
     methods = {
@@ -58,7 +70,7 @@ def main():
         task1_results = {}
         for name, method in methods.items():
             print(f"\nRunning {name}...")
-            task1_results[name] = run_continuation(method, model, tokenizer)
+            task1_results[name] = run_continuation(method, model, tokenizer, max_new_tokens=safe_continuation_max)
             # Memory Cleanup
             torch.cuda.empty_cache()
             import gc
@@ -73,7 +85,7 @@ def main():
         task2_results = {}
         for name, method in methods.items():
             print(f"\nRunning {name}...")
-            task2_results[name] = run_reasoning(method, model, tokenizer)
+            task2_results[name] = run_reasoning(method, model, tokenizer, max_new_tokens=safe_reasoning_max)
             # Memory Cleanup
             torch.cuda.empty_cache()
             import gc
@@ -88,7 +100,7 @@ def main():
         task3_results = {}
         for name, method in methods.items():
             print(f"\nRunning {name}...")
-            task3_results[name] = run_multiturn(method, model, tokenizer)
+            task3_results[name] = run_multiturn(method, model, tokenizer, n_turns=safe_multiturn_turns)
             # Memory Cleanup
             torch.cuda.empty_cache()
             import gc

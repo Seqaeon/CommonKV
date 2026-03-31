@@ -50,8 +50,14 @@ def estimate_boundary_vs_interior_anchor_rate(generated_text, anchor_positions):
         "interior_anchor_rate": interior_anchors / max(n_interior, 1),
     }
 
-def run_reasoning(method, model, tokenizer) -> dict:
+def run_reasoning(method, model, tokenizer, max_new_tokens=None) -> dict:
     all_results = []
+    
+    # Calculate limits based on model capacity if provided
+    limit = max_new_tokens or MAX_NEW_TOKENS
+    # Filter and cap checkpoint steps
+    active_steps = [s for s in CHECKPOINT_STEPS if s < limit]
+    active_steps.append(limit)
 
     for prompt in REASONING_PROMPTS:
         # Tokenize and verify prompt is short
@@ -62,8 +68,8 @@ def run_reasoning(method, model, tokenizer) -> dict:
         torch.cuda.reset_peak_memory_stats()
         generated_text, snapshots, final_state = method.generate(
             model, tokenizer, prompt,
-            max_new_tokens=MAX_NEW_TOKENS,
-            checkpoint_steps=CHECKPOINT_STEPS,
+            max_new_tokens=limit,
+            checkpoint_steps=active_steps,
         )
 
         result = {
@@ -74,7 +80,7 @@ def run_reasoning(method, model, tokenizer) -> dict:
                     "compression_ratio": snap.compressed_bytes / snap.fullkv_bytes,
                     "anchor_rate": snap.anchor_count / max(snap.anchor_count + snap.residual_count, 1),
                 }
-                for step, snap in zip(CHECKPOINT_STEPS, snapshots)
+                for step, snap in zip(active_steps, snapshots)
             ],
             "final_compression_ratio": final_state.compressed_bytes / final_state.fullkv_bytes,
             "peak_vram_gb": get_total_vram_gb(),
