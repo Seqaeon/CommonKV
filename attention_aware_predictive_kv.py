@@ -386,6 +386,11 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
 
     def additive_decode(self, indices, codebooks):
         """Reconstruct residual from indices."""
+        if len(indices) == 0:
+            return torch.zeros(0, 0, self.head_dim)
+        if len(codebooks) == 0:
+            B, H = indices[0].shape
+            return torch.zeros(B, H, self.head_dim, device=indices[0].device, dtype=torch.float32)
         device = codebooks[0].device
         dtype = codebooks[0].dtype
         B, H = indices[0].shape
@@ -428,6 +433,8 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
 
     def compute_distortion(self, Q, K_true, K_reconstructed):
         """Compute distortion metric."""
+        if Q is None:
+            return 0.0
         if self.apkvc_config.rd_metric == 'key_dot':
             scale = math.sqrt(self.head_dim)
             score_true = torch.sum(Q * K_true, dim=-1, keepdim=True) / scale
@@ -480,6 +487,12 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         """
         K_true = key_states
         V_true = value_states
+        if not self.initialized:
+            self._init_lazy(
+                head_dim=K_true.shape[-1],
+                device=K_true.device,
+                dtype=K_true.dtype,
+            )
         
         if self.apkvc_config.use_rope_aware_aq:
             K_true_base = rope_derotate(K_true, t)
