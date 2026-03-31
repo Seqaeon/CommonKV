@@ -479,14 +479,19 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
             return True
         return False
 
-    def compress_decode_token(self, key_states, value_states, Q, t, state):
+    def compress_decode_token(self, key_states, value_states, Q, t, state, abs_pos=None):
         """
         K_true, V_true: [B, H, 1, D] — true KV for this token
-        Q: [B, H, 1, D] - true Q for this token 
+        Q: [B, H, 1, D] - true Q for this token
+        t: decode-local step counter (0, 1, 2...) — used for anchor interval logic
+        abs_pos: absolute sequence position (prefill_len + t) — used for RoPE
+                 derotation/rotation.  If None, falls back to t (incorrect for
+                 sequences with a non-zero prefill, kept for backward compat).
         state: running state dict safely isolated by HybridAPKVCCache
         """
         K_true = key_states
         V_true = value_states
+        rope_pos = abs_pos if abs_pos is not None else t  # correct absolute position
         if not self.initialized:
             self._init_lazy(
                 head_dim=K_true.shape[-1],
@@ -495,7 +500,7 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
             )
         
         if self.apkvc_config.use_rope_aware_aq:
-            K_true_base = rope_derotate(K_true, t)
+            K_true_base = rope_derotate(K_true, rope_pos)  # was: t — wrong for non-zero prefill
         else:
             K_true_base = K_true
             
@@ -592,7 +597,7 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
             
         K_recon_base = K_hat_base + recon_delta_K_base
         if self.apkvc_config.use_rope_aware_aq:
-            K_recon = rope_rotate(K_recon_base, t)
+            K_recon = rope_rotate(K_recon_base, rope_pos)  # was: t — wrong for non-zero prefill
         else:
             K_recon = K_recon_base
         V_recon = V_hat + recon_delta_V

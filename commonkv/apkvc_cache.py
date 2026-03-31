@@ -124,11 +124,19 @@ class HybridAPKVCCache(DynamicCache):
             cluster = state['cluster']
             Q = cache_kwargs.get("query_states", None)
             
-            t = len(state['entries'])
+            t = len(state['entries'])  # decode-local step (used for anchor interval logic)
+            # Absolute sequence position: needed for correct RoPE derotation/rotation.
+            # K_true already has RoPE applied at prefill_len + t; derotating at t
+            # alone would corrupt the base vector and therefore all reconstructed K.
+            prefill_len = (
+                self.prefill_K_int8[layer_idx].shape[-2]
+                if self.prefill_K_int8[layer_idx] is not None else 0
+            )
+            abs_pos = prefill_len + t
             
             # We defer the actual codebook heavy lifting completely into the cluster module
             # Let it write its mathematical outputs (Anchors & Dictionaries) securely into `state`
-            K_recon, V_recon = cluster.compress_decode_token(key_states, value_states, Q, t, state)
+            K_recon, V_recon = cluster.compress_decode_token(key_states, value_states, Q, t, state, abs_pos=abs_pos)
             
             # Finally, rebuild the complete sequence tensor to feed to scaled-dot-product attention.
             K_prefill, V_prefill = self.dequantize_prefill_kv(layer_idx)
