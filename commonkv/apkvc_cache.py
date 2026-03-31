@@ -41,6 +41,8 @@ class HybridAPKVCCache(DynamicCache):
                 'last_V': None,
                 'last_K2': None,
                 'last_V2': None,
+                'decode_K_cat': None,
+                'decode_V_cat': None,
             }
             self.decode_states.append(state)
             self.prefill_K_int8.append(None)
@@ -134,16 +136,14 @@ class HybridAPKVCCache(DynamicCache):
             # Gather decode history from recon_cache
             # Because PyTorch requires contiguous arrays, we must materialize them
             # O(T) materialization is required here as HF past_key_value inherently requires the entire history!
-            decode_len = t + 1
-            K_decode_list = []
-            V_decode_list = []
-            for position in range(decode_len):
-                K_t, V_t = state['recon_cache'][position]
-                K_decode_list.append(K_t)
-                V_decode_list.append(V_t)
-                
-            K_decode = torch.cat(K_decode_list, dim=-2)
-            V_decode = torch.cat(V_decode_list, dim=-2)
+            if state['decode_K_cat'] is None:
+                state['decode_K_cat'] = K_recon
+                state['decode_V_cat'] = V_recon
+            else:
+                state['decode_K_cat'] = torch.cat([state['decode_K_cat'], K_recon], dim=-2)
+                state['decode_V_cat'] = torch.cat([state['decode_V_cat'], V_recon], dim=-2)
+            K_decode = state['decode_K_cat']
+            V_decode = state['decode_V_cat']
             
             final_K = torch.cat([K_prefill, K_decode], dim=-2)
             final_V = torch.cat([V_prefill, V_decode], dim=-2)

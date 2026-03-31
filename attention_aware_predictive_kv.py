@@ -98,22 +98,31 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
     def __init__(self, **kwargs):
         super().__init__()
         self.layer_idx = kwargs.get('layer_idx', 0)
+        def _get(name, default=None):
+            return kwargs.get(name, kwargs.get(f"apkvc_{name}", default))
+        def _get_bool(name, default=False):
+            val = _get(name, default)
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, str):
+                return val.lower() in ("1", "true", "yes", "y", "on")
+            return bool(val)
         # Extract config from kwargs or use defaults
         self.apkvc_config = APKVCConfig(
-            predictor_type=kwargs.get("predictor_type", 'identity'),
-            per_layer_codebooks=bool(int(kwargs.get("apkvc_per_layer_codebooks", 0))),
-            compress_K=bool(int(kwargs.get("apkvc_compress_K", 1))),
-            compress_V=bool(int(kwargs.get("apkvc_compress_V", 1))),
-            use_scale_normalization=bool(int(kwargs.get("apkvc_use_scale_normalization", 1))),
-            attention_window_size=kwargs.get("attention_window_size", 16),
-            rd_threshold=kwargs.get("rd_threshold", 0.05),
-            max_anchor_interval=kwargs.get("max_anchor_interval", 16),
-            K_num_codebooks=kwargs.get("K_num_codebooks", 4),
-            V_num_codebooks=kwargs.get("V_num_codebooks", 2),
-            calibration_path=kwargs.get("apkvc_calibration_path", kwargs.get("calibration_path", None)),
-            trace_output_path=kwargs.get("apkvc_trace_output_path", kwargs.get("trace_output_path", None)),
-            trace_max_samples=int(kwargs.get("apkvc_trace_max_samples", kwargs.get("trace_max_samples", 400000))),
-            trace_chunk_size=int(kwargs.get("apkvc_trace_chunk_size", kwargs.get("trace_chunk_size", 0))),
+            predictor_type=_get("predictor_type", 'identity'),
+            per_layer_codebooks=_get_bool("per_layer_codebooks", False),
+            compress_K=_get_bool("compress_K", True),
+            compress_V=_get_bool("compress_V", True),
+            use_scale_normalization=_get_bool("use_scale_normalization", True),
+            attention_window_size=_get("attention_window_size", 16),
+            rd_threshold=_get("rd_threshold", 0.05),
+            max_anchor_interval=_get("max_anchor_interval", 16),
+            K_num_codebooks=_get("K_num_codebooks", 4),
+            V_num_codebooks=_get("V_num_codebooks", 2),
+            calibration_path=_get("calibration_path", None),
+            trace_output_path=_get("trace_output_path", None),
+            trace_max_samples=int(_get("trace_max_samples", 400000)),
+            trace_chunk_size=int(_get("trace_chunk_size", 0)),
         )
         
         self.head_dim = None
@@ -377,6 +386,11 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
 
     def additive_decode(self, indices, codebooks):
         """Reconstruct residual from indices."""
+        if len(indices) == 0:
+            return torch.zeros(0, 0, self.head_dim)
+        if len(codebooks) == 0:
+            B, H = indices[0].shape
+            return torch.zeros(B, H, self.head_dim, device=indices[0].device, dtype=torch.float32)
         device = codebooks[0].device
         dtype = codebooks[0].dtype
         B, H = indices[0].shape
@@ -419,6 +433,8 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
 
     def compute_distortion(self, Q, K_true, K_reconstructed):
         """Compute distortion metric."""
+        if Q is None:
+            return 0.0
         if self.apkvc_config.rd_metric == 'key_dot':
             scale = math.sqrt(self.head_dim)
             score_true = torch.sum(Q * K_true, dim=-1, keepdim=True) / scale
@@ -471,6 +487,12 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         """
         K_true = key_states
         V_true = value_states
+        if not self.initialized:
+            self._init_lazy(
+                head_dim=K_true.shape[-1],
+                device=K_true.device,
+                dtype=K_true.dtype,
+            )
         
         if self.apkvc_config.use_rope_aware_aq:
             K_true_base = rope_derotate(K_true, t)
