@@ -62,6 +62,39 @@ def main():
     all_results = {}
     selected_tasks = args.tasks.split(",")
 
+    def save_results_snapshot():
+        results_path = os.path.join(args.output_dir, f"ldcb_{timestamp}.json")
+        with open(results_path, "w") as f:
+            json.dump(all_results, f, indent=2)
+        return results_path
+
+    def render_available_plots():
+        if "task1_continuation" in all_results:
+            plot1_compression_vs_length(
+                all_results["task1_continuation"],
+                task_name="Continuation",
+                save_path=os.path.join(args.output_dir, f"plot1_continuation_{timestamp}.png"),
+            )
+            pareto_data = []
+            for name, r in all_results["task1_continuation"].items():
+                pareto_data.append({
+                    "method": name,
+                    "compression_ratio": r.get("final_compression_ratio", {}).get("mean", 1.0),
+                    "perplexity": r.get("perplexity", {}).get("mean", 0.0),
+                    "rouge_l": r.get("rouge_l", {}).get("mean", float("nan")),
+                    "config_label": name,
+                })
+            plot2_pareto_frontier(
+                pareto_data,
+                save_path=os.path.join(args.output_dir, f"plot2_pareto_{timestamp}.png"),
+            )
+
+        if "task3_multiturn" in all_results:
+            plot3_vram_over_turns(
+                {name: r["turns"] for name, r in all_results["task3_multiturn"].items()},
+                save_path=os.path.join(args.output_dir, f"plot3_vram_{timestamp}.png"),
+            )
+
     # ----- Task 1: Continuation -----
     if "continuation" in selected_tasks:
         print("\n" + "=" * 60)
@@ -76,6 +109,8 @@ def main():
             import gc
             gc.collect()
         all_results["task1_continuation"] = task1_results
+        save_results_snapshot()
+        render_available_plots()
 
     # ----- Task 2: Reasoning -----
     if "reasoning" in selected_tasks:
@@ -91,6 +126,8 @@ def main():
             import gc
             gc.collect()
         all_results["task2_reasoning"] = task2_results
+        save_results_snapshot()
+        render_available_plots()
 
     # ----- Task 3: Multi-turn -----
     if "multiturn" in selected_tasks:
@@ -106,37 +143,15 @@ def main():
             import gc
             gc.collect()
         all_results["task3_multiturn"] = task3_results
+        save_results_snapshot()
+        render_available_plots()
 
     # ----- Save raw results -----
-    results_path = os.path.join(args.output_dir, f"ldcb_{timestamp}.json")
-    with open(results_path, "w") as f:
-        json.dump(all_results, f, indent=2)
+    results_path = save_results_snapshot()
     print(f"\nResults saved to {results_path}")
 
     # ----- Generate plots -----
-    if "continuation" in all_results:
-        plot1_compression_vs_length(
-            all_results["task1_continuation"],
-            task_name="Continuation",
-            save_path=os.path.join(args.output_dir, f"plot1_continuation_{timestamp}.png"),
-        )
-        # Pareto data
-        pareto_data = []
-        for name, r in all_results["task1_continuation"].items():
-            pareto_data.append({
-                "method": name,
-                "compression_ratio": r.get("final_compression_ratio", {}).get("mean", 1.0),
-                "perplexity": r.get("perplexity", {}).get("mean", 0.0),
-                "rouge_l": 1.0, # Placeholder or compute against FullKV
-                "config_label": name,
-            })
-        plot2_pareto_frontier(pareto_data, save_path=os.path.join(args.output_dir, f"plot2_pareto_{timestamp}.png"))
-
-    if "task3_multiturn" in all_results:
-        plot3_vram_over_turns(
-            {name: r["turns"] for name, r in all_results["task3_multiturn"].items()},
-            save_path=os.path.join(args.output_dir, f"plot3_vram_{timestamp}.png"),
-        )
+    render_available_plots()
 
     print("Plots saved to", args.output_dir)
 
