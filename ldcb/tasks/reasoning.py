@@ -1,7 +1,7 @@
 import torch
 import random
 from ..utils import get_total_vram_gb
-from ..metrics import aggregate_task_results
+from ..metrics import aggregate_task_results, compute_perplexity
 
 MAX_NEW_TOKENS = 2000
 CHECKPOINT_STEPS = [250, 500, 1000, 1500, 2000]
@@ -16,7 +16,7 @@ def make_algebra_problem(seed: int) -> str:
     ]
     return random.choice(ops)()
 
-def make_reasoning_prompt(n_problems: int = 15, seed: int = 42) -> str:
+def make_reasoning_prompt(n_problems: int = 10, seed: int = 42) -> str:
     problems = [make_algebra_problem(seed + i) for i in range(n_problems)]
     numbered = "\n".join(f"{i+1}. {p}" for i, p in enumerate(problems))
     return (
@@ -24,7 +24,7 @@ def make_reasoning_prompt(n_problems: int = 15, seed: int = 42) -> str:
         + numbered
     )
 
-REASONING_PROMPTS = [make_reasoning_prompt(seed=s) for s in [42, 99, 137, 200, 314]]
+REASONING_SEEDS = [42, 99, 137, 200, 314]
 
 def estimate_boundary_vs_interior_anchor_rate(generated_text, anchor_positions):
     """
@@ -50,7 +50,7 @@ def estimate_boundary_vs_interior_anchor_rate(generated_text, anchor_positions):
         "interior_anchor_rate": interior_anchors / max(n_interior, 1),
     }
 
-def run_reasoning(method, model, tokenizer, max_new_tokens=None) -> dict:
+def run_reasoning(method, model, tokenizer, max_new_tokens=None, compute_ppl: bool = False) -> dict:
     all_results = []
     
     # Calculate limits based on model capacity if provided
@@ -59,11 +59,16 @@ def run_reasoning(method, model, tokenizer, max_new_tokens=None) -> dict:
     active_steps = [s for s in CHECKPOINT_STEPS if s < limit]
     active_steps.append(limit)
 
-    for prompt in REASONING_PROMPTS:
-        # Tokenize and verify prompt is short
+    for seed in REASONING_SEEDS:
+        prompt = make_reasoning_prompt(seed=seed)
+        # Tokenize and verify prompt is short; auto-shrink if needed
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids
-        assert input_ids.shape[1] <= 128, \
-            f"Prompt too long: {input_ids.shape[1]} tokens. Trim it."
+        n_problems = 10
+        while input_ids.shape[1] > 128 and n_problems > 3:
+            n_problems -= 1
+            prompt = make_reasoning_prompt(n_problems=n_problems, seed=seed)
+            input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+        assert input_ids.shape[1] <= 128, f"Prompt too long after shrink: {input_ids.shape[1]} tokens."
 
         torch.cuda.reset_peak_memory_stats()
         generated_text, snapshots, final_state = method.generate(
@@ -71,6 +76,13 @@ def run_reasoning(method, model, tokenizer, max_new_tokens=None) -> dict:
             max_new_tokens=limit,
             checkpoint_steps=active_steps,
         )
+
+        perplexity = float("nan")
+        if compute_ppl:
+            try:
+                perplexity = compute_perplexity(model, tokenizer, generated_text)
+            except Exception:
+                perplexity = float("nan")
 
         result = {
             "prompt": prompt[:60] + "...",
@@ -84,8 +96,13 @@ def run_reasoning(method, model, tokenizer, max_new_tokens=None) -> dict:
             ],
             "final_compression_ratio": final_state.compressed_bytes / final_state.fullkv_bytes,
             "peak_vram_gb": get_total_vram_gb(),
-            "perplexity": 0.0, # Reasoning task focuses on logic rather than PPL
+            "perplexity": perplexity,
         }
+        anchor_rates = estimate_boundary_vs_interior_anchor_rate(
+            generated_text=generated_text,
+            anchor_positions=final_state.anchor_positions,
+        )
+        result.update(anchor_rates)
         all_results.append(result)
 
     return aggregate_task_results(all_results)
