@@ -61,12 +61,16 @@ class KIVIMethod(KVCacheMethod):
             tokens_generated += 1
 
             while tokens_generated < max_new_tokens:
-                past_kv_tuple = tuple(
-                    (self._dequantize(K_q, K_scale, self.bits).to(model.dtype),
-                     self._dequantize(V_q, V_scale, self.bits).to(model.dtype))
-                    for K_q, K_scale, V_q, V_scale in quant_cache
-                )
-                past_kv_deq = DynamicCache.from_legacy_cache(past_kv_tuple)
+                past_kv_deq = DynamicCache()
+                for K_q, K_scale, V_q, V_scale in quant_cache:
+                    k_deq = self._dequantize(K_q, K_scale, self.bits).to(model.dtype)
+                    v_deq = self._dequantize(V_q, V_scale, self.bits).to(model.dtype)
+                    past_kv_deq.key_cache.append(k_deq)
+                    past_kv_deq.value_cache.append(v_deq)
+                
+                if len(past_kv_deq.key_cache) > 0:
+                    # _seen_tokens tracks the number of tokens currently in the cache
+                    past_kv_deq._seen_tokens = past_kv_deq.key_cache[0].shape[-2]
 
                 outputs = model(next_token, past_key_values=past_kv_deq, use_cache=True)
                 new_kv_full = outputs.past_key_values
