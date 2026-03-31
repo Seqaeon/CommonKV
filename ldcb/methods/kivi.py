@@ -62,15 +62,11 @@ class KIVIMethod(KVCacheMethod):
 
             while tokens_generated < max_new_tokens:
                 past_kv_deq = DynamicCache()
-                for K_q, K_scale, V_q, V_scale in quant_cache:
+                for i, (K_q, K_scale, V_q, V_scale) in enumerate(quant_cache):
                     k_deq = self._dequantize(K_q, K_scale, self.bits).to(model.dtype)
                     v_deq = self._dequantize(V_q, V_scale, self.bits).to(model.dtype)
-                    past_kv_deq.key_cache.append(k_deq)
-                    past_kv_deq.value_cache.append(v_deq)
-                
-                if len(past_kv_deq.key_cache) > 0:
-                    # _seen_tokens tracks the number of tokens currently in the cache
-                    past_kv_deq._seen_tokens = past_kv_deq.key_cache[0].shape[-2]
+                    # update() is the official state-management API for Transformers Cache objects
+                    past_kv_deq.update(k_deq, v_deq, i)
 
                 outputs = model(next_token, past_key_values=past_kv_deq, use_cache=True)
                 new_kv_full = outputs.past_key_values
