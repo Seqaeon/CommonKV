@@ -25,10 +25,12 @@ class KIVIMethod(KVCacheMethod):
     prior tokens to stay consistent.
     """
 
-    def __init__(self, bits: int = 4, residual_buffer: int = 32):
+    def __init__(self, bits: int = 4, residual_buffer: int = 32,
+                 cpu_offload_quant: bool = False):
         assert bits in (2, 4, 8)
         self.bits = bits
         self.residual_buffer = residual_buffer
+        self.cpu_offload_quant = cpu_offload_quant
         self.name = f"KIVI-int{bits}"
 
     # ------------------------------------------------------------------
@@ -119,6 +121,9 @@ class KIVIMethod(KVCacheMethod):
             if split > 0:
                 K_q, K_scale = self._quantize(K_old)
                 V_q, V_scale = self._quantize(V_old)
+                if self.cpu_offload_quant:
+                    K_q, K_scale = K_q.cpu(), K_scale.cpu()
+                    V_q, V_scale = V_q.cpu(), V_scale.cpu()
             else:
                 K_q = V_q = K_scale = V_scale = None
 
@@ -139,14 +144,21 @@ class KIVIMethod(KVCacheMethod):
                 past_kv_deq = DynamicCache()
                 for i, (K_q, K_scale, V_q, V_scale, K_res, V_res) in enumerate(quant_cache):
                     if K_q is not None:
+                        dev = K_res.device
+                        K_q_d = K_q.to(dev) if self.cpu_offload_quant else K_q
+                        K_s_d = K_scale.to(dev) if self.cpu_offload_quant else K_scale
+                        V_q_d = V_q.to(dev) if self.cpu_offload_quant else V_q
+                        V_s_d = V_scale.to(dev) if self.cpu_offload_quant else V_scale
                         K_fp = torch.cat([
-                            self._dequantize(K_q, K_scale).to(model.dtype),
+                            self._dequantize(K_q_d, K_s_d).to(model.dtype),
                             K_res.to(model.dtype),
                         ], dim=2)
                         V_fp = torch.cat([
-                            self._dequantize(V_q, V_scale).to(model.dtype),
+                            self._dequantize(V_q_d, V_s_d).to(model.dtype),
                             V_res.to(model.dtype),
                         ], dim=2)
+                        if self.cpu_offload_quant:
+                            del K_q_d, K_s_d, V_q_d, V_s_d
                     else:
                         K_fp = K_res.to(model.dtype)
                         V_fp = V_res.to(model.dtype)
@@ -193,6 +205,9 @@ class KIVIMethod(KVCacheMethod):
                         # Quantize this token exactly once
                         pK_q, pK_scale = self._quantize(promo_K)
                         pV_q, pV_scale = self._quantize(promo_V)
+                        if self.cpu_offload_quant:
+                            pK_q, pK_scale = pK_q.cpu(), pK_scale.cpu()
+                            pV_q, pV_scale = pV_q.cpu(), pV_scale.cpu()
 
                         if K_q is not None:
                             K_q     = torch.cat([K_q,     pK_q],     dim=2)

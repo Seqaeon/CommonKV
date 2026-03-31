@@ -1,11 +1,10 @@
 import gc
 import json
 import os
-import tempfile
 import torch
 import argparse
 from datetime import datetime
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
 from ldcb.methods.fullkv import FullKVMethod
 from ldcb.methods.kivi import KIVIMethod
@@ -16,12 +15,25 @@ from ldcb.tasks.multiturn import run_multiturn
 from ldcb.plots import plot1_compression_vs_length, plot2_pareto_frontier, plot3_vram_over_turns
 
 
-def load_model(model_id, device_map="auto"):
+def load_model(model_id, device_map="auto", load_in_8bit=False, load_in_4bit=False):
     print(f"Loading model {model_id} (device_map={device_map})...")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
+    bnb_config = None
+    if load_in_4bit:
+        print("  Using 4-bit NF4 weight quantization (bitsandbytes)")
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+    elif load_in_8bit:
+        print("  Using 8-bit weight quantization (bitsandbytes)")
+        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        dtype=torch.float16,
+        quantization_config=bnb_config,
+        torch_dtype=torch.float16 if bnb_config is None else None,
         device_map=device_map,
         trust_remote_code=True,
     )
@@ -165,23 +177,52 @@ def main():
     parser.add_argument("--output_dir", type=str, default="ldcb/results")
     parser.add_argument("--device_map", type=str, default="auto")
     parser.add_argument("--tasks",      type=str, default="continuation,reasoning,multiturn")
+    # Memory-saving options
+    parser.add_argument("--low_memory", action="store_true",
+                        help="Enable all memory-saving options at once: 8-bit weights, "
+                             "KIVI CPU offload, reduced calibration (5×500), "
+                             "max 2000 continuation tokens")
+    parser.add_argument("--load_in_8bit", action="store_true",
+                        help="Quantize model weights to 8-bit with bitsandbytes")
+    parser.add_argument("--load_in_4bit", action="store_true",
+                        help="Quantize model weights to 4-bit NF4 with bitsandbytes")
+    parser.add_argument("--max_continuation_tokens", type=int, default=None,
+                        help="Override max tokens for continuation task (default: model max - 128)")
     parser.add_argument("--skip_calibration", action="store_true",
                         help="Skip APKVC codebook calibration (uses random codebooks)")
-    parser.add_argument("--calibration_prompts", type=int, default=8,
-                        help="Number of prompts to use for APKVC calibration (default 8)")
-    parser.add_argument("--calibration_tokens", type=int, default=1000,
-                        help="Tokens to generate per calibration prompt (default 1000)")
+    parser.add_argument("--calibration_prompts", type=int, default=None,
+                        help="Number of prompts to use for APKVC calibration")
+    parser.add_argument("--calibration_tokens", type=int, default=None,
+                        help="Tokens to generate per calibration prompt")
     args = parser.parse_args()
+
+    # Apply --low_memory defaults
+    if args.low_memory:
+        if not args.load_in_4bit:
+            args.load_in_8bit = True
+        if args.calibration_prompts is None:
+            args.calibration_prompts = 5
+        if args.calibration_tokens is None:
+            args.calibration_tokens = 500
+        if args.max_continuation_tokens is None:
+            args.max_continuation_tokens = 2000
+    # Apply regular defaults
+    if args.calibration_prompts is None:
+        args.calibration_prompts = 8
+    if args.calibration_tokens is None:
+        args.calibration_tokens = 1000
 
     os.makedirs(args.output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    model, tokenizer = load_model(args.model_id, args.device_map)
+    model, tokenizer = load_model(args.model_id, args.device_map,
+                                   load_in_8bit=getattr(args, "load_in_8bit", False),
+                                   load_in_4bit=getattr(args, "load_in_4bit", False))
 
     max_pos = getattr(model.config, "max_position_embeddings", 2048)
     print(f"Model capacity: {max_pos} tokens")
 
-    safe_continuation_max = min(4000, max_pos - 128)
+    safe_continuation_max = args.max_continuation_tokens or min(4000, max_pos - 128)
     safe_reasoning_max    = min(2000, max_pos - 128)
     safe_multiturn_turns  = min(15, (max_pos - 100) // 150)
 
@@ -201,12 +242,13 @@ def main():
         print("[APKVC] Skipping calibration (--skip_calibration). Using random codebooks.")
 
     # ---- Define methods (APKVC gets calibration_path if available) ----
+    kivi_offload = getattr(args, "low_memory", False)
     apkvc_extra = {"calibration_path": calibration_path} if calibration_path else {}
 
     methods = {
         "FullKV":         FullKVMethod(),
-        "KIVI-int4":      KIVIMethod(bits=4),
-        "KIVI-int2":      KIVIMethod(bits=2),
+        "KIVI-int4":      KIVIMethod(bits=4, cpu_offload_quant=kivi_offload),
+        "KIVI-int2":      KIVIMethod(bits=2, cpu_offload_quant=kivi_offload),
         "APKVC-identity": APKVCMethod(predictor_type="identity", **apkvc_extra),
         "APKVC-linear":   APKVCMethod(predictor_type="linear",   **apkvc_extra),
     }
