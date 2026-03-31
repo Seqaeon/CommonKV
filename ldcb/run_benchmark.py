@@ -1,5 +1,7 @@
+import gc
 import json
 import os
+import tempfile
 import torch
 import argparse
 from datetime import datetime
@@ -13,50 +15,197 @@ from ldcb.tasks.reasoning import run_reasoning
 from ldcb.tasks.multiturn import run_multiturn
 from ldcb.plots import plot1_compression_vs_length, plot2_pareto_frontier, plot3_vram_over_turns
 
+
 def load_model(model_id, device_map="cuda"):
     print(f"Loading model {model_id} (device_map={device_map})...")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         device_map=device_map,
         trust_remote_code=True,
     )
     model.eval()
     return model, tokenizer
 
+
+# ---------------------------------------------------------------------------
+# Codebook calibration
+# ---------------------------------------------------------------------------
+
+CALIBRATION_PROMPTS = [
+    "The history of artificial intelligence spans decades of research, beginning with early work on symbolic reasoning and logic-based systems. Researchers initially believed that human intelligence could be reduced to symbol manipulation. Over time, it became clear that learning from data was essential, giving rise to the field of machine learning.",
+    "Climate change poses one of the most significant challenges of the twenty-first century. Rising global temperatures are causing glaciers to melt, sea levels to rise, and extreme weather events to become more frequent. Scientists stress the urgency of transitioning to renewable energy sources and reducing greenhouse gas emissions.",
+    "The development of large language models has transformed natural language processing. Models trained on vast corpora of text have demonstrated remarkable abilities in translation, summarisation, question answering, and creative writing. These capabilities emerge from learning statistical patterns across billions of tokens.",
+    "Modern operating systems manage hardware resources through layers of abstraction. The kernel handles memory allocation, process scheduling, and I/O operations. User applications interact with the kernel through system calls, which provide a controlled interface to hardware without exposing low-level details.",
+    "Economic inequality has grown substantially in many countries over the past four decades. While technological progress has created enormous wealth, the gains have been concentrated among a small fraction of the population. Policymakers debate the appropriate role of taxation, education, and social programmes in addressing this disparity.",
+]
+
+
+def calibrate_apkvc(model, tokenizer, output_dir, n_prompts=5,
+                    gen_tokens=300, K_num_codebooks=4, V_num_codebooks=2,
+                    codebook_size=256, iters=25, per_layer=True):
+    """
+    Run a short tracing pass to collect KV residual statistics, then
+    fit RVQ codebooks via K-means.  Returns the path to the saved .pt file.
+
+    Strategy
+    --------
+    1. Run APKVCMethod with trace_output_path set, generating a few hundred
+       tokens per calibration prompt.  The cluster's _append_trace_samples()
+       collects normalised residual vectors for every non-anchor decode token.
+    2. Force-flush the traces via atexit handler by importing the cluster class
+       and calling its dump method directly.
+    3. Pass the trace file to the calibration K-means routine.
+    4. Return the calibration path so APKVCMethod can load it.
+    """
+    from scripts.calibrate_apkvc_codebooks import (
+        _load_trace_tensors, _residual_kmeans
+    )
+    from attention_aware_predictive_kv import AttentionAwarePredictiveKVCluster
+
+    trace_path = os.path.join(output_dir, "apkvc_calibration_trace.pt")
+    calib_path = os.path.join(output_dir, "apkvc_codebooks.pt")
+
+    # Skip if already calibrated for this run
+    if os.path.isfile(calib_path):
+        print(f"[APKVC] Found existing codebooks: {calib_path}  (skipping calibration)")
+        return calib_path
+
+    print(f"\n{'='*60}")
+    print("APKVC CODEBOOK CALIBRATION")
+    print(f"{'='*60}")
+    print(f"Collecting residual traces from {n_prompts} prompts × {gen_tokens} tokens...")
+
+    # Reset class-level trace state so we get a clean trace
+    AttentionAwarePredictiveKVCluster._trace_delta_k = {}
+    AttentionAwarePredictiveKVCluster._trace_delta_v = {}
+    AttentionAwarePredictiveKVCluster._trace_output_path = trace_path
+    AttentionAwarePredictiveKVCluster._trace_registered = True  # prevent re-register
+
+    trace_method = APKVCMethod(
+        predictor_type="identity",
+        trace_output_path=trace_path,
+        trace_max_samples=200_000,
+        per_layer_codebooks=per_layer,
+        K_num_codebooks=K_num_codebooks,
+        V_num_codebooks=V_num_codebooks,
+    )
+
+    prompts = (CALIBRATION_PROMPTS * ((n_prompts // len(CALIBRATION_PROMPTS)) + 1))[:n_prompts]
+    for i, prompt in enumerate(prompts):
+        print(f"  Prompt {i+1}/{n_prompts}...")
+        with torch.no_grad():
+            trace_method.generate(
+                model, tokenizer, prompt,
+                max_new_tokens=gen_tokens,
+                checkpoint_steps=[gen_tokens],
+            )
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    # Flush traces from class-level buffers to disk
+    print("  Flushing trace buffers...")
+    AttentionAwarePredictiveKVCluster._dump_traces_at_exit()
+
+    if not os.path.isfile(trace_path):
+        print("[APKVC][WARN] Trace file not written — codebooks will remain random.")
+        return None
+
+    # Fit codebooks
+    print(f"  Fitting codebooks (per_layer={per_layer}, K×{K_num_codebooks}, V×{V_num_codebooks}, size={codebook_size})...")
+    K_dicts = _load_trace_tensors([trace_path], "delta_K_base", max_samples=200_000)
+    V_dicts = _load_trace_tensors([trace_path], "delta_V",       max_samples=200_000)
+
+    head_dim = next(iter(K_dicts.values())).shape[-1]
+
+    if per_layer:
+        n_layers = max(list(K_dicts.keys()) + list(V_dicts.keys())) + 1
+        K_cbs_list, V_cbs_list = [], []
+        for l in range(n_layers):
+            kl = K_dicts.get(l, K_dicts.get(0))
+            vl = V_dicts.get(l, V_dicts.get(0))
+            K_cbs_list.append(_residual_kmeans(kl, K_num_codebooks, codebook_size, iters))
+            V_cbs_list.append(_residual_kmeans(vl, V_num_codebooks, codebook_size, iters))
+            if (l + 1) % 4 == 0:
+                print(f"    ...layer {l+1}/{n_layers}")
+        K_codebooks = torch.stack(K_cbs_list, dim=0)
+        V_codebooks = torch.stack(V_cbs_list, dim=0)
+    else:
+        K_all = torch.cat(list(K_dicts.values()), dim=0)
+        V_all = torch.cat(list(V_dicts.values()), dim=0)
+        K_codebooks = _residual_kmeans(K_all, K_num_codebooks, codebook_size, iters)
+        V_codebooks = _residual_kmeans(V_all, V_num_codebooks, codebook_size, iters)
+
+    torch.save({
+        "K_codebooks": K_codebooks.half(),
+        "V_codebooks": V_codebooks.half(),
+        "metadata": {
+            "K_num_codebooks": K_num_codebooks,
+            "V_num_codebooks": V_num_codebooks,
+            "codebook_size":   codebook_size,
+            "per_layer":       per_layer,
+            "head_dim":        head_dim,
+        },
+    }, calib_path)
+    print(f"  Saved calibrated codebooks → {calib_path}")
+    return calib_path
+
+
+# ---------------------------------------------------------------------------
+# Main benchmark
+# ---------------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(description="Run Long-Decode Compression Benchmark (LDCB)")
-    parser.add_argument("--model_id", type=str, default="meta-llama/Llama-3.2-3B-Instruct", help="Model ID to benchmark")
-    parser.add_argument("--output_dir", type=str, default="ldcb/results", help="Directory to save results")
-    parser.add_argument("--device_map", type=str, default="auto", help="Device map to use (e.g. 'auto', 'cuda:0')")
-    parser.add_argument("--tasks", type=str, default="continuation,reasoning,multiturn", help="Comma-separated list of tasks to run")
+    parser.add_argument("--model_id",   type=str, default="meta-llama/Llama-3.2-3B-Instruct")
+    parser.add_argument("--output_dir", type=str, default="ldcb/results")
+    parser.add_argument("--device_map", type=str, default="auto")
+    parser.add_argument("--tasks",      type=str, default="continuation,reasoning,multiturn")
+    parser.add_argument("--skip_calibration", action="store_true",
+                        help="Skip APKVC codebook calibration (uses random codebooks)")
+    parser.add_argument("--calibration_prompts", type=int, default=5,
+                        help="Number of prompts to use for APKVC calibration (default 5)")
+    parser.add_argument("--calibration_tokens", type=int, default=300,
+                        help="Tokens to generate per calibration prompt (default 300)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     model, tokenizer = load_model(args.model_id, args.device_map)
-    
-    # Detect architectural context limit and calculate safe benchmark targets
+
     max_pos = getattr(model.config, "max_position_embeddings", 2048)
     print(f"Model capacity: {max_pos} tokens")
 
-    # Continuation: Reserve ~128 tokens for prompt
     safe_continuation_max = min(4000, max_pos - 128)
-    # Reasoning: Reserve ~128 tokens for prompt 
-    safe_reasoning_max = min(2000, max_pos - 128)
-    # Multiturn: Ensure (turns * 150) + prompt < max_pos
-    # Heuristic: 100 tokens response + 50 tokens avg user msg
-    safe_multiturn_turns = min(15, (max_pos - 100) // 150)
+    safe_reasoning_max    = min(2000, max_pos - 128)
+    safe_multiturn_turns  = min(15, (max_pos - 100) // 150)
 
-    # Define methods to benchmark
+    # ---- Calibrate APKVC codebooks before any benchmark tasks ----
+    calibration_path = None
+    if not args.skip_calibration:
+        calibration_path = calibrate_apkvc(
+            model, tokenizer,
+            output_dir=args.output_dir,
+            n_prompts=args.calibration_prompts,
+            gen_tokens=args.calibration_tokens,
+            per_layer=True,
+        )
+        torch.cuda.empty_cache()
+        gc.collect()
+    else:
+        print("[APKVC] Skipping calibration (--skip_calibration). Using random codebooks.")
+
+    # ---- Define methods (APKVC gets calibration_path if available) ----
+    apkvc_extra = {"calibration_path": calibration_path} if calibration_path else {}
+
     methods = {
-        "FullKV":          FullKVMethod(),
-        "KIVI-int4":       KIVIMethod(bits=4),
-        "KIVI-int2":       KIVIMethod(bits=2),
-        "APKVC-identity":  APKVCMethod(predictor_type="identity"),
-        "APKVC-linear":    APKVCMethod(predictor_type="linear"),
+        "FullKV":         FullKVMethod(),
+        "KIVI-int4":      KIVIMethod(bits=4),
+        "KIVI-int2":      KIVIMethod(bits=2),
+        "APKVC-identity": APKVCMethod(predictor_type="identity", **apkvc_extra),
+        "APKVC-linear":   APKVCMethod(predictor_type="linear",   **apkvc_extra),
     }
 
     all_results = {}
@@ -78,11 +227,11 @@ def main():
             pareto_data = []
             for name, r in all_results["task1_continuation"].items():
                 pareto_data.append({
-                    "method": name,
+                    "method":           name,
                     "compression_ratio": r.get("final_compression_ratio", {}).get("mean", 1.0),
-                    "perplexity": r.get("base_ppl", {}).get("mean", float("nan")),
-                    "rouge_l": r.get("rouge_l", {}).get("mean", float("nan")),
-                    "config_label": name,
+                    "perplexity":        r.get("base_ppl",  {}).get("mean", float("nan")),
+                    "rouge_l":           r.get("rouge_l",   {}).get("mean", float("nan")),
+                    "config_label":      name,
                 })
             plot2_pareto_frontier(
                 pareto_data,
@@ -101,20 +250,18 @@ def main():
         print("TASK 1: Long continuation")
         print("=" * 60)
         task1_results = {}
-        fullkv_texts = None  # captured from FullKV, used as ROUGE-L reference
+        fullkv_texts = None
         for name, method in methods.items():
             print(f"\nRunning {name}...")
             aggregated, gen_texts = run_continuation(
                 method, model, tokenizer,
                 max_new_tokens=safe_continuation_max,
-                reference_texts=fullkv_texts,  # None for FullKV itself
+                reference_texts=fullkv_texts,
             )
             task1_results[name] = aggregated
             if name == "FullKV":
-                fullkv_texts = gen_texts  # store as reference for all others
-            # Memory Cleanup
+                fullkv_texts = gen_texts
             torch.cuda.empty_cache()
-            import gc
             gc.collect()
         all_results["task1_continuation"] = task1_results
         save_results_snapshot()
@@ -128,10 +275,9 @@ def main():
         task2_results = {}
         for name, method in methods.items():
             print(f"\nRunning {name}...")
-            task2_results[name] = run_reasoning(method, model, tokenizer, max_new_tokens=safe_reasoning_max)
-            # Memory Cleanup
+            task2_results[name] = run_reasoning(method, model, tokenizer,
+                                                max_new_tokens=safe_reasoning_max)
             torch.cuda.empty_cache()
-            import gc
             gc.collect()
         all_results["task2_reasoning"] = task2_results
         save_results_snapshot()
@@ -145,22 +291,17 @@ def main():
         task3_results = {}
         for name, method in methods.items():
             print(f"\nRunning {name}...")
-            task3_results[name] = run_multiturn(method, model, tokenizer, n_turns=safe_multiturn_turns)
-            # Memory Cleanup
+            task3_results[name] = run_multiturn(method, model, tokenizer,
+                                                n_turns=safe_multiturn_turns)
             torch.cuda.empty_cache()
-            import gc
             gc.collect()
         all_results["task3_multiturn"] = task3_results
         save_results_snapshot()
         render_available_plots()
 
-    # ----- Save raw results -----
     results_path = save_results_snapshot()
     print(f"\nResults saved to {results_path}")
-
-    # ----- Generate plots -----
     render_available_plots()
-
     print("Plots saved to", args.output_dir)
 
     # ----- Summary Table -----
@@ -168,11 +309,11 @@ def main():
         print("\n" + "=" * 60)
         print("SUMMARY — Task 1 (Continuation)")
         print("=" * 60)
-        # base_ppl is a model sanity check — identical for all methods by design
-        # (same base model, same reference text, no cache state involved).
         first = next(iter(all_results["task1_continuation"].values()))
         sanity_ppl = first.get("base_ppl", {}).get("mean", float("nan"))
         print(f"Base model PPL on WikiText-2 (sanity check, same for all): {sanity_ppl:.2f}")
+        calib_note = f" [calibrated: {calibration_path}]" if calibration_path else " [random codebooks]"
+        print(f"APKVC codebooks:{calib_note}")
         print()
         print(f"{'Method':<20} {'Compression':>12} {'ROUGE-L vs FullKV':>18}")
         print("-" * 52)
@@ -181,6 +322,7 @@ def main():
             rl = r.get("rouge_l", {}).get("mean", float("nan"))
             rl_str = f"{rl:.3f}" if rl == rl else "N/A (FullKV baseline)"
             print(f"{name:<20} {cr:>12.3f} {rl_str:>18}")
+
 
 if __name__ == "__main__":
     main()
