@@ -35,7 +35,11 @@ def compute_perplexity(model, tokenizer, text: str) -> float:
         
         # Aggressive memory cleanup after each forward pass
         del outputs
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
         gc.collect()
 
     return torch.exp(torch.stack(nlls).sum() / end_loc).item()

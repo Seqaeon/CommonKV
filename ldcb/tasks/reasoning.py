@@ -50,7 +50,7 @@ def estimate_boundary_vs_interior_anchor_rate(generated_text, anchor_positions):
         "interior_anchor_rate": interior_anchors / max(n_interior, 1),
     }
 
-def run_reasoning(method, model, tokenizer, max_new_tokens=None) -> dict:
+def run_reasoning(method, model, tokenizer, max_new_tokens=None, compute_ppl: bool = False) -> dict:
     all_results = []
     
     # Calculate limits based on model capacity if provided
@@ -77,6 +77,13 @@ def run_reasoning(method, model, tokenizer, max_new_tokens=None) -> dict:
             checkpoint_steps=active_steps,
         )
 
+        perplexity = float("nan")
+        if compute_ppl:
+            try:
+                perplexity = compute_perplexity(model, tokenizer, generated_text)
+            except Exception:
+                perplexity = float("nan")
+
         result = {
             "prompt": prompt[:60] + "...",
             "snapshots": [
@@ -89,7 +96,7 @@ def run_reasoning(method, model, tokenizer, max_new_tokens=None) -> dict:
             ],
             "final_compression_ratio": final_state.compressed_bytes / final_state.fullkv_bytes,
             "peak_vram_gb": get_total_vram_gb(),
-            "perplexity": compute_perplexity(model, tokenizer, generated_text),
+            "perplexity": perplexity,
         }
         anchor_rates = estimate_boundary_vs_interior_anchor_rate(
             generated_text=generated_text,
