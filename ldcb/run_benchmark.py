@@ -114,7 +114,7 @@ def main():
     print(f"\nResults saved to {results_path}")
 
     # ----- Generate plots -----
-    if "continuation" in all_results:
+    if "task1_continuation" in all_results:
         plot1_compression_vs_length(
             all_results["task1_continuation"],
             task_name="Continuation",
@@ -127,7 +127,7 @@ def main():
                 "method": name,
                 "compression_ratio": r.get("final_compression_ratio", {}).get("mean", 1.0),
                 "perplexity": r.get("perplexity", {}).get("mean", 0.0),
-                "rouge_l": 1.0, # Placeholder or compute against FullKV
+                "rouge_l": r.get("rouge_l", {}).get("mean", float("nan")),
                 "config_label": name,
             })
         plot2_pareto_frontier(pareto_data, save_path=os.path.join(args.output_dir, f"plot2_pareto_{timestamp}.png"))
