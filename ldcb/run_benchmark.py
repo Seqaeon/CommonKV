@@ -16,7 +16,7 @@ from ldcb.tasks.multiturn import run_multiturn
 from ldcb.plots import plot1_compression_vs_length, plot2_pareto_frontier, plot3_vram_over_turns
 
 
-def load_model(model_id, device_map="cuda"):
+def load_model(model_id, device_map="auto"):
     print(f"Loading model {model_id} (device_map={device_map})...")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(
