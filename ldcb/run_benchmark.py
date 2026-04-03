@@ -248,14 +248,15 @@ def main():
     methods = {
         "FullKV":             FullKVMethod(),
         # Diagnostic baseline: every decode token is a full-precision anchor.
-        # max_anchor_interval=1 fires the anchor reset at *every* step.
-        # compress_K/V=False skips AQ entirely — stored value == K_true/V_true.
-        # Expected: ROUGE-L == 1.000 vs FullKV. If not, there is a prefill bug.
+        # fp16_prefill=True stores the prompt KV in exact fp16 (no quantisation)
+        # so that the decode reconstruction path is isolated.
+        # Expected: ROUGE-L == 1.000 vs FullKV. Any gap means a decode bug.
         "APKVC-anchor-only":  APKVCMethod(
                                   predictor_type="identity",
                                   max_anchor_interval=1,
                                   compress_K=False,
                                   compress_V=False,
+                                  fp16_prefill=True,
                                   **apkvc_extra,
                               ),
         "KIVI-int4":          KIVIMethod(bits=4, cpu_offload_quant=kivi_offload),
