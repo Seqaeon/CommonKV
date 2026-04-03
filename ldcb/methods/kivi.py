@@ -284,16 +284,22 @@ class KIVIMethod(KVCacheMethod):
                         # Flush all R tokens at once
                         pK_q, pK_sc, pK_mn = _quant_K(K_res, G, self.bits)
                         if self.cpu:
-                            pK_q, pK_sc, pK_mn = pK_q.cpu(), pK_sc.cpu(), pK_mn.cpu()
-                        if K_q is None:
-                            K_q, K_sc, K_mn = pK_q, pK_sc, pK_mn
+                            # Move to CPU and concatenate on CPU to avoid large GPU transfers
+                            pk_q_cpu, pk_sc_cpu, pk_mn_cpu = pK_q.cpu(), pK_sc.cpu(), pK_mn.cpu()
+                            if K_q is None:
+                                K_q, K_sc, K_mn = pk_q_cpu, pk_sc_cpu, pk_mn_cpu
+                            else:
+                                K_q  = torch.cat([K_q,  pk_q_cpu],  dim=2)
+                                K_sc = torch.cat([K_sc, pk_sc_cpu], dim=2)
+                                K_mn = torch.cat([K_mn, pk_mn_cpu], dim=2)
                         else:
-                            dev = K_res.device
-                            K_q  = torch.cat([K_q.to(dev),  pK_q],  dim=2)
-                            K_sc = torch.cat([K_sc.to(dev), pK_sc], dim=2)
-                            K_mn = torch.cat([K_mn.to(dev), pK_mn], dim=2)
-                            if self.cpu:
-                                K_q, K_sc, K_mn = K_q.cpu(), K_sc.cpu(), K_mn.cpu()
+                            # Standard GPU path
+                            if K_q is None:
+                                K_q, K_sc, K_mn = pK_q, pK_sc, pK_mn
+                            else:
+                                K_q  = torch.cat([K_q,  pK_q],  dim=2)
+                                K_sc = torch.cat([K_sc, pK_sc], dim=2)
+                                K_mn = torch.cat([K_mn, pK_mn], dim=2)
                         K_res = K_res[:, :, :0, :]   # reset to empty
 
                     # --- Value residual (flush one token at a time) ---
@@ -304,16 +310,22 @@ class KIVIMethod(KVCacheMethod):
                         V_res = V_res[:, :, 1:, :]
                         pV_q, pV_sc, pV_mn = _quant_V(evict, G, self.bits)
                         if self.cpu:
-                            pV_q, pV_sc, pV_mn = pV_q.cpu(), pV_sc.cpu(), pV_mn.cpu()
-                        if V_q is None:
-                            V_q, V_sc, V_mn = pV_q, pV_sc, pV_mn
+                            # Move to CPU and concatenate on CPU
+                            pv_q_cpu, pv_sc_cpu, pv_mn_cpu = pV_q.cpu(), pV_sc.cpu(), pV_mn.cpu()
+                            if V_q is None:
+                                V_q, V_sc, V_mn = pv_q_cpu, pv_sc_cpu, pv_mn_cpu
+                            else:
+                                V_q  = torch.cat([V_q,  pv_q_cpu],  dim=2)
+                                V_sc = torch.cat([V_sc, pv_sc_cpu], dim=2)
+                                V_mn = torch.cat([V_mn, pv_mn_cpu], dim=2)
                         else:
-                            dev = V_res.device
-                            V_q  = torch.cat([V_q.to(dev),  pV_q],  dim=2)
-                            V_sc = torch.cat([V_sc.to(dev), pV_sc], dim=2)
-                            V_mn = torch.cat([V_mn.to(dev), pV_mn], dim=2)
-                            if self.cpu:
-                                V_q, V_sc, V_mn = V_q.cpu(), V_sc.cpu(), V_mn.cpu()
+                            # Standard GPU path
+                            if V_q is None:
+                                V_q, V_sc, V_mn = pV_q, pV_sc, pV_mn
+                            else:
+                                V_q  = torch.cat([V_q,  pV_q],  dim=2)
+                                V_sc = torch.cat([V_sc, pV_sc], dim=2)
+                                V_mn = torch.cat([V_mn, pV_mn], dim=2)
 
                     new_cache.append([K_q, K_sc, K_mn, V_q, V_sc, V_mn, K_res, V_res])
 
