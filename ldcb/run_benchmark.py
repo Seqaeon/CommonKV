@@ -246,11 +246,22 @@ def main():
     apkvc_extra = {"calibration_path": calibration_path} if calibration_path else {}
 
     methods = {
-        "FullKV":         FullKVMethod(),
-        "KIVI-int4":      KIVIMethod(bits=4, cpu_offload_quant=kivi_offload),
-        "KIVI-int2":      KIVIMethod(bits=2, cpu_offload_quant=kivi_offload),
-        "APKVC-identity": APKVCMethod(predictor_type="identity", **apkvc_extra),
-        "APKVC-linear":   APKVCMethod(predictor_type="linear",   **apkvc_extra),
+        "FullKV":             FullKVMethod(),
+        # Diagnostic baseline: every decode token is a full-precision anchor.
+        # max_anchor_interval=1 fires the anchor reset at *every* step.
+        # compress_K/V=False skips AQ entirely — stored value == K_true/V_true.
+        # Expected: ROUGE-L == 1.000 vs FullKV. If not, there is a prefill bug.
+        "APKVC-anchor-only":  APKVCMethod(
+                                  predictor_type="identity",
+                                  max_anchor_interval=1,
+                                  compress_K=False,
+                                  compress_V=False,
+                                  **apkvc_extra,
+                              ),
+        "KIVI-int4":          KIVIMethod(bits=4, cpu_offload_quant=kivi_offload),
+        "KIVI-int2":          KIVIMethod(bits=2, cpu_offload_quant=kivi_offload),
+        "APKVC-identity":     APKVCMethod(predictor_type="identity", **apkvc_extra),
+        "APKVC-linear":       APKVCMethod(predictor_type="linear",   **apkvc_extra),
     }
 
     all_results = {}

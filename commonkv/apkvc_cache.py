@@ -11,10 +11,12 @@ class HybridAPKVCCache(DynamicCache):
     def __init__(self, model_config, apkvc_kwargs=None):
         super().__init__()
         # Pre-allocate caches
-        self.prefill_K_int8 = []
+        self.prefill_K_int8  = []
         self.prefill_K_scale = []
-        self.prefill_V_int8 = []
+        self.prefill_K_zero  = []   # zero-point for asymmetric quant
+        self.prefill_V_int8  = []
         self.prefill_V_scale = []
+        self.prefill_V_zero  = []   # zero-point for asymmetric quant
         
         self.decode_states = []
         
@@ -52,43 +54,66 @@ class HybridAPKVCCache(DynamicCache):
             self.decode_states.append(state)
             self.prefill_K_int8.append(None)
             self.prefill_K_scale.append(None)
+            self.prefill_K_zero.append(None)
             self.prefill_V_int8.append(None)
             self.prefill_V_scale.append(None)
+            self.prefill_V_zero.append(None)
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         if len(self.decode_states) <= layer_idx:
             return 0
-        
+
         prefill_len = 0
-        if self.prefill_K_int8[layer_idx] is not None:
-            prefill_len = self.prefill_K_int8[layer_idx].shape[-2]
-            
+        K_raw = self.prefill_K_int8[layer_idx]
+        if K_raw is not None:
+            prefill_len = K_raw.shape[-2]
+
         decode_len = len(self.decode_states[layer_idx]['entries'])
         return prefill_len + decode_len
 
     def quantize_prefill_kv(self, K: torch.Tensor, V: torch.Tensor):
-        # Per-channel: scale over token dimension (dim=2)
-        K_scale = K.abs().amax(dim=2, keepdim=True) / 127.0
-        V_scale = V.abs().amax(dim=2, keepdim=True) / 127.0
-        # Prevent zero division
-        K_scale = K_scale.clamp(min=1e-5)
-        V_scale = V_scale.clamp(min=1e-5)
-        
-        K_int8 = (K / K_scale).round().clamp(-128, 127).to(torch.int8)
-        V_int8 = (V / V_scale).round().clamp(-128, 127).to(torch.int8)
-        return K_int8, K_scale.half(), V_int8, V_scale.half()
+        """
+        Per-token asymmetric uint8 quantization.
+
+        Each token gets its own (min, max) over the head-dim axis, giving a
+        dedicated 8-bit range per token.  This prevents a single outlier token
+        from inflating the quantisation scale for all other tokens — the root
+        cause of the anchor-only ROUGE-L < 1.0 bug with the old per-channel
+        symmetric scheme.
+
+        K, V : [B, H, T, D]
+        Returns per-token scale and zero-point (both fp16) alongside uint8 data.
+        """
+        # Per-token min/max over the head-dim (last) axis
+        K_min   = K.float().amin(dim=-1, keepdim=True)   # [B, H, T, 1]
+        K_max   = K.float().amax(dim=-1, keepdim=True)
+        K_scale = (K_max - K_min).clamp(min=1e-5) / 255.0
+        K_uint8 = ((K.float() - K_min) / K_scale).round().clamp(0, 255).to(torch.uint8)
+
+        V_min   = V.float().amin(dim=-1, keepdim=True)
+        V_max   = V.float().amax(dim=-1, keepdim=True)
+        V_scale = (V_max - V_min).clamp(min=1e-5) / 255.0
+        V_uint8 = ((V.float() - V_min) / V_scale).round().clamp(0, 255).to(torch.uint8)
+
+        return (K_uint8, K_scale.half(), K_min.half(),
+                V_uint8, V_scale.half(), V_min.half())
 
     def dequantize_prefill_kv(self, layer_idx: int):
         K_raw   = self.prefill_K_int8[layer_idx]
         K_scale = self.prefill_K_scale[layer_idx]
+        K_zero  = self.prefill_K_zero[layer_idx]
         V_raw   = self.prefill_V_int8[layer_idx]
         V_scale = self.prefill_V_scale[layer_idx]
+        V_zero  = self.prefill_V_zero[layer_idx]
+
         if K_scale is None:
             # fp16_prefill mode — raw tensors are already fp16
             return K_raw, V_raw
-        K = K_raw.half() * K_scale
-        V = V_raw.half() * V_scale
-        return K, V
+
+        # Asymmetric dequant: X_hat = X_uint8 * scale + zero
+        K = K_raw.float() * K_scale.float() + K_zero.float()
+        V = V_raw.float() * V_scale.float() + V_zero.float()
+        return K.half(), V.half()
 
     def update(
         self,
@@ -114,11 +139,15 @@ class HybridAPKVCCache(DynamicCache):
                 self.prefill_V_scale[layer_idx] = None
             else:
                 # 1. Quantize and save prefill arrays in physical memory
-                K_int8, K_scale, V_int8, V_scale = self.quantize_prefill_kv(key_states, value_states)
+                K_int8, K_scale, K_zero, V_int8, V_scale, V_zero = (
+                    self.quantize_prefill_kv(key_states, value_states)
+                )
                 self.prefill_K_int8[layer_idx]  = K_int8
                 self.prefill_K_scale[layer_idx] = K_scale
+                self.prefill_K_zero[layer_idx]  = K_zero
                 self.prefill_V_int8[layer_idx]  = V_int8
                 self.prefill_V_scale[layer_idx] = V_scale
+                self.prefill_V_zero[layer_idx]  = V_zero
             
             # Instantiate prediction states so decoded tokens can securely predict
             state = self.decode_states[layer_idx]
