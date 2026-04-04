@@ -273,13 +273,21 @@ def main():
         # Use --apkvc_prefill_compression vq only after confirming calibration
         # covers ≥20 prompts × ≥300 tokens (vq prefill needs sufficient codebook
         # coverage of the derotated-K distribution to work well).
-        "APKVC-Commutative":  APKVCMethod(**{
-                                  **apkvc_extra,
-                                  "predictor_type":     "identity",
-                                  "codebook_structure": "rope_commutative_2x2",
-                                  # prefill_compression comes from --apkvc_prefill_compression (default: int8)
-                                  # pass --apkvc_prefill_compression vq to enable VQ prefill
-                              }),
+        # Unconstrained APKVC: purely learned codebooks, no structural constraint.
+        # Expected higher quality than Commutative — use as the quality ceiling.
+        "APKVC-Unconstrained": APKVCMethod(**{
+                                    **apkvc_extra,
+                                    "predictor_type":     "identity",
+                                    "codebook_structure": "unconstrained",
+                                }),
+        # CommVQ-inspired APKVC: codebooks constrained to 2×2 RoPE-commutative form.
+        # Tests quality trade-off of the structural constraint.
+        "APKVC-Commutative":   APKVCMethod(**{
+                                    **apkvc_extra,
+                                    "predictor_type":     "identity",
+                                    "codebook_structure": "rope_commutative_2x2",
+                                    # prefill_compression comes from --apkvc_prefill_compression (default: int8)
+                                }),
         # ---- commented out for cleaner comparison ----
         # "APKVC-anchor-only": APKVCMethod(predictor_type="identity", max_anchor_interval=1,
         #                                   compress_K=False, compress_V=False, fp16_prefill=True,
