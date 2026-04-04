@@ -59,7 +59,8 @@ CALIBRATION_PROMPTS = [
 
 def calibrate_apkvc(model, tokenizer, output_dir, n_prompts=5,
                     gen_tokens=300, K_num_codebooks=4, V_num_codebooks=2,
-                    codebook_size=256, iters=25, per_layer=True):
+                    codebook_size=256, iters=25, per_layer=True,
+                    trainer="kmeans", codebook_structure="unconstrained"):
     """
     Run a short tracing pass to collect KV residual statistics, then
     fit RVQ codebooks via K-means.  Returns the path to the saved .pt file.
@@ -140,8 +141,8 @@ def calibrate_apkvc(model, tokenizer, output_dir, n_prompts=5,
         for l in range(n_layers):
             kl = K_dicts.get(l, K_dicts.get(0))
             vl = V_dicts.get(l, V_dicts.get(0))
-            K_cbs_list.append(_residual_kmeans(kl, K_num_codebooks, codebook_size, iters))
-            V_cbs_list.append(_residual_kmeans(vl, V_num_codebooks, codebook_size, iters))
+            K_cbs_list.append(_residual_kmeans(kl, K_num_codebooks, codebook_size, iters, trainer=trainer, commutative_2x2=(codebook_structure == "rope_commutative_2x2")))
+            V_cbs_list.append(_residual_kmeans(vl, V_num_codebooks, codebook_size, iters, trainer=trainer, commutative_2x2=(codebook_structure == "rope_commutative_2x2")))
             if (l + 1) % 4 == 0:
                 print(f"    ...layer {l+1}/{n_layers}")
         K_codebooks = torch.stack(K_cbs_list, dim=0)
@@ -149,8 +150,8 @@ def calibrate_apkvc(model, tokenizer, output_dir, n_prompts=5,
     else:
         K_all = torch.cat(list(K_dicts.values()), dim=0)
         V_all = torch.cat(list(V_dicts.values()), dim=0)
-        K_codebooks = _residual_kmeans(K_all, K_num_codebooks, codebook_size, iters)
-        V_codebooks = _residual_kmeans(V_all, V_num_codebooks, codebook_size, iters)
+        K_codebooks = _residual_kmeans(K_all, K_num_codebooks, codebook_size, iters, trainer=trainer, commutative_2x2=(codebook_structure == "rope_commutative_2x2"))
+        V_codebooks = _residual_kmeans(V_all, V_num_codebooks, codebook_size, iters, trainer=trainer, commutative_2x2=(codebook_structure == "rope_commutative_2x2"))
 
     torch.save({
         "K_codebooks": K_codebooks.half(),
@@ -161,6 +162,8 @@ def calibrate_apkvc(model, tokenizer, output_dir, n_prompts=5,
             "codebook_size":   codebook_size,
             "per_layer":       per_layer,
             "head_dim":        head_dim,
+            "trainer":         trainer,
+            "codebook_structure": codebook_structure,
         },
     }, calib_path)
     print(f"  Saved calibrated codebooks → {calib_path}")
@@ -194,6 +197,11 @@ def main():
                         help="Number of prompts to use for APKVC calibration")
     parser.add_argument("--calibration_tokens", type=int, default=None,
                         help="Tokens to generate per calibration prompt")
+    # APKVC specialized options
+    parser.add_argument("--apkvc_prefill_compression", type=str, default="int8", choices=["int8", "vq", "fp16"])
+    parser.add_argument("--apkvc_codebook_structure", type=str, default="unconstrained", choices=["unconstrained", "rope_commutative_2x2"])
+    parser.add_argument("--apkvc_enable_code_attention_lookup", action="store_true")
+    parser.add_argument("--apkvc_calib_trainer", type=str, default="kmeans", choices=["kmeans", "em_closed_form"])
     args = parser.parse_args()
 
     # Apply --low_memory defaults
@@ -235,6 +243,8 @@ def main():
             n_prompts=args.calibration_prompts,
             gen_tokens=args.calibration_tokens,
             per_layer=True,
+            trainer=args.apkvc_calib_trainer,
+            codebook_structure=args.apkvc_codebook_structure,
         )
         torch.cuda.empty_cache()
         gc.collect()
@@ -243,7 +253,16 @@ def main():
 
     # ---- Define methods (APKVC gets calibration_path if available) ----
     kivi_offload = getattr(args, "low_memory", False)
-    apkvc_extra = {"calibration_path": calibration_path} if calibration_path else {}
+    apkvc_extra = {
+        "calibration_path": calibration_path,
+        "prefill_compression": args.apkvc_prefill_compression,
+        "codebook_structure": args.apkvc_codebook_structure,
+        "enable_code_attention_lookup": args.apkvc_enable_code_attention_lookup,
+    } if calibration_path else {
+        "prefill_compression": args.apkvc_prefill_compression,
+        "codebook_structure": args.apkvc_codebook_structure,
+        "enable_code_attention_lookup": args.apkvc_enable_code_attention_lookup,
+    }
 
     methods = {
         "FullKV":             FullKVMethod(),
@@ -263,6 +282,12 @@ def main():
         "KIVI-int2":          KIVIMethod(bits=2, cpu_offload_quant=kivi_offload),
         "APKVC-identity":     APKVCMethod(predictor_type="identity", **apkvc_extra),
         "APKVC-linear":       APKVCMethod(predictor_type="linear",   **apkvc_extra),
+        "APKVC-Commutative":  APKVCMethod(
+                                  predictor_type="identity", 
+                                  codebook_structure="rope_commutative_2x2",
+                                  prefill_compression="vq",
+                                  **apkvc_extra
+                              ),
     }
 
     all_results = {}
