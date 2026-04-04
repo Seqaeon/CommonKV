@@ -282,12 +282,12 @@ def main():
         "KIVI-int2":          KIVIMethod(bits=2, cpu_offload_quant=kivi_offload),
         "APKVC-identity":     APKVCMethod(predictor_type="identity", **apkvc_extra),
         "APKVC-linear":       APKVCMethod(predictor_type="linear",   **apkvc_extra),
-        "APKVC-Commutative":  APKVCMethod(
-                                  predictor_type="identity", 
-                                  codebook_structure="rope_commutative_2x2",
-                                  prefill_compression="vq",
-                                  **apkvc_extra
-                              ),
+        "APKVC-Commutative":  APKVCMethod(**{
+                                  **apkvc_extra,
+                                  "predictor_type": "identity",
+                                  "codebook_structure": "rope_commutative_2x2",
+                                  "prefill_compression": "vq",
+                              }),
     }
 
     all_results = {}
