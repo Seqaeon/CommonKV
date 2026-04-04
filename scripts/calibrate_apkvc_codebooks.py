@@ -86,17 +86,73 @@ def _kmeans(X: torch.Tensor, k: int, iters: int = 25, chunk_size: int = 8192) ->
     return centers
 
 
+def _project_rope_commutative_2x2(centers: torch.Tensor) -> torch.Tensor:
+    if centers.shape[-1] % 2 != 0:
+        raise ValueError("rope_commutative_2x2 requires even feature dimension")
+    return centers.reshape(centers.shape[0], -1, 2).reshape_as(centers)
+
+
+def _em_closed_form(
+    X: torch.Tensor,
+    k: int,
+    iters: int = 25,
+    chunk_size: int = 8192,
+    temperature: float = 1.0,
+    commutative_2x2: bool = False,
+) -> torch.Tensor:
+    """
+    Soft-EM where M-step is the closed-form weighted mean.
+    """
+    N = X.shape[0]
+    if N < k:
+        reps = (k + N - 1) // N
+        X = X.repeat(reps, 1)
+        N = X.shape[0]
+    centers = X[torch.randperm(N)[:k]].clone()
+    for _ in range(iters):
+        chunks = []
+        weights = []
+        for s in range(0, N, chunk_size):
+            e = min(N, s + chunk_size)
+            x = X[s:e]
+            d2 = torch.cdist(x, centers) ** 2
+            w = torch.softmax(-d2 / max(1e-6, temperature), dim=-1)
+            chunks.append(x)
+            weights.append(w)
+        w_all = torch.cat(weights, dim=0)
+        x_all = torch.cat(chunks, dim=0)
+        denom = w_all.sum(dim=0, keepdim=True).t().clamp(min=1e-8)
+        new_centers = (w_all.t() @ x_all) / denom
+        if commutative_2x2:
+            new_centers = _project_rope_commutative_2x2(new_centers)
+        centers = new_centers
+    return centers
+
+
 def _residual_kmeans(
     X: torch.Tensor,
     num_codebooks: int,
     codebook_size: int,
     iters: int = 25,
     chunk_size: int = 8192,
+    trainer: str = "kmeans",
+    commutative_2x2: bool = False,
 ) -> torch.Tensor:
     residual = X.clone()
     codebooks = []
     for _ in range(num_codebooks):
-        C = _kmeans(residual, codebook_size, iters=iters, chunk_size=chunk_size)
+        if trainer == "em_closed_form":
+            C = _em_closed_form(
+                residual,
+                codebook_size,
+                iters=iters,
+                chunk_size=chunk_size,
+                commutative_2x2=commutative_2x2,
+            )
+        else:
+            C = _kmeans(residual, codebook_size, iters=iters, chunk_size=chunk_size)
+            if commutative_2x2:
+                C = _project_rope_commutative_2x2(C)
         codebooks.append(C)
         idx = _argmin_dist_chunked(residual, C, chunk_size=chunk_size)
         residual = residual - C[idx]
@@ -115,11 +171,14 @@ def parse_args():
     p.add_argument("--chunk_size", type=int, default=8192, help="Chunk size for memory-safe distance assignment")
     p.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"], help="Device for k-means calibration")
     p.add_argument("--per_layer_codebooks", action="store_true", help="Train completely independent AQ codebooks per layer")
+    p.add_argument("--trainer", type=str, default="kmeans", choices=["kmeans", "em_closed_form"], help="Codebook trainer")
+    p.add_argument("--codebook_structure", type=str, default="unconstrained", choices=["unconstrained", "rope_commutative_2x2"])
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    use_commutative = args.codebook_structure == "rope_commutative_2x2"
     for p in args.trace_paths:
         if not os.path.isfile(p):
             raise FileNotFoundError(p)
@@ -147,9 +206,15 @@ def main():
             if vl is not None: vl = vl.to(device)
             else: vl = torch.zeros((10, args.codebook_size), device=device)
             
-            Ck = _residual_kmeans(kl, args.K_num_codebooks, args.codebook_size, args.iters, args.chunk_size)
+            Ck = _residual_kmeans(
+                kl, args.K_num_codebooks, args.codebook_size, args.iters, args.chunk_size,
+                trainer=args.trainer, commutative_2x2=use_commutative,
+            )
             K_cbs_list.append(Ck)
-            Cv = _residual_kmeans(vl, args.V_num_codebooks, args.codebook_size, args.iters, args.chunk_size)
+            Cv = _residual_kmeans(
+                vl, args.V_num_codebooks, args.codebook_size, args.iters, args.chunk_size,
+                trainer=args.trainer, commutative_2x2=use_commutative,
+            )
             V_cbs_list.append(Cv)
             
         K_codebooks = torch.stack(K_cbs_list, dim=0) # [L, M, S, D]
@@ -162,8 +227,14 @@ def main():
         if V_all.shape[0] > args.max_samples: V_all = V_all[torch.randperm(V_all.shape[0])[:args.max_samples]]
         
         K_all, V_all = K_all.to(device), V_all.to(device)
-        K_codebooks = _residual_kmeans(K_all, args.K_num_codebooks, args.codebook_size, args.iters, args.chunk_size)
-        V_codebooks = _residual_kmeans(V_all, args.V_num_codebooks, args.codebook_size, args.iters, args.chunk_size)
+        K_codebooks = _residual_kmeans(
+            K_all, args.K_num_codebooks, args.codebook_size, args.iters, args.chunk_size,
+            trainer=args.trainer, commutative_2x2=use_commutative,
+        )
+        V_codebooks = _residual_kmeans(
+            V_all, args.V_num_codebooks, args.codebook_size, args.iters, args.chunk_size,
+            trainer=args.trainer, commutative_2x2=use_commutative,
+        )
 
     payload = {
         "K_codebooks": K_codebooks.half(),
@@ -174,6 +245,8 @@ def main():
             "codebook_size": args.codebook_size,
             "max_samples": args.max_samples,
             "trace_paths": args.trace_paths,
+            "trainer": args.trainer,
+            "codebook_structure": args.codebook_structure,
         },
     }
     os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
