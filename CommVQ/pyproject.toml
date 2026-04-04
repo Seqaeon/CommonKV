@@ -1,0 +1,24 @@
+[project]
+name = "commvq"
+version = "0.0.1"
+description = "CommVQ"
+dependencies = [
+    "torch",
+    "deepspeed",
+    "peft",
+    "datasets",
+    "rouge_score",
+    "seaborn",
+    "jieba",
+    "fuzzywuzzy",
+    "rouge",
+    "trl==0.11.1",
+    "transformers==4.45.1",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["commvq"]
