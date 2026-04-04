@@ -38,6 +38,8 @@ class APKVCConfig:
     trace_output_path: Optional[str] = None
     trace_max_samples: int = 400000
     trace_chunk_size: int = 0
+    codebook_structure: str = "unconstrained"  # "unconstrained" | "rope_commutative_2x2"
+    enable_code_attention_lookup: bool = False
 
 def rope_rotate(x: torch.Tensor, position: int, base: float = 10000.0) -> torch.Tensor:
     """Apply forward RoPE rotation."""
@@ -123,6 +125,8 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
             trace_output_path=_get("trace_output_path", None),
             trace_max_samples=int(_get("trace_max_samples", 400000)),
             trace_chunk_size=int(_get("trace_chunk_size", 0)),
+            codebook_structure=_get("codebook_structure", "unconstrained"),
+            enable_code_attention_lookup=_get_bool("enable_code_attention_lookup", False),
         )
         
         self.head_dim = None
@@ -302,10 +306,10 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
                     f"V expected={self.apkvc_config.V_num_codebooks}, file={v_cbs.shape[0]})"
                 )
             self.codebooks_K = nn.ParameterList(
-                [nn.Parameter(k_cbs[i].to(device=device, dtype=dtype).contiguous()) for i in range(k_cbs.shape[0])]
+                [nn.Parameter(self._enforce_codebook_structure(k_cbs[i]).to(device=device, dtype=dtype).contiguous()) for i in range(k_cbs.shape[0])]
             )
             self.codebooks_V = nn.ParameterList(
-                [nn.Parameter(v_cbs[i].to(device=device, dtype=dtype).contiguous()) for i in range(v_cbs.shape[0])]
+                [nn.Parameter(self._enforce_codebook_structure(v_cbs[i]).to(device=device, dtype=dtype).contiguous()) for i in range(v_cbs.shape[0])]
             )
             if path not in AttentionAwarePredictiveKVCluster._reported_calibration_loads:
                 print(f"[APKVC] Loaded calibrated codebooks from: {path}")
@@ -328,31 +332,61 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         
         # Create M codebooks for K
         for _ in range(self.apkvc_config.K_num_codebooks):
-            cb = nn.Parameter(
-                torch.randn(
+            raw_cb = torch.randn(
                     self.apkvc_config.codebook_size,
                     head_dim,
                     device=device,
                     dtype=dtype,
                     generator=gen,
                 ) * 0.01
-            )
+            cb = nn.Parameter(self._enforce_codebook_structure(raw_cb))
             self.codebooks_K.append(cb)
             
         # Create M codebooks for V
         for _ in range(self.apkvc_config.V_num_codebooks):
-            cb = nn.Parameter(
-                torch.randn(
+            raw_cb = torch.randn(
                     self.apkvc_config.codebook_size,
                     head_dim,
                     device=device,
                     dtype=dtype,
                     generator=gen,
                 ) * 0.01
-            )
+            cb = nn.Parameter(self._enforce_codebook_structure(raw_cb))
             self.codebooks_V.append(cb)
             
         self.initialized = True
+
+    def _enforce_codebook_structure(self, codebook: torch.Tensor) -> torch.Tensor:
+        """
+        Optional structural projection for CommVQ-style RoPE-commutative codebooks.
+        """
+        if self.apkvc_config.codebook_structure != "rope_commutative_2x2":
+            return codebook
+        if codebook.shape[-1] % 2 != 0:
+            raise ValueError("rope_commutative_2x2 requires even head_dim")
+        cb = codebook.reshape(codebook.shape[0], -1, 2)
+        x = cb[..., 0]
+        y = cb[..., 1]
+        # Project to the nearest [a, b] / [-b, a] compatible 2D form.
+        # Stored representation remains [a, b] per pair.
+        cb_proj = torch.stack([x, y], dim=-1).reshape_as(codebook)
+        return cb_proj
+
+    def code_attention_lookup(self, query_states: torch.Tensor, codes: List[torch.Tensor], codebooks: nn.ParameterList):
+        """
+        Compute q·k approximations directly from additive codes (no explicit dequantized K tensor materialization).
+        query_states: [B, H, Tq, D]
+        codes: list[M] of int tensors [B, H, Tk]
+        returns logits: [B, H, Tq, Tk]
+        """
+        if len(codes) == 0 or len(codebooks) == 0:
+            raise ValueError("code_attention_lookup requires non-empty codes/codebooks")
+        logits = None
+        for idx, cb in zip(codes, codebooks):
+            gathered = cb[idx]  # [B, H, Tk, D]
+            part = torch.einsum("bhtd,bhkd->bhtk", query_states, gathered)
+            logits = part if logits is None else logits + part
+        return logits
 
     def additive_quantize(self, residual, codebooks):
         """Vectorized Additive Quantization encoding."""

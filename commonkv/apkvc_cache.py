@@ -17,6 +17,8 @@ class HybridAPKVCCache(DynamicCache):
         self.prefill_V_int8  = []
         self.prefill_V_scale = []
         self.prefill_V_zero  = []   # zero-point for asymmetric quant
+        self.prefill_K_codes = []
+        self.prefill_V_codes = []
         
         self.decode_states = []
         
@@ -28,6 +30,7 @@ class HybridAPKVCCache(DynamicCache):
         # confirming the decode path is clean. If it still doesn't, the bug
         # is in the decode path. If it does, INT8 prefill is the culprit.
         self.fp16_prefill = self.apkvc_kwargs.get("fp16_prefill", False)
+        self.prefill_compression = self.apkvc_kwargs.get("prefill_compression", "int8")
         
     def _init_layer(self, layer_idx):
         from attention_aware_predictive_kv import AttentionAwarePredictiveKVCluster
@@ -58,6 +61,8 @@ class HybridAPKVCCache(DynamicCache):
             self.prefill_V_int8.append(None)
             self.prefill_V_scale.append(None)
             self.prefill_V_zero.append(None)
+            self.prefill_K_codes.append(None)
+            self.prefill_V_codes.append(None)
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         if len(self.decode_states) <= layer_idx:
@@ -67,6 +72,9 @@ class HybridAPKVCCache(DynamicCache):
         K_raw = self.prefill_K_int8[layer_idx]
         if K_raw is not None:
             prefill_len = K_raw.shape[-2]
+        elif self.prefill_K_codes[layer_idx] is not None:
+            H = self.model_config.num_key_value_heads if hasattr(self.model_config, "num_key_value_heads") else self.model_config.num_attention_heads
+            prefill_len = self.prefill_K_codes[layer_idx][0].shape[-1] // H
 
         decode_len = len(self.decode_states[layer_idx]['entries'])
         return prefill_len + decode_len
@@ -99,6 +107,22 @@ class HybridAPKVCCache(DynamicCache):
                 V_uint8, V_scale.half(), V_min.half())
 
     def dequantize_prefill_kv(self, layer_idx: int):
+        if self.prefill_compression == "vq" and self.prefill_K_codes[layer_idx] is not None:
+            state = self.decode_states[layer_idx]
+            cluster = state["cluster"]
+            if not cluster.initialized:
+                raise RuntimeError("VQ prefill requested but codebooks are not initialized")
+            K_codes = self.prefill_K_codes[layer_idx]
+            V_codes = self.prefill_V_codes[layer_idx]
+            K = cluster.additive_decode(K_codes, cluster.codebooks_K)
+            V = cluster.additive_decode(V_codes, cluster.codebooks_V)
+            B, HT, D = K.shape
+            H = self.model_config.num_key_value_heads if hasattr(self.model_config, "num_key_value_heads") else self.model_config.num_attention_heads
+            T = HT // H
+            K = K.view(B, T, H, D).permute(0, 2, 1, 3).contiguous().half()
+            V = V.view(B, T, H, D).permute(0, 2, 1, 3).contiguous().half()
+            return K, V
+
         K_raw   = self.prefill_K_int8[layer_idx]
         K_scale = self.prefill_K_scale[layer_idx]
         K_zero  = self.prefill_K_zero[layer_idx]
@@ -115,6 +139,18 @@ class HybridAPKVCCache(DynamicCache):
         V = V_raw.float() * V_scale.float() + V_zero.float()
         return K.half(), V.half()
 
+    def _quantize_prefill_vq(self, K: torch.Tensor, V: torch.Tensor, layer_idx: int):
+        state = self.decode_states[layer_idx]
+        cluster = state["cluster"]
+        if not cluster.initialized:
+            cluster._init_lazy(head_dim=K.shape[-1], device=K.device, dtype=K.dtype)
+        B, H, T, D = K.shape
+        K_flat = K.permute(0, 2, 1, 3).reshape(B, T * H, D)
+        V_flat = V.permute(0, 2, 1, 3).reshape(B, T * H, D)
+        k_codes = cluster.additive_quantize(K_flat, cluster.codebooks_K)
+        v_codes = cluster.additive_quantize(V_flat, cluster.codebooks_V)
+        return k_codes, v_codes
+
     def update(
         self,
         key_states: torch.Tensor,
@@ -130,13 +166,25 @@ class HybridAPKVCCache(DynamicCache):
         is_prefill = key_states.shape[-2] > 1
         
         if is_prefill:
-            if self.fp16_prefill:
+            if self.fp16_prefill or self.prefill_compression == "fp16":
                 # Store fp16 directly — decode steps will use original values,
                 # making anchor-only identical to FullKV for diagnostic purposes.
                 self.prefill_K_int8[layer_idx]  = key_states.half()
                 self.prefill_K_scale[layer_idx] = None  # sentinel: fp16 mode
                 self.prefill_V_int8[layer_idx]  = value_states.half()
                 self.prefill_V_scale[layer_idx] = None
+                self.prefill_K_codes[layer_idx] = None
+                self.prefill_V_codes[layer_idx] = None
+            elif self.prefill_compression == "vq":
+                K_codes, V_codes = self._quantize_prefill_vq(key_states, value_states, layer_idx)
+                self.prefill_K_codes[layer_idx] = K_codes
+                self.prefill_V_codes[layer_idx] = V_codes
+                self.prefill_K_int8[layer_idx] = None
+                self.prefill_V_int8[layer_idx] = None
+                self.prefill_K_scale[layer_idx] = None
+                self.prefill_V_scale[layer_idx] = None
+                self.prefill_K_zero[layer_idx] = None
+                self.prefill_V_zero[layer_idx] = None
             else:
                 # 1. Quantize and save prefill arrays in physical memory
                 K_int8, K_scale, K_zero, V_int8, V_scale, V_zero = (
@@ -148,6 +196,8 @@ class HybridAPKVCCache(DynamicCache):
                 self.prefill_V_int8[layer_idx]  = V_int8
                 self.prefill_V_scale[layer_idx] = V_scale
                 self.prefill_V_zero[layer_idx]  = V_zero
+                self.prefill_K_codes[layer_idx] = None
+                self.prefill_V_codes[layer_idx] = None
             
             # Instantiate prediction states so decoded tokens can securely predict
             state = self.decode_states[layer_idx]
@@ -174,7 +224,11 @@ class HybridAPKVCCache(DynamicCache):
             # alone would corrupt the base vector and therefore all reconstructed K.
             prefill_len = (
                 self.prefill_K_int8[layer_idx].shape[-2]
-                if self.prefill_K_int8[layer_idx] is not None else 0
+                if self.prefill_K_int8[layer_idx] is not None else (
+                    0 if self.prefill_K_codes[layer_idx] is None else
+                    self.prefill_K_codes[layer_idx][0].shape[-1] //
+                    (self.model_config.num_key_value_heads if hasattr(self.model_config, "num_key_value_heads") else self.model_config.num_attention_heads)
+                )
             )
             abs_pos = prefill_len + t
             

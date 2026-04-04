@@ -15,6 +15,9 @@ class APKVCMethod(KVCacheMethod):
             "use_scale_normalization": True,
             "use_rope_aware_aq": True,
             "per_layer_codebooks": True,
+            "prefill_compression": "int8",  # int8 | vq | fp16
+            "codebook_structure": "unconstrained",  # unconstrained | rope_commutative_2x2
+            "enable_code_attention_lookup": False,
         }
         self.apkvc_kwargs.update(kwargs)
         self.name = f"APKVC-{predictor_type}"
@@ -34,6 +37,12 @@ class APKVCMethod(KVCacheMethod):
                 D = K_int8.shape[-1]
                 total_bytes += 2 * (T_pre * H * D * 1) # INT8 K and V
                 total_bytes += 2 * (H * D * 2) # FP16 scales
+            elif cache.prefill_K_codes[i] is not None:
+                # VQ code-only prefill storage (1 byte/code assumption).
+                k_codes = cache.prefill_K_codes[i]
+                v_codes = cache.prefill_V_codes[i]
+                total_bytes += sum(c.numel() for c in k_codes)  # K codes
+                total_bytes += sum(c.numel() for c in v_codes)  # V codes
             
             # 2. Decoding (Anchors or AQ)
             state = cache.decode_states[i]
