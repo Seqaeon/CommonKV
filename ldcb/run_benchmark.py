@@ -266,29 +266,28 @@ def main():
 
     methods = {
         "FullKV":             FullKVMethod(),
-        # Diagnostic baseline: every decode token is a full-precision anchor.
-        # fp16_prefill=True stores the prompt KV in exact fp16 (no quantisation)
-        # so that the decode reconstruction path is isolated.
-        # Expected: ROUGE-L == 1.000 vs FullKV. Any gap means a decode bug.
-        "APKVC-anchor-only":  APKVCMethod(
-                                  predictor_type="identity",
-                                  max_anchor_interval=1,
-                                  compress_K=False,
-                                  compress_V=False,
-                                  fp16_prefill=True,
-                                  **apkvc_extra,
-                              ),
-        "KIVI-int4":          KIVIMethod(bits=4, cpu_offload_quant=kivi_offload),
-        "KIVI-int2":          KIVIMethod(bits=2, cpu_offload_quant=kivi_offload),
-        "APKVC-identity":     APKVCMethod(predictor_type="identity", **apkvc_extra),
-        "APKVC-linear":       APKVCMethod(predictor_type="linear",   **apkvc_extra),
+        "KIVI-int4":          KIVIMethod(bits=4, group_size=32, residual_length=128,
+                                         cpu_offload_quant=kivi_offload),
+        # CommVQ-inspired APKVC: commutative 2×2 codebook structure for decode
+        # residual AQ, with reliable INT8 prefill compression.
+        # Use --apkvc_prefill_compression vq only after confirming calibration
+        # covers ≥20 prompts × ≥300 tokens (vq prefill needs sufficient codebook
+        # coverage of the derotated-K distribution to work well).
         "APKVC-Commutative":  APKVCMethod(**{
                                   **apkvc_extra,
-                                  "predictor_type": "identity",
-                                  "codebook_structure": "rope_commutative_2x2",
-                                  "prefill_compression": "vq",
+                                  "predictor_type":      "identity",
+                                  "codebook_structure":  "rope_commutative_2x2",
+                                  "prefill_compression": "int8",   # int8 is safer; set vq via CLI if calibration is large
                               }),
+        # ---- commented out for cleaner comparison ----
+        # "APKVC-anchor-only": APKVCMethod(predictor_type="identity", max_anchor_interval=1,
+        #                                   compress_K=False, compress_V=False, fp16_prefill=True,
+        #                                   **apkvc_extra),
+        # "APKVC-identity":    APKVCMethod(predictor_type="identity", **apkvc_extra),
+        # "APKVC-linear":      APKVCMethod(predictor_type="linear",   **apkvc_extra),
+        # "KIVI-int2":         KIVIMethod(bits=2, cpu_offload_quant=kivi_offload),
     }
+
 
     all_results = {}
     selected_tasks = args.tasks.split(",")

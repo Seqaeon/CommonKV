@@ -1,17 +1,15 @@
 """
-KIVI KV-cache compression — axes faithful to the official implementation.
+KIVI KV-cache compression — aligned with official quant/new_pack.py math.
 
-From quant/new_pack.py:
-  quant_and_pack_kcache : input [B,H,T,D], groups of G along TOKEN axis (dim=-2).
-                          Scale shape [B,H,T//G,1,D].  Per-channel outliers are
-                          isolated because each channel (D position) contributes
-                          one value per group → channels with persistent large
-                          magnitudes get their own per-group range.
-  quant_and_pack_vcache : input [B,H,T,D], groups of G along HEAD-DIM axis (dim=-1).
-                          Scale shape [B,H,T,D//G,1].  Per-token: each token's
-                          channels are independently grouped.
+Key/Value quantization axes (from quant/new_pack.py):
+  quant_and_pack_kcache : groups of G along TOKEN axis (dim=-2).
+  quant_and_pack_vcache : groups of G along HEAD-DIM axis (dim=-1).
 
-Flush policy (from llama_kivi.py):
+Values are bit-packed into int32 (matching the reference) so byte
+estimates are accurate.  Dequantization is pure PyTorch so no Triton
+dependency is needed.
+
+Flush policy (from models/llama_kivi.py):
   Key  : accumulate in fp16 residual until residual == R tokens, then flush
          ALL R tokens to quantised store at once and reset residual to empty.
   Value: append each new token to fp16 residual; when residual > R, evict the
@@ -26,90 +24,145 @@ from ldcb.utils import get_kv_iterator
 
 
 # ---------------------------------------------------------------------------
-# Pure-PyTorch equivalents of quant_and_pack_kcache / quant_and_pack_vcache
+# Bit-packing helpers — mirrors pack_tensor / unpack_tensor from new_pack.py
+# but without the Triton dependency.
+# ---------------------------------------------------------------------------
+
+def _pack_tensor(data: torch.Tensor, bits: int, pack_dim: int) -> torch.Tensor:
+    """Pack integer tensor along pack_dim into int32 words (pure PyTorch)."""
+    assert bits in (2, 4, 8)
+    shape = data.shape
+    feat_per_int = 32 // bits
+    assert shape[pack_dim] % feat_per_int == 0
+    packed_shape = shape[:pack_dim] + (shape[pack_dim] // feat_per_int,) + shape[pack_dim + 1:]
+    code = torch.zeros(packed_shape, dtype=torch.int32, device=data.device)
+    for j in range(feat_per_int):
+        idx = [slice(None)] * len(shape)
+        idx[pack_dim] = slice(j, None, feat_per_int)          # every feat_per_int-th element
+        packed_idx = [slice(None)] * len(packed_shape)
+        packed_idx[pack_dim] = slice(None)
+        # Accumulate using a loop over positions within the word
+        pass
+    # Cleaner vectorised version
+    data_int = data.to(torch.int32)
+    code = torch.zeros(packed_shape, dtype=torch.int32, device=data.device)
+    for j in range(feat_per_int):
+        src_idx = [slice(None)] * len(shape)
+        src_idx[pack_dim] = slice(j, shape[pack_dim], feat_per_int)
+        dst_idx = [slice(None)] * len(packed_shape)
+        dst_idx[pack_dim] = slice(None)
+        code[dst_idx] |= (data_int[src_idx] << (bits * j))
+    return code
+
+
+def _unpack_tensor(code: torch.Tensor, bits: int, pack_dim: int) -> torch.Tensor:
+    """Unpack int32 tensor to int16 values (pure PyTorch)."""
+    assert bits in (2, 4, 8)
+    shape = code.shape
+    feat_per_int = 32 // bits
+    new_shape = shape[:pack_dim] + (shape[pack_dim] * feat_per_int,) + shape[pack_dim + 1:]
+    out = torch.zeros(new_shape, dtype=torch.int16, device=code.device)
+    mask = (0xFF >> (8 - bits))
+    for j in range(feat_per_int):
+        dst_idx = [slice(None)] * len(new_shape)
+        dst_idx[pack_dim] = slice(j, new_shape[pack_dim], feat_per_int)
+        out[dst_idx] = ((code >> (bits * j)) & mask).to(torch.int16)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# K quantisation: groups of G tokens along the TOKEN axis (dim=-2)
 # ---------------------------------------------------------------------------
 
 def _quant_K(K: torch.Tensor, group_size: int, bits: int):
     """
     Group-wise asymmetric quantisation along the TOKEN axis.
-
-    K       : [B, H, T, D]   (T must be divisible by group_size)
+    K      : [B, H, T, D]   (T must be divisible by group_size)
     Returns
-      K_q   : [B, H, T, D]   uint8  (unpacked; ideally bit-packed for memory)
-      scale : [B, H, T//G, D]  fp16
-      mn    : [B, H, T//G, D]  fp16
+      K_code : [B, H, T//feat_per_int, D]  int32  (bit-packed)
+      scale  : [B, H, T//G, 1, D]          fp32
+      mn     : [B, H, T//G, 1, D]          fp32
     """
     B, H, T, D = K.shape
     G = group_size
     assert T % G == 0, f"_quant_K: T={T} not divisible by G={G}"
     levels = (1 << bits) - 1
 
-    # [B, H, T//G, G, D]
-    Kg = K.float().view(B, H, T // G, G, D)
-    mn = Kg.amin(dim=-2)                                    # [B, H, T//G, D]
-    mx = Kg.amax(dim=-2)
-    scale = (mx - mn).clamp(min=1e-5) / levels             # [B, H, T//G, D]
+    Kg = K.float().view(B, H, T // G, G, D)            # [B, H, T//G, G, D]
+    mn = Kg.amin(dim=-2, keepdim=True)                  # [B, H, T//G, 1, D]
+    mx = Kg.amax(dim=-2, keepdim=True)
+    scale = (mx - mn).clamp(min=1e-5) / levels         # [B, H, T//G, 1, D]
 
-    Kg_q = ((Kg - mn.unsqueeze(-2)) / scale.unsqueeze(-2)).round_().clamp_(0, levels)
-    K_q  = Kg_q.to(torch.uint8).view(B, H, T, D)
-    return K_q, scale.half(), mn.half()
+    Kg_q = ((Kg - mn) / scale).round_().clamp_(0, levels).to(torch.int32)
+    K_int = Kg_q.view(B, H, T, D)                      # [B, H, T, D] int32
+
+    feat_per_int = 32 // bits
+    assert T % feat_per_int == 0
+    K_code = _pack_tensor(K_int, bits, pack_dim=2)      # [B, H, T//fpi, D]
+    return K_code, scale, mn
 
 
-def _dequant_K(K_q: torch.Tensor, scale: torch.Tensor, mn: torch.Tensor,
-               group_size: int) -> torch.Tensor:
+def _dequant_K(K_code: torch.Tensor, scale: torch.Tensor, mn: torch.Tensor,
+               group_size: int, bits: int, T: int) -> torch.Tensor:
     """
-    K_q   : [B, H, T, D]        uint8
-    scale : [B, H, T//G, D]     fp16
-    mn    : [B, H, T//G, D]     fp16
+    K_code : [B, H, T//feat_per_int, D]  int32
+    scale  : [B, H, T//G, 1, D]          fp32
+    mn     : [B, H, T//G, 1, D]          fp32
     Returns fp16 [B, H, T, D].
     """
-    B, H, T, D = K_q.shape
+    B, H, _, D = K_code.shape
     G = group_size
-    Kg_q = K_q.float().view(B, H, T // G, G, D)           # [B, H, T//G, G, D]
-    out  = Kg_q * scale.float().unsqueeze(-2) + mn.float().unsqueeze(-2)
+    K_int = _unpack_tensor(K_code, bits, pack_dim=2).to(torch.float32)  # [B, H, T, D]
+    Kg = K_int.view(B, H, T // G, G, D)
+    out = Kg * scale + mn
     return out.view(B, H, T, D).half()
 
+
+# ---------------------------------------------------------------------------
+# V quantisation: groups of G elements along the HEAD-DIM axis (dim=-1)
+# ---------------------------------------------------------------------------
 
 def _quant_V(V: torch.Tensor, group_size: int, bits: int):
     """
     Group-wise asymmetric quantisation along the HEAD-DIM axis.
-
-    V can be a single token [B,H,1,D] or multiple [B,H,T,D].
-    D must be divisible by group_size.
-
+    V      : [B, H, T, D]   (D must be divisible by group_size)
     Returns
-      V_q   : [B, H, T, D]        uint8
-      scale : [B, H, T, D//G]     fp16
-      mn    : [B, H, T, D//G]     fp16
+      V_code : [B, H, T, D//feat_per_int]  int32
+      scale  : [B, H, T, D//G, 1]          fp32
+      mn     : [B, H, T, D//G, 1]          fp32
     """
     B, H, T, D = V.shape
     G = group_size
     assert D % G == 0, f"_quant_V: D={D} not divisible by G={G}"
     levels = (1 << bits) - 1
 
-    # [B, H, T, D//G, G]
-    Vg = V.float().view(B, H, T, D // G, G)
-    mn = Vg.amin(dim=-1)                                    # [B, H, T, D//G]
-    mx = Vg.amax(dim=-1)
+    Vg = V.float().view(B, H, T, D // G, G)            # [B, H, T, D//G, G]
+    mn = Vg.amin(dim=-1, keepdim=True)                  # [B, H, T, D//G, 1]
+    mx = Vg.amax(dim=-1, keepdim=True)
     scale = (mx - mn).clamp(min=1e-5) / levels
 
-    Vg_q = ((Vg - mn.unsqueeze(-1)) / scale.unsqueeze(-1)).round_().clamp_(0, levels)
-    V_q  = Vg_q.to(torch.uint8).view(B, H, T, D)
-    return V_q, scale.half(), mn.half()
+    Vg_q = ((Vg - mn) / scale).round_().clamp_(0, levels).to(torch.int32)
+    V_int = Vg_q.view(B, H, T, D)                      # [B, H, T, D] int32
+
+    feat_per_int = 32 // bits
+    assert D % feat_per_int == 0
+    V_code = _pack_tensor(V_int, bits, pack_dim=3)      # [B, H, T, D//fpi]
+    return V_code, scale, mn
 
 
-def _dequant_V(V_q: torch.Tensor, scale: torch.Tensor, mn: torch.Tensor,
-               group_size: int) -> torch.Tensor:
+def _dequant_V(V_code: torch.Tensor, scale: torch.Tensor, mn: torch.Tensor,
+               group_size: int, bits: int, D: int) -> torch.Tensor:
     """
-    V_q   : [B, H, T, D]        uint8
-    scale : [B, H, T, D//G]     fp16
-    mn    : [B, H, T, D//G]     fp16
+    V_code : [B, H, T, D//feat_per_int]  int32
+    scale  : [B, H, T, D//G, 1]          fp32
+    mn     : [B, H, T, D//G, 1]          fp32
     Returns fp16 [B, H, T, D].
     """
-    B, H, T, D = V_q.shape
+    B, H, T, _ = V_code.shape
     G = group_size
-    Vg_q = V_q.float().view(B, H, T, D // G, G)           # [B, H, T, D//G, G]
-    out  = Vg_q * scale.float().unsqueeze(-1) + mn.float().unsqueeze(-1)
+    V_int = _unpack_tensor(V_code, bits, pack_dim=3).to(torch.float32)   # [B, H, T, D]
+    Vg = V_int.view(B, H, T, D // G, G)
+    out = Vg * scale + mn
     return out.view(B, H, T, D).half()
 
 
@@ -123,31 +176,32 @@ class KIVIMethod(KVCacheMethod):
                  residual_length: int = 128,
                  cpu_offload_quant: bool = False):
         assert bits in (2, 4, 8)
-        self.bits   = bits
-        self.G      = group_size
-        self.R      = residual_length
-        self.cpu    = cpu_offload_quant
-        self.name   = f"KIVI-int{bits}"
+        self.bits = bits
+        self.G = group_size
+        self.R = residual_length
+        self.cpu = cpu_offload_quant
+        self.name = f"KIVI-int{bits}"
 
     # ------------------------------------------------------------------
-    # Byte estimate (theoretical bit-packing, matching original convention)
+    # Byte estimate — uses actual int32 bit-packed size
     # ------------------------------------------------------------------
 
     def _cache_bytes(self, n_tokens, n_layers, n_heads, head_dim) -> int:
-        G, R   = self.G, self.R
-        T_q    = max(0, n_tokens - R)
-        T_r    = min(n_tokens, R)
+        G, R, bits = self.G, self.R, self.bits
+        feat_per_int = 32 // bits
+        T_q = max(0, n_tokens - R)
+        T_r = min(n_tokens, R)
 
-        # Key quantised: values (bits/8 B each) + scale [T_q//G, D] fp16 + mn same
-        K_val  = T_q * head_dim * (self.bits / 8)
-        K_meta = (T_q // G) * head_dim * 2 * 2          # scale + mn, fp16
+        # Key quantised (bit-packed along token dim): T_q * D / feat_per_int * 4B per int32
+        K_val  = (T_q // feat_per_int) * head_dim * 4 if T_q > 0 else 0
+        K_meta = (T_q // G) * head_dim * 4 * 2          # scale + mn, fp32 (stored as fp32 internally)
 
-        # Value quantised: values + scale [T_q, D//G] fp16 + mn same
-        V_val  = T_q * head_dim * (self.bits / 8)
-        V_meta = T_q * (head_dim // G) * 2 * 2
+        # Value quantised (bit-packed along head-dim): T_q * (D / feat_per_int) * 4B
+        V_val  = T_q * (head_dim // feat_per_int) * 4 if T_q > 0 else 0
+        V_meta = T_q * (head_dim // G) * 4 * 2
 
         # Residual window (K + V, fp16)
-        res    = 2 * T_r * head_dim * 2
+        res = 2 * T_r * head_dim * 2
 
         per_head = K_val + K_meta + V_val + V_meta + res
         return int(per_head * n_layers * n_heads)
@@ -157,70 +211,70 @@ class KIVIMethod(KVCacheMethod):
     # ------------------------------------------------------------------
 
     def generate(self, model, tokenizer, prompt, max_new_tokens, checkpoint_steps):
-        inputs        = tokenizer(prompt, return_tensors="pt").to(model.device)
-        n_layers      = model.config.num_hidden_layers
-        n_heads       = getattr(model.config, "num_key_value_heads",
-                                model.config.num_attention_heads)
-        head_dim      = model.config.hidden_size // model.config.num_attention_heads
-        G, R          = self.G, self.R
+        inputs   = tokenizer(prompt, return_tensors="pt").to(model.device)
+        n_layers = model.config.num_hidden_layers
+        n_heads  = getattr(model.config, "num_key_value_heads",
+                           model.config.num_attention_heads)
+        head_dim = model.config.hidden_size // model.config.num_attention_heads
+        mdtype   = next(model.parameters()).dtype   # use actual model dtype (fp16 OR bf16)
+        G, R     = self.G, self.R
 
         generated_ids = inputs.input_ids
-        snapshots     = []
-        chk_iter      = iter(checkpoint_steps)
-        cur_chk       = next(chk_iter, None)
-        tok_gen       = 0
+        snapshots = []
+        chk_iter  = iter(checkpoint_steps)
+        cur_chk   = next(chk_iter, None)
+        tok_gen   = 0
 
         # ---- Prefill ----
         with torch.no_grad():
             outputs = model(generated_ids, use_cache=True)
 
         # Build per-layer quantised cache.
-        # State per layer: [K_q, K_scale, K_mn, V_q, V_scale, V_mn, K_res, V_res]
-        #   K_q    : [B,H,T_kq,D]    uint8 or None
-        #   K_scale: [B,H,T_kq//G,D] fp16  or None
-        #   K_mn   : [B,H,T_kq//G,D] fp16  or None
-        #   V_q    : [B,H,T_vq,D]    uint8 or None
-        #   V_scale: [B,H,T_vq,D//G] fp16  or None
-        #   V_mn   : [B,H,T_vq,D//G] fp16  or None
-        #   K_res  : [B,H,T_kr,D]    fp16  (0 <= T_kr < R)
-        #   V_res  : [B,H,T_vr,D]    fp16  (0 <= T_vr <= R)
+        # State per layer: [K_code, K_scale, K_mn, K_T_q, V_code, V_scale, V_mn, V_D, K_res, V_res]
+        #   K_code  : [B,H,T_kq//fpi,D]    int32  (bit-packed)
+        #   K_scale : [B,H,T_kq//G,1,D]    fp32
+        #   K_mn    : [B,H,T_kq//G,1,D]    fp32
+        #   K_T_q   : int   (T used for unpacking)
+        #   V_code  : [B,H,T_vq,D//fpi]    int32
+        #   V_scale : [B,H,T_vq,D//G,1]    fp32
+        #   V_mn    : [B,H,T_vq,D//G,1]    fp32
+        #   V_D     : int   (D used for unpacking)
+        #   K_res   : [B,H,T_kr,D]          mdtype
+        #   V_res   : [B,H,T_vr,D]          mdtype
         quant_cache = []
         for _, (layer_K, layer_V) in get_kv_iterator(outputs.past_key_values):
             T = layer_K.shape[2]
+            D = layer_K.shape[3]
 
             # ---- Keys ----
-            # Keep the tail (T % R) tokens as fp16 residual; quantise the rest
-            # in chunks of exactly R.  If T < R, everything is residual.
-            T_kq = (T // R) * R          # tokens that fill complete R-groups
-            K_old = layer_K[:, :, :T_kq, :].to(torch.float16)
-            K_res = layer_K[:, :, T_kq:, :].to(torch.float16)   # 0..R-1 tokens
+            T_kq = (T // R) * R
+            K_old = layer_K[:, :, :T_kq, :].to(dtype=torch.float32)
+            K_res = layer_K[:, :, T_kq:, :].to(dtype=mdtype)
 
             if T_kq > 0:
-                # Quantise in one shot (T_kq is a multiple of R which is a multiple of G)
                 assert T_kq % G == 0
-                K_q, K_sc, K_mn = _quant_K(K_old, G, self.bits)
+                K_code, K_sc, K_mn = _quant_K(K_old, G, self.bits)
                 if self.cpu:
-                    K_q, K_sc, K_mn = K_q.cpu(), K_sc.cpu(), K_mn.cpu()
+                    K_code, K_sc, K_mn = K_code.cpu(), K_sc.cpu(), K_mn.cpu()
             else:
-                K_q = K_sc = K_mn = None
+                K_code = K_sc = K_mn = None
 
             # ---- Values ----
-            # Keep last R tokens as fp16 residual; quantise earlier tokens
-            # one-by-one (but we can do it in one batch here at prefill).
             T_vq = max(0, T - R)
-            V_old = layer_V[:, :, :T_vq, :].to(torch.float16)
-            V_res = layer_V[:, :, T_vq:, :].to(torch.float16)   # last min(T,R) tokens
+            V_old = layer_V[:, :, :T_vq, :].to(dtype=torch.float32)
+            V_res = layer_V[:, :, T_vq:, :].to(dtype=mdtype)
 
             if T_vq > 0:
-                assert head_dim % G == 0, \
-                    f"head_dim={head_dim} not divisible by group_size={G}"
-                V_q, V_sc, V_mn = _quant_V(V_old, G, self.bits)
+                assert D % G == 0
+                V_code, V_sc, V_mn = _quant_V(V_old, G, self.bits)
                 if self.cpu:
-                    V_q, V_sc, V_mn = V_q.cpu(), V_sc.cpu(), V_mn.cpu()
+                    V_code, V_sc, V_mn = V_code.cpu(), V_sc.cpu(), V_mn.cpu()
             else:
-                V_q = V_sc = V_mn = None
+                V_code = V_sc = V_mn = None
 
-            quant_cache.append([K_q, K_sc, K_mn, V_q, V_sc, V_mn, K_res, V_res])
+            quant_cache.append([K_code, K_sc, K_mn, T_kq,
+                                 V_code, V_sc, V_mn, D,
+                                 K_res, V_res])
 
         next_token    = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
         generated_ids = torch.cat([generated_ids, next_token], dim=1)
@@ -231,39 +285,42 @@ class KIVIMethod(KVCacheMethod):
         with torch.no_grad():
             while tok_gen < max_new_tokens:
 
-                # Reconstruct full fp16 KV for attention
+                # Reconstruct full KV for attention
                 past_kv = DynamicCache()
-                for i, (K_q, K_sc, K_mn, V_q, V_sc, V_mn, K_res, V_res) in enumerate(quant_cache):
+                for i, (K_code, K_sc, K_mn, K_T_q,
+                         V_code, V_sc, V_mn, V_D,
+                         K_res, V_res) in enumerate(quant_cache):
                     dev = K_res.device
 
-                    if K_q is not None:
-                        kq = K_q.to(dev) if self.cpu else K_q
-                        ks = K_sc.to(dev) if self.cpu else K_sc
-                        km = K_mn.to(dev) if self.cpu else K_mn
-                        K_fp = torch.cat([_dequant_K(kq, ks, km, G).to(model.dtype),
-                                          K_res.to(model.dtype)], dim=2)
-                        if self.cpu:
-                            del kq, ks, km
+                    if K_code is not None:
+                        kc = K_code.to(dev) if self.cpu else K_code
+                        ks = K_sc.to(dev)   if self.cpu else K_sc
+                        km = K_mn.to(dev)   if self.cpu else K_mn
+                        K_fp = torch.cat([
+                            _dequant_K(kc, ks, km, G, self.bits, K_T_q).to(mdtype),
+                            K_res.to(mdtype)], dim=2)
+                        if self.cpu: del kc, ks, km
                     else:
-                        K_fp = K_res.to(model.dtype)
+                        K_fp = K_res.to(mdtype)
 
-                    if V_q is not None:
-                        vq = V_q.to(dev) if self.cpu else V_q
-                        vs = V_sc.to(dev) if self.cpu else V_sc
-                        vm = V_mn.to(dev) if self.cpu else V_mn
-                        V_fp = torch.cat([_dequant_V(vq, vs, vm, G).to(model.dtype),
-                                          V_res.to(model.dtype)], dim=2)
-                        if self.cpu:
-                            del vq, vs, vm
+                    if V_code is not None:
+                        vc = V_code.to(dev) if self.cpu else V_code
+                        vs = V_sc.to(dev)   if self.cpu else V_sc
+                        vm = V_mn.to(dev)   if self.cpu else V_mn
+                        V_fp = torch.cat([
+                            _dequant_V(vc, vs, vm, G, self.bits, V_D).to(mdtype),
+                            V_res.to(mdtype)], dim=2)
+                        if self.cpu: del vc, vs, vm
                     else:
-                        V_fp = V_res.to(model.dtype)
+                        V_fp = V_res.to(mdtype)
 
                     past_kv.update(K_fp, V_fp, i)
 
                 outputs = model(next_token, past_key_values=past_kv, use_cache=True)
 
                 new_kvs = [
-                    (K[:, :, -1:, :].half().clone(), V[:, :, -1:, :].half().clone())
+                    (K[:, :, -1:, :].to(mdtype).clone(),
+                     V[:, :, -1:, :].to(mdtype).clone())
                     for _, (K, V) in get_kv_iterator(outputs.past_key_values)
                 ]
                 next_token    = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
@@ -275,68 +332,54 @@ class KIVIMethod(KVCacheMethod):
 
                 # Update quantised cache
                 new_cache = []
-                for i, (K_q, K_sc, K_mn, V_q, V_sc, V_mn, K_res, V_res) in enumerate(quant_cache):
+                for i, (K_code, K_sc, K_mn, K_T_q,
+                         V_code, V_sc, V_mn, V_D,
+                         K_res, V_res) in enumerate(quant_cache):
                     nK, nV = new_kvs[i]
 
                     # --- Key residual (flush when full = R tokens) ---
                     K_res = torch.cat([K_res, nK], dim=2)
                     if K_res.shape[2] == R:
-                        # Flush all R tokens at once
-                        pK_q, pK_sc, pK_mn = _quant_K(K_res, G, self.bits)
+                        pK_code, pK_sc, pK_mn = _quant_K(K_res.float(), G, self.bits)
+                        new_K_T_q = K_T_q + R
                         if self.cpu:
-                            # Move to CPU and concatenate on CPU to avoid large GPU transfers
-                            pk_q_cpu, pk_sc_cpu, pk_mn_cpu = pK_q.cpu(), pK_sc.cpu(), pK_mn.cpu()
-                            if K_q is None:
-                                K_q, K_sc, K_mn = pk_q_cpu, pk_sc_cpu, pk_mn_cpu
-                            else:
-                                K_q  = torch.cat([K_q,  pk_q_cpu],  dim=2)
-                                K_sc = torch.cat([K_sc, pk_sc_cpu], dim=2)
-                                K_mn = torch.cat([K_mn, pk_mn_cpu], dim=2)
+                            pK_code = pK_code.cpu(); pK_sc = pK_sc.cpu(); pK_mn = pK_mn.cpu()
+                        if K_code is None:
+                            K_code, K_sc, K_mn, K_T_q = pK_code, pK_sc, pK_mn, new_K_T_q
                         else:
-                            # Standard GPU path
-                            if K_q is None:
-                                K_q, K_sc, K_mn = pK_q, pK_sc, pK_mn
-                            else:
-                                K_q  = torch.cat([K_q,  pK_q],  dim=2)
-                                K_sc = torch.cat([K_sc, pK_sc], dim=2)
-                                K_mn = torch.cat([K_mn, pK_mn], dim=2)
-                        K_res = K_res[:, :, :0, :]   # reset to empty
+                            K_code = torch.cat([K_code, pK_code], dim=2)
+                            K_sc   = torch.cat([K_sc,   pK_sc],   dim=2)
+                            K_mn   = torch.cat([K_mn,   pK_mn],   dim=2)
+                            K_T_q  = new_K_T_q
+                        K_res = K_res[:, :, :0, :]   # reset
 
-                    # --- Value residual (flush one token at a time) ---
+                    # --- Value residual (flush oldest when > R) ---
                     V_res = torch.cat([V_res, nV], dim=2)
                     if V_res.shape[2] > R:
-                        # Evict oldest single token
                         evict = V_res[:, :, :1, :].contiguous()
                         V_res = V_res[:, :, 1:, :]
-                        pV_q, pV_sc, pV_mn = _quant_V(evict, G, self.bits)
+                        pV_code, pV_sc, pV_mn = _quant_V(evict.float(), G, self.bits)
                         if self.cpu:
-                            # Move to CPU and concatenate on CPU
-                            pv_q_cpu, pv_sc_cpu, pv_mn_cpu = pV_q.cpu(), pV_sc.cpu(), pV_mn.cpu()
-                            if V_q is None:
-                                V_q, V_sc, V_mn = pv_q_cpu, pv_sc_cpu, pv_mn_cpu
-                            else:
-                                V_q  = torch.cat([V_q,  pv_q_cpu],  dim=2)
-                                V_sc = torch.cat([V_sc, pv_sc_cpu], dim=2)
-                                V_mn = torch.cat([V_mn, pv_mn_cpu], dim=2)
+                            pV_code = pV_code.cpu(); pV_sc = pV_sc.cpu(); pV_mn = pV_mn.cpu()
+                        if V_code is None:
+                            V_code, V_sc, V_mn = pV_code, pV_sc, pV_mn
                         else:
-                            # Standard GPU path
-                            if V_q is None:
-                                V_q, V_sc, V_mn = pV_q, pV_sc, pV_mn
-                            else:
-                                V_q  = torch.cat([V_q,  pV_q],  dim=2)
-                                V_sc = torch.cat([V_sc, pV_sc], dim=2)
-                                V_mn = torch.cat([V_mn, pV_mn], dim=2)
+                            V_code = torch.cat([V_code, pV_code], dim=2)
+                            V_sc   = torch.cat([V_sc,   pV_sc],   dim=2)
+                            V_mn   = torch.cat([V_mn,   pV_mn],   dim=2)
 
-                    new_cache.append([K_q, K_sc, K_mn, V_q, V_sc, V_mn, K_res, V_res])
+                    new_cache.append([K_code, K_sc, K_mn, K_T_q,
+                                      V_code, V_sc, V_mn, V_D,
+                                      K_res, V_res])
 
                 quant_cache = new_cache
 
                 if tok_gen == cur_chk:
-                    T        = generated_ids.shape[1]
-                    compr    = self._cache_bytes(T, n_layers, n_heads, head_dim)
-                    full_kv  = T * n_layers * n_heads * head_dim * 2 * 2
+                    T       = generated_ids.shape[1]
+                    compr   = self._cache_bytes(T, n_layers, n_heads, head_dim)
+                    full_kv = T * n_layers * n_heads * head_dim * 2 * 2
                     snapshots.append(CacheState(compressed_bytes=compr, fullkv_bytes=full_kv))
-                    cur_chk  = next(chk_iter, None)
+                    cur_chk = next(chk_iter, None)
 
                 if next_token.item() == tokenizer.eos_token_id:
                     break

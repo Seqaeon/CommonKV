@@ -108,20 +108,28 @@ class HybridAPKVCCache(DynamicCache):
 
     def dequantize_prefill_kv(self, layer_idx: int):
         if self.prefill_compression == "vq" and self.prefill_K_codes[layer_idx] is not None:
+            from attention_aware_predictive_kv import rope_rotate
             state = self.decode_states[layer_idx]
             cluster = state["cluster"]
             if not cluster.initialized:
                 raise RuntimeError("VQ prefill requested but codebooks are not initialized")
             K_codes = self.prefill_K_codes[layer_idx]
             V_codes = self.prefill_V_codes[layer_idx]
-            K = cluster.additive_decode(K_codes, cluster.codebooks_K)
-            V = cluster.additive_decode(V_codes, cluster.codebooks_V)
-            B, HT, D = K.shape
-            H = self.model_config.num_key_value_heads if hasattr(self.model_config, "num_key_value_heads") else self.model_config.num_attention_heads
+            H = (self.model_config.num_key_value_heads
+                 if hasattr(self.model_config, "num_key_value_heads")
+                 else self.model_config.num_attention_heads)
+            # Decode from derotated space → [B, T*H, D]
+            K_derot = cluster.additive_decode(K_codes, cluster.codebooks_K)
+            V_flat  = cluster.additive_decode(V_codes, cluster.codebooks_V)
+            B, HT, D = K_derot.shape
             T = HT // H
-            K = K.view(B, T, H, D).permute(0, 2, 1, 3).contiguous().half()
-            V = V.view(B, T, H, D).permute(0, 2, 1, 3).contiguous().half()
+            # Re-rotate each position back to rotated KV space
+            K_derot_bhd = K_derot.view(B, T, H, D).permute(0, 2, 1, 3)  # [B, H, T, D]
+            K_rot_list = [rope_rotate(K_derot_bhd[:, :, pos:pos+1, :], pos) for pos in range(T)]
+            K = torch.cat(K_rot_list, dim=2).half()                       # [B, H, T, D]
+            V = V_flat.view(B, T, H, D).permute(0, 2, 1, 3).contiguous().half()
             return K, V
+
 
         K_raw   = self.prefill_K_int8[layer_idx]
         K_scale = self.prefill_K_scale[layer_idx]
@@ -140,16 +148,30 @@ class HybridAPKVCCache(DynamicCache):
         return K.half(), V.half()
 
     def _quantize_prefill_vq(self, K: torch.Tensor, V: torch.Tensor, layer_idx: int):
+        """
+        Quantize the prefill K/V using the decode-residual codebooks.
+
+        IMPORTANT: codebooks are trained on *derotated* (RoPE-removed) key vectors.
+        We therefore derotate K at each position before quantizing so the
+        distribution seen here matches the one seen during calibration.
+        V does not use RoPE, so it is quantized as-is.
+        """
+        from attention_aware_predictive_kv import rope_derotate
         state = self.decode_states[layer_idx]
         cluster = state["cluster"]
         if not cluster.initialized:
             cluster._init_lazy(head_dim=K.shape[-1], device=K.device, dtype=K.dtype)
         B, H, T, D = K.shape
-        K_flat = K.permute(0, 2, 1, 3).reshape(B, T * H, D)
-        V_flat = V.permute(0, 2, 1, 3).reshape(B, T * H, D)
+        # Derotate each prefill position so distribution matches calibration
+        K_derot_list = [rope_derotate(K[:, :, pos:pos+1, :], pos) for pos in range(T)]
+        K_derot = torch.cat(K_derot_list, dim=2)           # [B, H, T, D] derotated
+        K_flat  = K_derot.permute(0, 2, 1, 3).reshape(B, T * H, D)
+        V_flat  = V.permute(0, 2, 1, 3).reshape(B, T * H, D)
         k_codes = cluster.additive_quantize(K_flat, cluster.codebooks_K)
         v_codes = cluster.additive_quantize(V_flat, cluster.codebooks_V)
         return k_codes, v_codes
+
+
 
     def update(
         self,

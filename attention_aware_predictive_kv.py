@@ -595,7 +595,12 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
 
         residual_too_large = self._residual_norm_exceeds(delta_K_normed, delta_V_normed)
         if residual_too_large:
-            state['entries'].append({'is_anchor': True, 'position': t})
+            state['entries'].append({
+                'is_anchor': True,
+                'K': K_true.half(),   # store K/V so byte estimator counts correctly
+                'V': V_true.half(),
+                'position': t,
+            })
             self.distortion_history.append(self.last_residual_norm)
             state['recon_cache'][t] = (K_true, V_true)
             state['last_anchor_t'] = t
