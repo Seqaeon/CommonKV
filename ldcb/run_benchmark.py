@@ -275,9 +275,10 @@ def main():
         # coverage of the derotated-K distribution to work well).
         "APKVC-Commutative":  APKVCMethod(**{
                                   **apkvc_extra,
-                                  "predictor_type":      "identity",
-                                  "codebook_structure":  "rope_commutative_2x2",
-                                  "prefill_compression": "int8",   # int8 is safer; set vq via CLI if calibration is large
+                                  "predictor_type":     "identity",
+                                  "codebook_structure": "rope_commutative_2x2",
+                                  # prefill_compression comes from --apkvc_prefill_compression (default: int8)
+                                  # pass --apkvc_prefill_compression vq to enable VQ prefill
                               }),
         # ---- commented out for cleaner comparison ----
         # "APKVC-anchor-only": APKVCMethod(predictor_type="identity", max_anchor_interval=1,
