@@ -27,10 +27,10 @@ class APKVCConfig:
     codebook_size: int       = 256
     
     rd_metric: str       = 'sampled_attention_output' # 'key_dot' or 'sampled_attention_output'
-    rd_threshold: float  = 0.1
+    rd_threshold: float  = 0.02
     rd_sample_heads: int = 4
 
-    max_anchor_interval: int         = 16
+    max_anchor_interval: int         = 4
     linear_window_size: int          = 2
     residual_norm_threshold_K: float = 1000.0
     residual_norm_threshold_V: float = 1000.0
@@ -647,7 +647,12 @@ class AttentionAwarePredictiveKVCluster(BaseCluster):
         self.distortion_history.append(distortion)
         
         if distortion > self.apkvc_config.rd_threshold:
-            state['entries'].append({'is_anchor': True, 'position': t})
+            state['entries'].append({
+                'is_anchor': True,
+                'K': K_true.half(),   # store K/V so byte estimator counts correctly
+                'V': V_true.half(),
+                'position': t,
+            })
             state['recon_cache'][t] = (K_true, V_true)
             state['last_anchor_t'] = t
             state['last_distortion'] = 0.0

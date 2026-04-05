@@ -9,6 +9,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from ldcb.methods.fullkv import FullKVMethod
 from ldcb.methods.kivi import KIVIMethod
 from ldcb.methods.apkvc import APKVCMethod
+from ldcb.methods.commvq import CommVQMethod
 from ldcb.tasks.continuation import run_continuation
 from ldcb.tasks.reasoning import run_reasoning
 from ldcb.tasks.multiturn import run_multiturn
@@ -202,6 +203,11 @@ def main():
     parser.add_argument("--apkvc_codebook_structure", type=str, default="unconstrained", choices=["unconstrained", "rope_commutative_2x2"])
     parser.add_argument("--apkvc_enable_code_attention_lookup", action="store_true")
     parser.add_argument("--apkvc_calib_trainer", type=str, default="kmeans", choices=["kmeans", "em_closed_form"])
+    # CommVQ options (requires meta-llama/Llama-3.1-8B-Instruct as --model_id)
+    parser.add_argument("--add_commvq", action="store_true",
+                        help="Add CommVQ-2bit to the benchmark. Requires --model_id meta-llama/Llama-3.1-8B-Instruct.")
+    parser.add_argument("--commvq_bits", type=int, default=2, choices=[1, 2],
+                        help="CommVQ key quantization bits (default: 2).")
     args = parser.parse_args()
 
     # Apply --low_memory defaults
@@ -265,38 +271,38 @@ def main():
     }
 
     methods = {
-        "FullKV":             FullKVMethod(),
-        "KIVI-int4":          KIVIMethod(bits=4, group_size=32, residual_length=128,
-                                         cpu_offload_quant=kivi_offload),
-        # CommVQ-inspired APKVC: commutative 2×2 codebook structure for decode
-        # residual AQ, with reliable INT8 prefill compression.
-        # Use --apkvc_prefill_compression vq only after confirming calibration
-        # covers ≥20 prompts × ≥300 tokens (vq prefill needs sufficient codebook
-        # coverage of the derotated-K distribution to work well).
-        # Unconstrained APKVC: purely learned codebooks, no structural constraint.
-        # Expected higher quality than Commutative — use as the quality ceiling.
-        "APKVC-Unconstrained": APKVCMethod(**{
-                                    **apkvc_extra,
-                                    "predictor_type":     "identity",
-                                    "codebook_structure": "unconstrained",
-                                }),
-        # CommVQ-inspired APKVC: codebooks constrained to 2×2 RoPE-commutative form.
-        # Tests quality trade-off of the structural constraint.
-        "APKVC-Commutative":   APKVCMethod(**{
-                                    **apkvc_extra,
-                                    "predictor_type":     "identity",
-                                    "codebook_structure": "rope_commutative_2x2",
-                                    # prefill_compression comes from --apkvc_prefill_compression (default: int8)
-                                }),
-        # ---- commented out for cleaner comparison ----
-        # "APKVC-anchor-only": APKVCMethod(predictor_type="identity", max_anchor_interval=1,
-        #                                   compress_K=False, compress_V=False, fp16_prefill=True,
-        #                                   **apkvc_extra),
-        # "APKVC-identity":    APKVCMethod(predictor_type="identity", **apkvc_extra),
-        # "APKVC-linear":      APKVCMethod(predictor_type="linear",   **apkvc_extra),
-        # "KIVI-int2":         KIVIMethod(bits=2, cpu_offload_quant=kivi_offload),
+        "FullKV":   FullKVMethod(),
+        "KIVI-int4": KIVIMethod(bits=4, group_size=32, residual_length=128,
+                                cpu_offload_quant=kivi_offload),
+        # APKVC with CommVQ-inspired unconstrained codebooks.
+        # Defaults: vq prefill, code-attention lookup, em_closed_form training.
+        # All controlled by CLI flags — pass --apkvc_prefill_compression / etc. to change.
+        #
+        # NOTE: The official CommVQ (CommVQ/commvq/) requires model-specific
+        # pre-trained codebook .pt files (e.g. Llama-3.1-8B-Instruct-CommVQ-1bit-codebook/).
+        # Those files do not exist for Llama-2-7B, so CommVQ cannot be added to the
+        # benchmark without first running its training pipeline on Llama-2-7B data.
+        "APKVC": APKVCMethod(**{
+            **apkvc_extra,
+            "predictor_type":               "identity",
+            "codebook_structure":           "unconstrained",
+            "prefill_compression":          args.apkvc_prefill_compression,
+            "enable_code_attention_lookup": args.apkvc_enable_code_attention_lookup,
+        }),
     }
 
+    # CommVQ: only included when --add_commvq is set.
+    # Requires meta-llama/Llama-3.1-8B-Instruct as --model_id.
+    # Codebooks are auto-downloaded from huggingface.co/senfu on first run.
+    if getattr(args, "add_commvq", False):
+        if "llama-3" not in args.model_id.lower() and "llama3" not in args.model_id.lower():
+            print("[WARNING] --add_commvq is designed for meta-llama/Llama-3.1-8B-Instruct. "
+                  "Other models will likely fail codebook loading.")
+        methods["CommVQ-2bit"] = CommVQMethod(
+            bits=args.commvq_bits,
+            residual_length=128,
+            cpu_offload=kivi_offload,
+        )
 
     all_results = {}
     selected_tasks = args.tasks.split(",")

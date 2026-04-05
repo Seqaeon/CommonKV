@@ -35,15 +35,6 @@ def _pack_tensor(data: torch.Tensor, bits: int, pack_dim: int) -> torch.Tensor:
     feat_per_int = 32 // bits
     assert shape[pack_dim] % feat_per_int == 0
     packed_shape = shape[:pack_dim] + (shape[pack_dim] // feat_per_int,) + shape[pack_dim + 1:]
-    code = torch.zeros(packed_shape, dtype=torch.int32, device=data.device)
-    for j in range(feat_per_int):
-        idx = [slice(None)] * len(shape)
-        idx[pack_dim] = slice(j, None, feat_per_int)          # every feat_per_int-th element
-        packed_idx = [slice(None)] * len(packed_shape)
-        packed_idx[pack_dim] = slice(None)
-        # Accumulate using a loop over positions within the word
-        pass
-    # Cleaner vectorised version
     data_int = data.to(torch.int32)
     code = torch.zeros(packed_shape, dtype=torch.int32, device=data.device)
     for j in range(feat_per_int):
@@ -51,7 +42,7 @@ def _pack_tensor(data: torch.Tensor, bits: int, pack_dim: int) -> torch.Tensor:
         src_idx[pack_dim] = slice(j, shape[pack_dim], feat_per_int)
         dst_idx = [slice(None)] * len(packed_shape)
         dst_idx[pack_dim] = slice(None)
-        code[dst_idx] |= (data_int[src_idx] << (bits * j))
+        code[tuple(dst_idx)] |= (data_int[tuple(src_idx)] << (bits * j))
     return code
 
 
@@ -66,7 +57,7 @@ def _unpack_tensor(code: torch.Tensor, bits: int, pack_dim: int) -> torch.Tensor
     for j in range(feat_per_int):
         dst_idx = [slice(None)] * len(new_shape)
         dst_idx[pack_dim] = slice(j, new_shape[pack_dim], feat_per_int)
-        out[dst_idx] = ((code >> (bits * j)) & mask).to(torch.int16)
+        out[tuple(dst_idx)] = ((code >> (bits * j)) & mask).to(torch.int16)
     return out
 
 
