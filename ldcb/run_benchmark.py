@@ -194,6 +194,10 @@ def main():
                         help="Override max tokens for continuation task (default: model max - 128)")
     parser.add_argument("--skip_calibration", action="store_true",
                         help="Skip APKVC codebook calibration (uses random codebooks)")
+    parser.add_argument("--reuse_calibration_path", type=str, default=None,
+                        help="Path to a previously saved apkvc_codebooks.pt — skips calibration "
+                             "and reuses these codebooks directly. Example: "
+                             "ldcb/results/llama31_8b/apkvc_codebooks.pt")
     parser.add_argument("--calibration_prompts", type=int, default=None,
                         help="Number of prompts to use for APKVC calibration")
     parser.add_argument("--calibration_tokens", type=int, default=None,
@@ -242,7 +246,14 @@ def main():
 
     # ---- Calibrate APKVC codebooks before any benchmark tasks ----
     calibration_path = None
-    if not args.skip_calibration:
+    if getattr(args, "reuse_calibration_path", None):
+        # Reuse a previously saved codebook — skip the calibration pass entirely.
+        if not os.path.isfile(args.reuse_calibration_path):
+            raise FileNotFoundError(
+                f"--reuse_calibration_path: file not found: {args.reuse_calibration_path}")
+        calibration_path = args.reuse_calibration_path
+        print(f"[APKVC] Reusing codebooks from: {calibration_path}")
+    elif not args.skip_calibration:
         calibration_path = calibrate_apkvc(
             model, tokenizer,
             output_dir=args.output_dir,

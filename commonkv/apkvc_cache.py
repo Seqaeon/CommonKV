@@ -31,7 +31,9 @@ class HybridAPKVCCache(DynamicCache):
         # is in the decode path. If it does, INT8 prefill is the culprit.
         self.fp16_prefill = self.apkvc_kwargs.get("fp16_prefill", False)
         self.prefill_compression = self.apkvc_kwargs.get("prefill_compression", "int8")
-        
+        # Will be set from the first prefill tensor's dtype (e.g. bfloat16 on Llama-3)
+        self._model_dtype = torch.float16
+
     def _init_layer(self, layer_idx):
         from attention_aware_predictive_kv import AttentionAwarePredictiveKVCluster
         while len(self.decode_states) <= layer_idx:
@@ -107,6 +109,7 @@ class HybridAPKVCCache(DynamicCache):
                 V_uint8, V_scale.half(), V_min.half())
 
     def dequantize_prefill_kv(self, layer_idx: int):
+        dt = self._model_dtype
         if self.prefill_compression == "vq" and self.prefill_K_codes[layer_idx] is not None:
             from attention_aware_predictive_kv import rope_rotate
             state = self.decode_states[layer_idx]
@@ -118,16 +121,14 @@ class HybridAPKVCCache(DynamicCache):
             H = (self.model_config.num_key_value_heads
                  if hasattr(self.model_config, "num_key_value_heads")
                  else self.model_config.num_attention_heads)
-            # Decode from derotated space → [B, T*H, D]
             K_derot = cluster.additive_decode(K_codes, cluster.codebooks_K)
             V_flat  = cluster.additive_decode(V_codes, cluster.codebooks_V)
             B, HT, D = K_derot.shape
             T = HT // H
-            # Re-rotate each position back to rotated KV space
-            K_derot_bhd = K_derot.view(B, T, H, D).permute(0, 2, 1, 3)  # [B, H, T, D]
+            K_derot_bhd = K_derot.view(B, T, H, D).permute(0, 2, 1, 3)
             K_rot_list = [rope_rotate(K_derot_bhd[:, :, pos:pos+1, :], pos) for pos in range(T)]
-            K = torch.cat(K_rot_list, dim=2).half()                       # [B, H, T, D]
-            V = V_flat.view(B, T, H, D).permute(0, 2, 1, 3).contiguous().half()
+            K = torch.cat(K_rot_list, dim=2).to(dt)
+            V = V_flat.view(B, T, H, D).permute(0, 2, 1, 3).contiguous().to(dt)
             return K, V
 
 
@@ -139,13 +140,12 @@ class HybridAPKVCCache(DynamicCache):
         V_zero  = self.prefill_V_zero[layer_idx]
 
         if K_scale is None:
-            # fp16_prefill mode — raw tensors are already fp16
-            return K_raw, V_raw
+            # fp16_prefill / fp16 mode — raw tensors stored in model dtype
+            return K_raw.to(dt), V_raw.to(dt)
 
-        # Asymmetric dequant: X_hat = X_uint8 * scale + zero
         K = K_raw.float() * K_scale.float() + K_zero.float()
         V = V_raw.float() * V_scale.float() + V_zero.float()
-        return K.half(), V.half()
+        return K.to(dt), V.to(dt)
 
     def _quantize_prefill_vq(self, K: torch.Tensor, V: torch.Tensor, layer_idx: int):
         """
@@ -184,16 +184,17 @@ class HybridAPKVCCache(DynamicCache):
         self._init_layer(layer_idx)
         if layer_idx == 0:
             self._seen_tokens += key_states.shape[-2]
-            
+
         is_prefill = key_states.shape[-2] > 1
-        
+
         if is_prefill:
+            # Capture model dtype from the first real tensor we see
+            self._model_dtype = key_states.dtype
+
             if self.fp16_prefill or self.prefill_compression == "fp16":
-                # Store fp16 directly — decode steps will use original values,
-                # making anchor-only identical to FullKV for diagnostic purposes.
-                self.prefill_K_int8[layer_idx]  = key_states.half()
-                self.prefill_K_scale[layer_idx] = None  # sentinel: fp16 mode
-                self.prefill_V_int8[layer_idx]  = value_states.half()
+                self.prefill_K_int8[layer_idx]  = key_states.to(self._model_dtype)
+                self.prefill_K_scale[layer_idx] = None
+                self.prefill_V_int8[layer_idx]  = value_states.to(self._model_dtype)
                 self.prefill_V_scale[layer_idx] = None
                 self.prefill_K_codes[layer_idx] = None
                 self.prefill_V_codes[layer_idx] = None
