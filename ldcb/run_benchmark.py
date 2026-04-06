@@ -58,7 +58,7 @@ CALIBRATION_PROMPTS = [
 ]
 
 
-def calibrate_apkvc(model, tokenizer, output_dir, n_prompts=5,
+def calibrate_apkvc(model, tokenizer, output_dir, prompts,
                     gen_tokens=300, K_num_codebooks=4, V_num_codebooks=2,
                     codebook_size=256, iters=25, per_layer=True,
                     trainer="kmeans", codebook_structure="unconstrained"):
@@ -94,6 +94,9 @@ def calibrate_apkvc(model, tokenizer, output_dir, n_prompts=5,
     print(f"{'='*60}")
     print(f"Collecting residual traces from {n_prompts} prompts × {gen_tokens} tokens...")
 
+    n_prompts = len(prompts)
+    print(f"Collecting residual traces from {n_prompts} prompts × {gen_tokens} tokens...")
+
     # Reset class-level trace state so we get a clean trace
     AttentionAwarePredictiveKVCluster._trace_delta_k = {}
     AttentionAwarePredictiveKVCluster._trace_delta_v = {}
@@ -109,7 +112,6 @@ def calibrate_apkvc(model, tokenizer, output_dir, n_prompts=5,
         V_num_codebooks=V_num_codebooks,
     )
 
-    prompts = (CALIBRATION_PROMPTS * ((n_prompts // len(CALIBRATION_PROMPTS)) + 1))[:n_prompts]
     for i, prompt in enumerate(prompts):
         print(f"  Prompt {i+1}/{n_prompts}...")
         with torch.no_grad():
@@ -194,6 +196,8 @@ def main():
                         help="Override max tokens for continuation task (default: model max - 128)")
     parser.add_argument("--skip_calibration", action="store_true",
                         help="Skip APKVC codebook calibration (uses random codebooks)")
+    parser.add_argument("--calibrate_only", action="store_true",
+                        help="Exit after calibration; do not run benchmark tasks.")
     parser.add_argument("--reuse_calibration_path", type=str, default=None,
                         help="Path to a previously saved apkvc_codebooks.pt — skips calibration "
                              "and reuses these codebooks directly. Example: "
@@ -202,6 +206,15 @@ def main():
                         help="Number of prompts to use for APKVC calibration")
     parser.add_argument("--calibration_tokens", type=int, default=None,
                         help="Tokens to generate per calibration prompt")
+    # New calibration dataset flags
+    parser.add_argument("--calibration_dataset", type=str, default=None,
+                        help="HuggingFace dataset for calibration (e.g., 'wikitext')")
+    parser.add_argument("--calibration_subset", type=str, default=None,
+                        help="Dataset subset/config (e.g., 'wikitext-2-raw-v1')")
+    parser.add_argument("--calibration_split", type=str, default="train",
+                        help="Dataset split for calibration (e.g., 'train', 'validation')")
+    parser.add_argument("--calibration_text_column", type=str, default="text",
+                        help="Column name in dataset containing text")
     # APKVC specialized options
     parser.add_argument("--apkvc_prefill_compression", type=str, default="int8", choices=["int8", "vq", "fp16"])
     parser.add_argument("--apkvc_codebook_structure", type=str, default="unconstrained", choices=["unconstrained", "rope_commutative_2x2"])
@@ -254,15 +267,47 @@ def main():
         calibration_path = args.reuse_calibration_path
         print(f"[APKVC] Reusing codebooks from: {calibration_path}")
     elif not args.skip_calibration:
+        # Load calibration prompts
+        calib_prompts = []
+        if args.calibration_dataset:
+            try:
+                from datasets import load_dataset
+                print(f"[APKVC] Loading calibration dataset: {args.calibration_dataset} ({args.calibration_subset or 'default'})...")
+                ds = load_dataset(args.calibration_dataset, args.calibration_subset, split=args.calibration_split, streaming=True)
+                count = 0
+                for item in ds:
+                    text = item.get(args.calibration_text_column, "")
+                    if len(text.strip()) > 100: # skip very short snippets
+                        calib_prompts.append(text)
+                        count += 1
+                        if count >= args.calibration_prompts: break
+                if len(calib_prompts) == 0:
+                    print("[WARNING] Dataset loading returned no prompts! Falling back to defaults.")
+                    calib_prompts = (CALIBRATION_PROMPTS * ((args.calibration_prompts // len(CALIBRATION_PROMPTS)) + 1))[:args.calibration_prompts]
+                else:
+                    print(f"  Loaded {len(calib_prompts)} prompts from dataset.")
+            except ImportError:
+                print("[ERROR] 'datasets' library not found. Run 'pip install datasets'. Falling back to default prompts.")
+                calib_prompts = (CALIBRATION_PROMPTS * ((args.calibration_prompts // len(CALIBRATION_PROMPTS)) + 1))[:args.calibration_prompts]
+            except Exception as e:
+                print(f"[ERROR] Failed to load dataset: {e}. Falling back to default prompts.")
+                calib_prompts = (CALIBRATION_PROMPTS * ((args.calibration_prompts // len(CALIBRATION_PROMPTS)) + 1))[:args.calibration_prompts]
+        else:
+            print("[APKVC] Using built-in calibration prompts.")
+            calib_prompts = (CALIBRATION_PROMPTS * ((args.calibration_prompts // len(CALIBRATION_PROMPTS)) + 1))[:args.calibration_prompts]
+
         calibration_path = calibrate_apkvc(
             model, tokenizer,
             output_dir=args.output_dir,
-            n_prompts=args.calibration_prompts,
+            prompts=calib_prompts,
             gen_tokens=args.calibration_tokens,
             per_layer=True,
             trainer=args.apkvc_calib_trainer,
             codebook_structure=args.apkvc_codebook_structure,
         )
+        if args.calibrate_only:
+            print(f"\n[APKVC] Calibration complete. Exiting (--calibrate_only).")
+            return
         torch.cuda.empty_cache()
         gc.collect()
     else:
