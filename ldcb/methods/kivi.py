@@ -306,6 +306,7 @@ class KIVIMethod(KVCacheMethod):
                         V_fp = V_res.to(mdtype)
 
                     past_kv.update(K_fp, V_fp, i)
+                    del K_fp, V_fp   # free dequantised tensors immediately
 
                 outputs = model(next_token, past_key_values=past_kv, use_cache=True)
 
@@ -316,7 +317,8 @@ class KIVIMethod(KVCacheMethod):
                 ]
                 next_token    = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
                 del outputs, past_kv
-                torch.cuda.empty_cache()
+                # NOTE: empty_cache() every token is expensive and triggers async error
+                # reporting. Only call it periodically.
 
                 generated_ids = torch.cat([generated_ids, next_token], dim=1)
                 tok_gen      += 1
