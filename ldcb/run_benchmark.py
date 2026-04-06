@@ -92,8 +92,6 @@ def calibrate_apkvc(model, tokenizer, output_dir, prompts,
     print(f"\n{'='*60}")
     print("APKVC CODEBOOK CALIBRATION")
     print(f"{'='*60}")
-    print(f"Collecting residual traces from {n_prompts} prompts × {gen_tokens} tokens...")
-
     n_prompts = len(prompts)
     print(f"Collecting residual traces from {n_prompts} prompts × {gen_tokens} tokens...")
 
