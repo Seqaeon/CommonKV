@@ -1,6 +1,10 @@
 import torch
 from ..utils import get_total_vram_gb
-from ..metrics import compute_perplexity_on_reference, compute_rouge_l, aggregate_task_results
+from ..metrics import (
+    compute_perplexity_on_reference,
+    compute_output_kl_on_text_pair,
+    aggregate_task_results,
+)
 
 CHECKPOINT_STEPS = [250, 500, 1000, 2000, 4000]
 MAX_NEW_TOKENS = 4000
@@ -31,10 +35,8 @@ def run_continuation(method, model, tokenizer, max_new_tokens=None,
     Parameters
     ----------
     reference_texts : list[str] or None
-        One generated string per prompt from FullKV, used to compute
-        ROUGE-L.  Pass None for the FullKV run itself (ROUGE-L will be 1.0
-        by definition and is omitted).  Pass the list returned by the FullKV
-        run for every other method.
+        One generated string per prompt from FullKV, used as the baseline for
+        OutputKL and DeltaPPL metrics. Pass None for the FullKV run itself.
 
     Returns
     -------
@@ -81,9 +83,7 @@ def run_continuation(method, model, tokenizer, max_new_tokens=None,
             "final_compression_ratio": final_state.compressed_bytes / final_state.fullkv_bytes,
             "peak_vram_gb": get_total_vram_gb(),
             # WikiText-2 reference perplexity — identical for all methods (same
-            # base model, no cache state involved).  Use as a sanity check that
-            # the model loaded correctly (~5–7 for LLaMA-class models), NOT as
-            # a differentiating quality signal.  ROUGE-L is the quality metric.
+            # base model, no cache state involved).  Use as a sanity check.
             "base_ppl": compute_perplexity_on_reference(model, tokenizer, n_tokens=2048),
             "distortion_mean": float(torch.tensor(final_state.distortions).mean())
                                if final_state.distortions else 0.0,
@@ -91,11 +91,22 @@ def run_continuation(method, model, tokenizer, max_new_tokens=None,
                               if final_state.distortions else 0.0,
         }
 
-        # ROUGE-L vs FullKV — the real quality signal for compression methods.
-        # Measures how faithfully the compressed method reproduces the text
-        # that FullKV would have generated for the same prompt.
+        # Replace ROUGE with IAVQ-KC stack end metrics:
+        #  - Level 4: Output distribution KL vs FullKV continuation
+        #  - Level 5 proxy: Delta perplexity (first-order) from KL:
+        #      delta_ppl ≈ ppl_ref * KL(p||q)
+        # This avoids exponential blow-ups when KL is large/off-distribution.
         if reference_texts is not None and prompt_idx < len(reference_texts):
-            result["rouge_l"] = compute_rouge_l(generated_text, reference_texts[prompt_idx])
+            reference_text = reference_texts[prompt_idx]
+            result["output_kl"] = compute_output_kl_on_text_pair(
+                model, tokenizer, reference_text, generated_text
+            )
+            ref_ppl = result["base_ppl"]
+            output_kl = result["output_kl"]
+            if output_kl == output_kl:  # not NaN
+                result["delta_ppl"] = ref_ppl * float(output_kl)
+            else:
+                result["delta_ppl"] = float("nan")
 
         all_results.append(result)
 

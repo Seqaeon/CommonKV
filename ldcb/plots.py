@@ -58,17 +58,17 @@ def plot1_compression_vs_length(results_by_method: dict, task_name: str,
 
 def plot2_pareto_frontier(pareto_data: list, save_path: str = None):
     """
-    Plot 2: Quality (perplexity or ROUGE-L) vs compression ratio.
+    Plot 2: Quality (perplexity / OutputKL) vs compression ratio.
 
     pareto_data: list of dicts:
       {"method": str, "compression_ratio": float, "perplexity": float,
-       "rouge_l": float, "config_label": str}
+       "output_kl": float, "config_label": str}
     """
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
     for ax, metric, ylabel, invert in [
         (axes[0], "perplexity",      "Perplexity (lower = better)", True),
-        (axes[1], "rouge_l",         "ROUGE-L (higher = better)",   False),
+        (axes[1], "output_kl",       "Output KL vs FullKV (lower = better)", True),
     ]:
         plotted_methods = set()
         for point in pareto_data:
