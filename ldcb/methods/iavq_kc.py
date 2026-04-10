@@ -71,7 +71,7 @@ def _importance_weighted_kmeans(
         N = k
 
     probs = weights / weights.sum()
-    centroid_ids = torch.multinomial(probs, k, replacement=False)
+    centroid_ids = torch.multinomial(probs, k, replacement=False).to(X.device)
     centroids = X[centroid_ids].clone().float()
 
     for _ in range(iters):
