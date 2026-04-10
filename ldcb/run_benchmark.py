@@ -8,7 +8,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
 from ldcb.methods.fullkv import FullKVMethod
 from ldcb.methods.kivi import KIVIMethod
-from ldcb.methods.apkvc import APKVCMethod
+# from ldcb.methods.apkvc import APKVCMethod  # commented out — replaced by IAVQ-KC
+from ldcb.methods.iavq_kc import IAVQKCMethod
 from ldcb.methods.commvq import CommVQMethod
 from ldcb.tasks.continuation import run_continuation
 from ldcb.tasks.reasoning import run_reasoning
@@ -311,38 +312,33 @@ def main():
     else:
         print("[APKVC] Skipping calibration (--skip_calibration). Using random codebooks.")
 
-    # ---- Define methods (APKVC gets calibration_path if available) ----
+    # ---- Define methods ----
     kivi_offload = getattr(args, "low_memory", False)
-    apkvc_extra = {
-        "calibration_path": calibration_path,
-        "prefill_compression": args.apkvc_prefill_compression,
-        "codebook_structure": args.apkvc_codebook_structure,
-        "enable_code_attention_lookup": args.apkvc_enable_code_attention_lookup,
-    } if calibration_path else {
-        "prefill_compression": args.apkvc_prefill_compression,
-        "codebook_structure": args.apkvc_codebook_structure,
-        "enable_code_attention_lookup": args.apkvc_enable_code_attention_lookup,
-    }
 
     methods = {
-        "FullKV":   FullKVMethod(),
+        "FullKV":    FullKVMethod(),
         "KIVI-int4": KIVIMethod(bits=4, group_size=32, residual_length=128,
                                 cpu_offload_quant=kivi_offload),
-        # APKVC with CommVQ-inspired unconstrained codebooks.
-        # Defaults: vq prefill, code-attention lookup, em_closed_form training.
-        # All controlled by CLI flags — pass --apkvc_prefill_compression / etc. to change.
-        #
-        # NOTE: The official CommVQ (CommVQ/commvq/) requires model-specific
-        # pre-trained codebook .pt files (e.g. Llama-3.1-8B-Instruct-CommVQ-1bit-codebook/).
-        # Those files do not exist for Llama-2-7B, so CommVQ cannot be added to the
-        # benchmark without first running its training pipeline on Llama-2-7B data.
-        "APKVC": APKVCMethod(**{
-            **apkvc_extra,
-            "predictor_type":               "identity",
-            "codebook_structure":           "unconstrained",
-            "prefill_compression":          args.apkvc_prefill_compression,
-            "enable_code_attention_lookup": args.apkvc_enable_code_attention_lookup,
-        }),
+        # IAVQ-KC: Importance-Aware Vector Quantization Key Cache.
+        # No offline calibration needed — codebook is built online from each
+        # prompt's own prefill attention statistics.
+        # See IAVQ_KC_design.md for the full design specification.
+        "IAVQ-KC": IAVQKCMethod(
+            codebook_size=256,        # A — total centroids, split evenly across layers
+            recency_window=64,        # R — last R decode tokens stored as full fp16
+            importance_anchors=128,   # M — top-M old tokens kept as full fp16
+            kmeans_iters=3,
+            update_strategy="recency_gated",
+            update_importance_during_decode=False,
+        ),
+        # ----- APKVC (commented out — replaced by IAVQ-KC) -----
+        # "APKVC": APKVCMethod(**{
+        #     **apkvc_extra,
+        #     "predictor_type":               "identity",
+        #     "codebook_structure":           "unconstrained",
+        #     "prefill_compression":          args.apkvc_prefill_compression,
+        #     "enable_code_attention_lookup": args.apkvc_enable_code_attention_lookup,
+        # }),
     }
 
     # CommVQ: only included when --add_commvq is set.
