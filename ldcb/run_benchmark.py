@@ -1,6 +1,7 @@
 import gc
 import json
 import os
+import subprocess
 import torch
 import argparse
 from datetime import datetime
@@ -184,6 +185,14 @@ def main():
     parser.add_argument("--output_dir", type=str, default="ldcb/results")
     parser.add_argument("--device_map", type=str, default="auto")
     parser.add_argument("--tasks",      type=str, default="continuation,reasoning,multiturn")
+    parser.add_argument("--longbench_steps", type=int, default=-1,
+                        help="Max LongBench examples per dataset (forwarded to run_longbench.py --steps).")
+    parser.add_argument("--longbench_max_datasets", type=int, default=-1,
+                        help="Max number of LongBench datasets (forwarded to run_longbench.py --max_datasets).")
+    parser.add_argument("--longbench_dataset", type=str, default="all",
+                        help="LongBench dataset name or 'all'.")
+    parser.add_argument("--longbench_eval_batch_size", type=int, default=1,
+                        help="Batch size for LongBench prediction run.")
     parser.add_argument("--attn_implementation", type=str, default=None,
                         choices=["eager", "sdpa", "flash_attention_2"],
                         help="Attention backend. Defaults to 'eager' (required for IAVQ-KC "
@@ -406,7 +415,7 @@ def main():
                     "method":           name,
                     "compression_ratio": r.get("final_compression_ratio", {}).get("mean", 1.0),
                     "perplexity":        r.get("base_ppl",  {}).get("mean", float("nan")),
-                    "rouge_l":           r.get("rouge_l",   {}).get("mean", float("nan")),
+                    "output_kl":         r.get("output_kl", {}).get("mean", float("nan")),
                     "config_label":      name,
                 })
             plot2_pareto_frontier(
@@ -420,19 +429,107 @@ def main():
                 save_path=os.path.join(args.output_dir, f"plot3_vram_{timestamp}.png"),
             )
 
+    def run_longbench_comparison(method_name: str):
+        """
+        Run existing LongBench pipeline for a method (when supported) and return summary.
+        """
+        method_map = {
+            "FullKV": ("fullkv", None),
+            "KIVI-int4": ("fullkv", {"quant_method": "kivi", "nbits": "4"}),
+        }
+        if method_name not in method_map:
+            return {"status": "skipped", "reason": "not_supported_by_run_longbench"}
+
+        lb_method, extra = method_map[method_name]
+        model_basename = args.model_id.split("/")[-1]
+        lb_save_root = os.path.join(args.output_dir, f"longbench_{method_name.lower().replace('-', '_')}")
+        os.makedirs(lb_save_root, exist_ok=True)
+
+        cmd = [
+            "python", "run_longbench.py",
+            "--method", lb_method,
+            "--model_path", args.model_id,
+            "--dataset", args.longbench_dataset,
+            "--save_dir", lb_save_root,
+            "--eval_batch_size", str(args.longbench_eval_batch_size),
+            "--steps", str(args.longbench_steps),
+            "--max_datasets", str(args.longbench_max_datasets),
+            "--attn_implementation", attn_impl,
+            "--rank", "32",
+            "--layer_step", "8",
+        ]
+        if extra:
+            for k, v in extra.items():
+                cmd.extend([f"--{k}", str(v)])
+
+        print(f"[LongBench] Running {method_name}: {' '.join(cmd)}")
+        pred_run = subprocess.run(cmd, capture_output=True, text=True)
+        if pred_run.returncode != 0:
+            return {
+                "status": "failed",
+                "reason": "prediction_run_failed",
+                "stderr_tail": pred_run.stderr[-1200:],
+            }
+
+        result_dir = os.path.join(lb_save_root, f"{model_basename}_32_8_v4")
+        eval_cmd = [
+            "python", "eval.py",
+            "--results_dir", result_dir,
+            "--methods", lb_method,
+        ]
+        print(f"[LongBench] Evaluating {method_name}: {' '.join(eval_cmd)}")
+        eval_run = subprocess.run(eval_cmd, capture_output=True, text=True)
+        if eval_run.returncode != 0:
+            return {
+                "status": "failed",
+                "reason": "eval_failed",
+                "stderr_tail": eval_run.stderr[-1200:],
+            }
+
+        long_jsonl = os.path.join(result_dir, "results_long.jsonl")
+        if not os.path.isfile(long_jsonl):
+            return {"status": "failed", "reason": "results_long_jsonl_missing"}
+
+        entries = []
+        with open(long_jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except Exception:
+                    pass
+        if not entries:
+            return {"status": "failed", "reason": "no_eval_entries"}
+
+        scores = [e.get("score", 0.0) for e in entries if isinstance(e.get("score", None), (int, float))]
+        crs = [e.get("compression_ratio", 1.0) for e in entries if isinstance(e.get("compression_ratio", None), (int, float))]
+        mean_score = float(sum(scores) / len(scores)) if scores else float("nan")
+        mean_cr = float(sum(crs) / len(crs)) if crs else float("nan")
+        return {
+            "status": "ok",
+            "method_on_longbench": lb_method,
+            "datasets_evaluated": len(entries),
+            "mean_score": mean_score,
+            "mean_compression_ratio": mean_cr,
+            "results_dir": result_dir,
+        }
+
     # ----- Task 1: Continuation -----
     if "continuation" in selected_tasks:
         print("\n" + "=" * 60)
         print("TASK 1: Long continuation")
         print("=" * 60)
         task1_results = all_results.get("task1_continuation", {})
-        # Recover FullKV texts for ROUGE-L if we're resuming
+        # Recover FullKV texts for OutputKL/DeltaPPL baseline if we're resuming
         fullkv_texts = None
         for name, method in methods.items():
             if name in task1_results:
                 print(f"  Skipping {name} (already in results).")
                 if name == "FullKV":
-                    # Can't recover raw text from JSON — run FullKV without ROUGE-L ref
+                    # Can't recover raw text from JSON — run FullKV without
+                    # text-aligned baseline metrics
                     fullkv_texts = None
                 continue
             print(f"\nRunning {name}...")
@@ -497,6 +594,20 @@ def main():
             torch.cuda.empty_cache()
             gc.collect()
 
+    # ----- Task 4: LongBench (existing repo benchmark) -----
+    if "longbench" in selected_tasks:
+        print("\n" + "=" * 60)
+        print("TASK 4: LongBench comparison")
+        print("=" * 60)
+        task4_results = all_results.get("task4_longbench", {})
+        for name in methods.keys():
+            if name in task4_results:
+                print(f"  Skipping {name} (already in LongBench results).")
+                continue
+            task4_results[name] = run_longbench_comparison(name)
+            all_results["task4_longbench"] = task4_results
+            save_results_snapshot()
+
     results_path = save_results_snapshot()
     print(f"\nResults saved to {results_path}")
     render_available_plots()
@@ -513,13 +624,29 @@ def main():
         calib_note = f" [calibrated: {calibration_path}]" if calibration_path else " [random codebooks]"
         print(f"APKVC codebooks:{calib_note}")
         print()
-        print(f"{'Method':<20} {'Compression':>12} {'ROUGE-L vs FullKV':>18}")
-        print("-" * 52)
+        print(f"{'Method':<20} {'Compression':>12} {'OutputKL vs FullKV':>20} {'Text-ΔPPL':>12}")
+        print("-" * 70)
         for name, r in all_results["task1_continuation"].items():
             cr = r.get("final_compression_ratio", {}).get("mean", 0)
-            rl = r.get("rouge_l", {}).get("mean", float("nan"))
-            rl_str = f"{rl:.3f}" if rl == rl else "N/A (FullKV baseline)"
-            print(f"{name:<20} {cr:>12.3f} {rl_str:>18}")
+            ok = r.get("output_kl", {}).get("mean", float("nan"))
+            dp = r.get("delta_ppl", {}).get("mean", float("nan"))
+            ok_str = f"{ok:.6f}" if ok == ok else "N/A (FullKV baseline)"
+            dp_str = f"{dp:.3f}" if dp == dp else "N/A"
+            print(f"{name:<20} {cr:>12.3f} {ok_str:>20} {dp_str:>12}")
+
+    if "task4_longbench" in all_results:
+        print("\n" + "=" * 60)
+        print("SUMMARY — Task 4 (LongBench)")
+        print("=" * 60)
+        print(f"{'Method':<20} {'Status':>10} {'Score':>10} {'CR':>10}")
+        print("-" * 56)
+        for name, r in all_results["task4_longbench"].items():
+            status = r.get("status", "unknown")
+            sc = r.get("mean_score", float("nan"))
+            cr = r.get("mean_compression_ratio", float("nan"))
+            sc_str = f"{sc:.2f}" if sc == sc else "N/A"
+            cr_str = f"{cr:.3f}" if cr == cr else "N/A"
+            print(f"{name:<20} {status:>10} {sc_str:>10} {cr_str:>10}")
 
 
 if __name__ == "__main__":

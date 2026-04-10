@@ -2702,7 +2702,7 @@ def llama_flash_attn2_forward_HeadKV(
     return attn_output, attn_weights, past_key_value
 
 
-from transformers.models.llama.modeling_llama import StaticCache
+from transformers.cache_utils import StaticCache
 
 
 def _prepare_4d_causal_attention_mask_with_cache_position(
