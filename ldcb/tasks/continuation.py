@@ -93,8 +93,9 @@ def run_continuation(method, model, tokenizer, max_new_tokens=None,
 
         # Replace ROUGE with IAVQ-KC stack end metrics:
         #  - Level 4: Output distribution KL vs FullKV continuation
-        #  - Level 5 proxy: Delta perplexity estimated from KL via:
-        #      H(p,q) = H(p) + KL(p||q),  PPL = exp(H)
+        #  - Level 5 proxy: Delta perplexity (first-order) from KL:
+        #      delta_ppl ≈ ppl_ref * KL(p||q)
+        # This avoids exponential blow-ups when KL is large/off-distribution.
         if reference_texts is not None and prompt_idx < len(reference_texts):
             reference_text = reference_texts[prompt_idx]
             result["output_kl"] = compute_output_kl_on_text_pair(
@@ -103,9 +104,7 @@ def run_continuation(method, model, tokenizer, max_new_tokens=None,
             ref_ppl = result["base_ppl"]
             output_kl = result["output_kl"]
             if output_kl == output_kl:  # not NaN
-                # If KL is measured in nats, this estimates how much perplexity
-                # would increase under q relative to p.
-                result["delta_ppl"] = ref_ppl * (float(torch.exp(torch.tensor(output_kl))) - 1.0)
+                result["delta_ppl"] = ref_ppl * float(output_kl)
             else:
                 result["delta_ppl"] = float("nan")
 
