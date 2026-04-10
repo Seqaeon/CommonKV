@@ -607,48 +607,40 @@ def main():
             else:
                 print("  Skipping FullKV (already in results).")
 
-            # --- KIVI-int4 via run_longbench.py (method=kivi, monkeypatch) ---
-            if not _is_done(task4_results.get("KIVI-int4")):
-                print("\n[LongBench] Running KIVI-int4 via run_longbench.py ...")
-                ret = subprocess.run(_lb_cmd("kivi"), cwd=_REPO_ROOT)
-                if ret.returncode != 0:
-                    task4_results["KIVI-int4"] = {"status": "failed", "reason": "prediction_run_failed"}
-                    print("  [WARN] run_longbench.py exited non-zero for KIVI.")
+            # --- Custom methods via their own generate() loop ---
+            for custom_method in ["KIVI-int4", "IAVQ-KC", "CommVQ-2bit"]:
+                if custom_method not in methods:
+                    if not _is_done(task4_results.get(custom_method)):
+                        task4_results[custom_method] = {"status": "skipped", "reason": "not in methods list"}
+                    continue
+                    
+                if not _is_done(task4_results.get(custom_method)):
+                    print(f"\n[LongBench] Running {custom_method} (custom generate loop) ...")
+                    from ldcb.tasks.longbench import run_longbench_iavqkc
+                    try:
+                        run_longbench_iavqkc(
+                            method=methods[custom_method],
+                            model=model,
+                            tokenizer=tokenizer,
+                            datasets=lb_datasets,
+                            data_dir=args.lb_data_dir,
+                            save_dir=lb_pred_subdir,
+                            steps=args.lb_steps,
+                        )
+                        task4_results[custom_method] = {"status": "predictions_done"}
+                    except Exception as e:
+                        task4_results[custom_method] = {"status": "failed", "reason": str(e)}
+                        print(f"  [WARN] {custom_method} LongBench run failed: {e}")
+                    
+                    all_results["task4_longbench"] = task4_results
+                    save_results_snapshot()
                 else:
-                    task4_results["KIVI-int4"] = {"status": "predictions_done"}
-                all_results["task4_longbench"] = task4_results
-                save_results_snapshot()
-            else:
-                print("  Skipping KIVI-int4 (already in results).")
-
-            # --- IAVQ-KC via its own generate() loop ---
-            if not _is_done(task4_results.get("IAVQ-KC")) and "IAVQ-KC" in methods:
-                print("\n[LongBench] Running IAVQ-KC (custom generate loop) ...")
-                from ldcb.tasks.longbench import run_longbench_iavqkc
-                try:
-                    run_longbench_iavqkc(
-                        method=methods["IAVQ-KC"],
-                        model=model,
-                        tokenizer=tokenizer,
-                        datasets=lb_datasets,
-                        data_dir=args.lb_data_dir,
-                        save_dir=lb_pred_subdir,
-                        steps=args.lb_steps,
-                    )
-                    task4_results["IAVQ-KC"] = {"status": "predictions_done"}
-                except Exception as e:
-                    task4_results["IAVQ-KC"] = {"status": "failed", "reason": str(e)}
-                    print(f"  [WARN] IAVQ-KC LongBench run failed: {e}")
-                all_results["task4_longbench"] = task4_results
-                save_results_snapshot()
-            elif not _is_done(task4_results.get("IAVQ-KC")):
-                task4_results["IAVQ-KC"] = {"status": "skipped",
-                                             "reason": "not in methods list"}
+                    print(f"  Skipping {custom_method} (already in results).")
 
             # --- Score all methods with eval.py ---
             print("\n[LongBench] Scoring with eval.py ...")
             methods_to_score = ",".join([
-                n.replace("KIVI-int4", "kivi")  # match run_longbench output filename
+                n
                 for n, v in task4_results.items()
                 if isinstance(v, dict) and v.get("status") == "predictions_done"
             ])
