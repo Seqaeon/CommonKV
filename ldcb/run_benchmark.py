@@ -192,8 +192,11 @@ def main():
     # Memory-saving options
     parser.add_argument("--low_memory", action="store_true",
                         help="Enable all memory-saving options at once: 8-bit weights, "
-                             "KIVI CPU offload, reduced calibration (5×500), "
+                             "KIVI CPU offload, reduced calibration (5x500), "
                              "max 2000 continuation tokens")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from the most recent results JSON in output_dir. "
+                             "Methods already present in that file are skipped.")
     parser.add_argument("--load_in_8bit", action="store_true",
                         help="Quantize model weights to 8-bit with bitsandbytes")
     parser.add_argument("--load_in_4bit", action="store_true",
@@ -367,6 +370,23 @@ def main():
     all_results = {}
     selected_tasks = args.tasks.split(",")
 
+    # ---- Resume: load most recent results snapshot if --resume is set ----
+    if getattr(args, "resume", False):
+        existing_jsons = sorted(
+            [f for f in os.listdir(args.output_dir) if f.startswith("ldcb_") and f.endswith(".json")]
+        )
+        if existing_jsons:
+            resume_path = os.path.join(args.output_dir, existing_jsons[-1])
+            print(f"[RESUME] Loading previous results from: {resume_path}")
+            with open(resume_path) as f:
+                all_results = json.load(f)
+            # Print what's already done
+            for task_key, task_res in all_results.items():
+                done = list(task_res.keys())
+                print(f"  {task_key}: already done → {done}")
+        else:
+            print("[RESUME] No previous results found in output_dir — starting fresh.")
+
     def save_results_snapshot():
         results_path = os.path.join(args.output_dir, f"ldcb_{timestamp}.json")
         with open(results_path, "w") as f:
@@ -405,9 +425,16 @@ def main():
         print("\n" + "=" * 60)
         print("TASK 1: Long continuation")
         print("=" * 60)
-        task1_results = {}
+        task1_results = all_results.get("task1_continuation", {})
+        # Recover FullKV texts for ROUGE-L if we're resuming
         fullkv_texts = None
         for name, method in methods.items():
+            if name in task1_results:
+                print(f"  Skipping {name} (already in results).")
+                if name == "FullKV":
+                    # Can't recover raw text from JSON — run FullKV without ROUGE-L ref
+                    fullkv_texts = None
+                continue
             print(f"\nRunning {name}...")
             aggregated, gen_texts = run_continuation(
                 method, model, tokenizer,
@@ -428,8 +455,11 @@ def main():
         print("\n" + "=" * 60)
         print("TASK 2: Structured reasoning")
         print("=" * 60)
-        task2_results = {}
+        task2_results = all_results.get("task2_reasoning", {})
         for name, method in methods.items():
+            if name in task2_results:
+                print(f"  Skipping {name} (already in results).")
+                continue
             print(f"\nRunning {name}...")
             task2_results[name] = run_reasoning(method, model, tokenizer,
                                                 max_new_tokens=safe_reasoning_max)
@@ -444,8 +474,11 @@ def main():
         print("\n" + "=" * 60)
         print("TASK 3: Multi-turn simulation")
         print("=" * 60)
-        task3_results = {}
+        task3_results = all_results.get("task3_multiturn", {})
         for name, method in methods.items():
+            if name in task3_results:
+                print(f"  Skipping {name} (already in results).")
+                continue
             print(f"\nRunning {name}...")
             task3_results[name] = run_multiturn(method, model, tokenizer,
                                                 n_turns=safe_multiturn_turns)

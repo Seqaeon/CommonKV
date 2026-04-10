@@ -55,36 +55,38 @@ def _importance_weighted_kmeans(
     X: torch.Tensor, weights: torch.Tensor, k: int, iters: int = 3
 ) -> torch.Tensor:
     """
-    Importance-biased k-means on GPU/CPU.
+    Importance-biased k-means.
     X:       [N, D]
     weights: [N] float — attention column sums (importance scores)
-    Returns: centroids [k, D]
+    Returns: centroids [k, D] on the same device as input X.
+
+    Computation runs on CPU to avoid device-mismatch errors when the model is
+    sharded across multiple GPUs (device_map="auto"). The codebook is small
+    (<=1024x128 fp16 = 256KB) so this is negligible overhead.
     """
+    orig_device = X.device
+    X = X.detach().float().cpu()
+    weights = weights.detach().float().cpu().clamp(min=1e-8)
     N, D = X.shape
-    weights = weights.float().clamp(min=1e-8)
 
     if N <= k:
-        # Not enough distinct points — pad by repeating
         reps = (k + N - 1) // N
         X = X.repeat(reps, 1)[:k]
         weights = weights.repeat(reps)[:k]
         N = k
 
     probs = weights / weights.sum()
-    centroid_ids = torch.multinomial(probs, k, replacement=False).to(X.device)
-    centroids = X[centroid_ids].clone().float()
+    centroid_ids = torch.multinomial(probs, k, replacement=False)  # CPU->CPU, no mismatch
+    centroids = X[centroid_ids].clone()
 
     for _ in range(iters):
-        # E-step: assign each point to nearest centroid
-        # Use chunked cdist to avoid OOM on large T
         chunk = 4096
-        assignments = torch.empty(N, dtype=torch.long, device=X.device)
+        assignments = torch.empty(N, dtype=torch.long)
         for s in range(0, N, chunk):
             e = min(N, s + chunk)
-            d2 = torch.cdist(X[s:e].float(), centroids)  # [B, k]
+            d2 = torch.cdist(X[s:e], centroids)
             assignments[s:e] = d2.argmin(dim=1)
 
-        # M-step: importance-weighted centroid update
         new_centroids = torch.zeros_like(centroids)
         for c in range(k):
             mask = assignments == c
@@ -92,11 +94,12 @@ def _importance_weighted_kmeans(
                 new_centroids[c] = centroids[c]
                 continue
             w = weights[mask]
-            new_centroids[c] = (X[mask].float() * w.unsqueeze(1)).sum(0) / w.sum()
+            new_centroids[c] = (X[mask] * w.unsqueeze(1)).sum(0) / w.sum()
 
         centroids = new_centroids
 
-    return centroids.to(X.dtype)
+    return centroids.to(device=orig_device)
+
 
 
 # ---------------------------------------------------------------------------
