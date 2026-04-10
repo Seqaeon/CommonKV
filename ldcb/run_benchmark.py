@@ -234,6 +234,19 @@ def main():
                         help="Add CommVQ-2bit to the benchmark. Requires --model_id meta-llama/Llama-3.1-8B-Instruct.")
     parser.add_argument("--commvq_bits", type=int, default=2, choices=[1, 2],
                         help="CommVQ key quantization bits (default: 2).")
+    # LongBench (task4) options
+    parser.add_argument("--lb_data_dir", type=str, default="data/LongBench",
+                        help="Directory containing LongBench .jsonl files (one per dataset).")
+    parser.add_argument("--lb_save_dir", type=str, default=None,
+                        help="Directory to write run_longbench.py prediction files. "
+                             "Defaults to <output_dir>/longbench_preds.")
+    parser.add_argument("--lb_steps", type=int, default=-1,
+                        help="Max examples per dataset in LongBench (passed as --steps to "
+                             "run_longbench.py). -1 = unlimited.")
+    parser.add_argument("--lb_max_datasets", type=int, default=-1,
+                        help="Max number of LongBench datasets to evaluate. -1 = all 16.")
+    parser.add_argument("--lb_max_capacity", type=int, default=512,
+                        help="max_capacity_prompts passed to run_longbench.py for KIVI (default 512).")
     args = parser.parse_args()
 
     # Apply --low_memory defaults
@@ -497,6 +510,174 @@ def main():
 
             torch.cuda.empty_cache()
             gc.collect()
+
+    # ----- Task 4: LongBench -----
+    if "longbench" in selected_tasks:
+        import subprocess, sys
+
+        print("\n" + "=" * 60)
+        print("TASK 4: LongBench evaluation")
+        print("=" * 60)
+
+        lb_save_dir = args.lb_save_dir or os.path.join(args.output_dir, "longbench_preds")
+        os.makedirs(lb_save_dir, exist_ok=True)
+
+        # Build dataset list (mirrors run_longbench.py's hardcoded list, capped by --lb_max_datasets)
+        _all_lb_datasets = [
+            "narrativeqa", "qasper", "multifieldqa_en", "hotpotqa",
+            "2wikimqa", "musique", "gov_report", "qmsum", "multi_news",
+            "trec", "triviaqa", "samsum", "passage_count",
+            "passage_retrieval_en", "lcc", "repobench-p",
+        ]
+        lb_datasets = (
+            _all_lb_datasets[:args.lb_max_datasets]
+            if args.lb_max_datasets != -1
+            else _all_lb_datasets
+        )
+        # Filter to datasets for which data files actually exist
+        lb_datasets = [
+            d for d in lb_datasets
+            if os.path.exists(os.path.join(args.lb_data_dir, f"{d}.jsonl"))
+        ]
+        if not lb_datasets:
+            print(f"  [WARN] No LongBench .jsonl files found in {args.lb_data_dir}. "
+                  "Set --lb_data_dir to the folder containing narrativeqa.jsonl etc. "
+                  "Skipping task4.")
+        else:
+            task4_results = all_results.get("task4_longbench", {})
+            # Resolve model save-dir subdir name (matches run_longbench.py convention)
+            model_name = args.model_id.split("/")[-1]
+            lb_pred_subdir = os.path.join(
+                lb_save_dir,
+                f"{model_name}_512_2_v4",   # rank=512, layer_step=2 defaults
+            )
+            os.makedirs(lb_pred_subdir, exist_ok=True)
+
+            # Helper: build the base run_longbench.py subprocess command
+            # KIVI is invoked as --method kivi (monkeypatch); FullKV as --method FullKV
+            _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            def _lb_cmd(method_flag, extra_args=None):
+                cmd = [
+                    sys.executable, os.path.join(_REPO_ROOT, "run_longbench.py"),
+                    "--model_path",      args.model_id,
+                    "--method",          method_flag,
+                    "--dataset",         "all",
+                    "--save_dir",        lb_save_dir,
+                    "--attn_implementation", "eager",
+                    "--max_capacity_prompts", str(args.lb_max_capacity),
+                    "--steps",           str(args.lb_steps),
+                    "--max_datasets",    str(args.lb_max_datasets),
+                    "--eval_batch_size", "1",
+                ]
+                if extra_args:
+                    cmd += extra_args
+                return cmd
+
+            # --- FullKV via run_longbench.py ---
+            if "FullKV" not in task4_results:
+                print("\n[LongBench] Running FullKV via run_longbench.py ...")
+                ret = subprocess.run(_lb_cmd("FullKV"), cwd=_REPO_ROOT)
+                if ret.returncode != 0:
+                    task4_results["FullKV"] = {"status": "failed", "reason": "prediction_run_failed"}
+                    print("  [WARN] run_longbench.py exited non-zero for FullKV.")
+                else:
+                    task4_results["FullKV"] = {"status": "predictions_done"}
+                all_results["task4_longbench"] = task4_results
+                save_results_snapshot()
+            else:
+                print("  Skipping FullKV (already in results).")
+
+            # --- KIVI-int4 via run_longbench.py (method=kivi, monkeypatch) ---
+            if "KIVI-int4" not in task4_results:
+                print("\n[LongBench] Running KIVI-int4 via run_longbench.py ...")
+                ret = subprocess.run(_lb_cmd("kivi"), cwd=_REPO_ROOT)
+                if ret.returncode != 0:
+                    task4_results["KIVI-int4"] = {"status": "failed", "reason": "prediction_run_failed"}
+                    print("  [WARN] run_longbench.py exited non-zero for KIVI.")
+                else:
+                    task4_results["KIVI-int4"] = {"status": "predictions_done"}
+                all_results["task4_longbench"] = task4_results
+                save_results_snapshot()
+            else:
+                print("  Skipping KIVI-int4 (already in results).")
+
+            # --- IAVQ-KC via its own generate() loop ---
+            if "IAVQ-KC" not in task4_results and "IAVQ-KC" in methods:
+                print("\n[LongBench] Running IAVQ-KC (custom generate loop) ...")
+                from ldcb.tasks.longbench import run_longbench_iavqkc
+                try:
+                    run_longbench_iavqkc(
+                        method=methods["IAVQ-KC"],
+                        model=model,
+                        tokenizer=tokenizer,
+                        datasets=lb_datasets,
+                        data_dir=args.lb_data_dir,
+                        save_dir=lb_pred_subdir,
+                        steps=args.lb_steps,
+                    )
+                    task4_results["IAVQ-KC"] = {"status": "predictions_done"}
+                except Exception as e:
+                    task4_results["IAVQ-KC"] = {"status": "failed", "reason": str(e)}
+                    print(f"  [WARN] IAVQ-KC LongBench run failed: {e}")
+                all_results["task4_longbench"] = task4_results
+                save_results_snapshot()
+            elif "IAVQ-KC" not in task4_results:
+                task4_results["IAVQ-KC"] = {"status": "skipped",
+                                             "reason": "not in methods list"}
+
+            # --- Score all methods with eval.py ---
+            print("\n[LongBench] Scoring with eval.py ...")
+            methods_to_score = ",".join([
+                n.replace("KIVI-int4", "kivi")  # match run_longbench output filename
+                for n, v in task4_results.items()
+                if isinstance(v, dict) and v.get("status") == "predictions_done"
+            ])
+            if methods_to_score:
+                eval_cmd = [
+                    sys.executable, os.path.join(_REPO_ROOT, "eval.py"),
+                    "--results_dir", lb_pred_subdir,
+                    "--methods",     methods_to_score,
+                ]
+                eval_proc = subprocess.run(
+                    eval_cmd, cwd=_REPO_ROOT,
+                    capture_output=True, text=True,
+                )
+                if eval_proc.returncode != 0:
+                    print(f"  [WARN] eval.py failed:\n{eval_proc.stderr[-800:]}")
+                else:
+                    # Parse results.csv for a summary dict keyed by method
+                    results_csv = os.path.join(lb_pred_subdir, "results.csv")
+                    if os.path.exists(results_csv):
+                        import csv
+                        with open(results_csv) as f:
+                            reader = csv.DictReader(f)
+                            rows = list(reader)
+                        # Pivot: task4_results[method]["lb_scores"][dataset] = score
+                        for row in rows:
+                            dataset = row.get("dataset", "")
+                            for method_col, score_str in row.items():
+                                if method_col == "dataset":
+                                    continue
+                                # Remap kivi -> KIVI-int4
+                                m = "KIVI-int4" if method_col.lower() == "kivi" else method_col
+                                if m not in task4_results:
+                                    task4_results[m] = {}
+                                task4_results[m].setdefault("lb_scores", {})[dataset] = (
+                                    float(score_str) if score_str not in ("", "-1") else None
+                                )
+                        # Compute mean score per method
+                        for m in list(task4_results.keys()):
+                            scores = task4_results[m].get("lb_scores", {})
+                            valid = [v for v in scores.values() if v is not None and v >= 0]
+                            if valid:
+                                task4_results[m]["lb_mean_score"] = round(sum(valid) / len(valid), 2)
+                        print("\n[LongBench] Mean scores:")
+                        for m, v in task4_results.items():
+                            if "lb_mean_score" in v:
+                                print(f"  {m}: {v['lb_mean_score']:.2f}")
+
+            all_results["task4_longbench"] = task4_results
+            save_results_snapshot()
 
     results_path = save_results_snapshot()
     print(f"\nResults saved to {results_path}")
