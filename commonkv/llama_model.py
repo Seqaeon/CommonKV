@@ -2779,7 +2779,7 @@ def prepare_inputs_for_generation_llama_new(
         use_cache=True,
         **kwargs,
 ):
-    if not isinstance(past_key_values, tuple):
+    if past_key_values is not None and not isinstance(past_key_values, tuple):
         if len(past_key_values.key_cache) == 0:
             for layer in self.model.layers:
                 layer.self_attn.kv_seq_len = 0
