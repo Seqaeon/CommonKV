@@ -2780,7 +2780,15 @@ def prepare_inputs_for_generation_llama_new(
         **kwargs,
 ):
     if past_key_values is not None and not isinstance(past_key_values, tuple):
-        if len(past_key_values.key_cache) == 0:
+        # Support Transformers versions where DynamicCache has no key_cache attribute
+        if hasattr(past_key_values, "get_seq_length"):
+            is_empty_cache = (past_key_values.get_seq_length() == 0)
+        elif hasattr(past_key_values, "key_cache"):
+            is_empty_cache = (len(past_key_values.key_cache) == 0)
+        else:
+            is_empty_cache = False
+
+        if is_empty_cache:
             for layer in self.model.layers:
                 layer.self_attn.kv_seq_len = 0
 
