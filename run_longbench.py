@@ -333,7 +333,7 @@ def main(args):
                 model.model.layers[i].self_attn.config.residual_norm_threshold_K = args.apkvc_residual_norm_threshold_K
                 model.model.layers[i].self_attn.config.residual_norm_threshold_V = args.apkvc_residual_norm_threshold_V
 
-        if args.method.lower() not in ["fullkv", "ours", "commonkv", "apkvc", "custom"] :
+        if args.method.lower() not in ["fullkv", "ours", "commonkv", "apkvc", "custom", "kivi"] :
             if args.method.lower() in ["snapkv","pyramidkv","h2o","cam", "l2norm", "adakv", "headkv", "think", "palu", "minicache"]:
                 window_sizes = args.window_size if args.window_size is not None else 8
             elif args.method.lower() in ["streamingllm"]:
