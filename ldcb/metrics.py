@@ -138,6 +138,43 @@ def compute_rouge_l(hypothesis: str, reference: str) -> float:
     return scores["rougeL"].fmeasure
 
 
+def output_distribution_kl(logits_full: torch.Tensor, logits_compressed: torch.Tensor,
+                           temperature: float = 1.0, eps: float = 1e-9) -> float:
+    """
+    Level-4 metric from IAVQ_KC_metrics.md:
+    mean KL( p_full || p_compressed ) over sequence positions.
+    """
+    p_full = torch.softmax(logits_full / temperature, dim=-1)
+    p_comp = torch.softmax(logits_compressed / temperature, dim=-1)
+    kl = (p_full * (torch.log(p_full + eps) - torch.log(p_comp + eps))).sum(dim=-1)
+    return kl.mean().item()
+
+
+def compute_output_kl_on_text_pair(model, tokenizer, reference_text: str,
+                                   compressed_text: str, max_tokens: int = 1024) -> float:
+    """
+    Practical benchmark approximation of Level-4 OutputKL.
+    We compare output distributions under teacher forcing on:
+      - FullKV reference continuation text
+      - Compressed-method continuation text
+    aligned to the same usable length.
+    """
+    ref_ids = tokenizer(reference_text, return_tensors="pt").input_ids.to(model.device)
+    cmp_ids = tokenizer(compressed_text, return_tensors="pt").input_ids.to(model.device)
+
+    usable = min(ref_ids.shape[1], cmp_ids.shape[1], max_tokens)
+    if usable < 2:
+        return float("nan")
+
+    ref_ids = ref_ids[:, :usable]
+    cmp_ids = cmp_ids[:, :usable]
+
+    with torch.no_grad():
+        ref_logits = model(ref_ids).logits[:, :-1, :]
+        cmp_logits = model(cmp_ids).logits[:, :-1, :]
+    return output_distribution_kl(ref_logits, cmp_logits)
+
+
 def compute_compression_ratio(compressed_bytes: int, fullkv_bytes: int) -> float:
     return compressed_bytes / fullkv_bytes
 

@@ -406,7 +406,7 @@ def main():
                     "method":           name,
                     "compression_ratio": r.get("final_compression_ratio", {}).get("mean", 1.0),
                     "perplexity":        r.get("base_ppl",  {}).get("mean", float("nan")),
-                    "rouge_l":           r.get("rouge_l",   {}).get("mean", float("nan")),
+                    "output_kl":         r.get("output_kl", {}).get("mean", float("nan")),
                     "config_label":      name,
                 })
             plot2_pareto_frontier(
@@ -426,13 +426,14 @@ def main():
         print("TASK 1: Long continuation")
         print("=" * 60)
         task1_results = all_results.get("task1_continuation", {})
-        # Recover FullKV texts for ROUGE-L if we're resuming
+        # Recover FullKV texts for OutputKL/DeltaPPL baseline if we're resuming
         fullkv_texts = None
         for name, method in methods.items():
             if name in task1_results:
                 print(f"  Skipping {name} (already in results).")
                 if name == "FullKV":
-                    # Can't recover raw text from JSON — run FullKV without ROUGE-L ref
+                    # Can't recover raw text from JSON — run FullKV without
+                    # text-aligned baseline metrics
                     fullkv_texts = None
                 continue
             print(f"\nRunning {name}...")
@@ -513,13 +514,15 @@ def main():
         calib_note = f" [calibrated: {calibration_path}]" if calibration_path else " [random codebooks]"
         print(f"APKVC codebooks:{calib_note}")
         print()
-        print(f"{'Method':<20} {'Compression':>12} {'ROUGE-L vs FullKV':>18}")
-        print("-" * 52)
+        print(f"{'Method':<20} {'Compression':>12} {'OutputKL vs FullKV':>20} {'DeltaPPL':>12}")
+        print("-" * 70)
         for name, r in all_results["task1_continuation"].items():
             cr = r.get("final_compression_ratio", {}).get("mean", 0)
-            rl = r.get("rouge_l", {}).get("mean", float("nan"))
-            rl_str = f"{rl:.3f}" if rl == rl else "N/A (FullKV baseline)"
-            print(f"{name:<20} {cr:>12.3f} {rl_str:>18}")
+            ok = r.get("output_kl", {}).get("mean", float("nan"))
+            dp = r.get("delta_ppl", {}).get("mean", float("nan"))
+            ok_str = f"{ok:.6f}" if ok == ok else "N/A (FullKV baseline)"
+            dp_str = f"{dp:.3f}" if dp == dp else "N/A"
+            print(f"{name:<20} {cr:>12.3f} {ok_str:>20} {dp_str:>12}")
 
 
 if __name__ == "__main__":
