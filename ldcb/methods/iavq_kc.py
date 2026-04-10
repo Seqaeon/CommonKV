@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 from .base import KVCacheMethod, CacheState
+from ldcb.utils import get_kv_iterator
 
 
 # ---------------------------------------------------------------------------
@@ -455,7 +456,7 @@ class IAVQKCMethod(KVCacheMethod):
 
         # Build per-layer states
         layer_states: list[_LayerState] = []
-        for l, (K_l, V_l) in enumerate(prefill_out.past_key_values):
+        for l, (K_l, V_l) in get_kv_iterator(prefill_out.past_key_values):
             # K_l, V_l: [B, H, T, D]
             state = self._build_layer_state(
                 K_l, V_l, importance, l, n_layers, dtype
@@ -501,7 +502,7 @@ class IAVQKCMethod(KVCacheMethod):
                 # Extract new K/V (last position from output cache)
                 new_kvs = [
                     (K[:, :, -1:, :].clone(), V[:, :, -1:, :].clone())
-                    for K, V in out.past_key_values
+                    for _, (K, V) in get_kv_iterator(out.past_key_values)
                 ]
 
                 # Optional importance score update from decode attention

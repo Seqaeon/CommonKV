@@ -17,8 +17,9 @@ from ldcb.tasks.multiturn import run_multiturn
 from ldcb.plots import plot1_compression_vs_length, plot2_pareto_frontier, plot3_vram_over_turns
 
 
-def load_model(model_id, device_map="auto", load_in_8bit=False, load_in_4bit=False):
-    print(f"Loading model {model_id} (device_map={device_map})...")
+def load_model(model_id, device_map="auto", load_in_8bit=False, load_in_4bit=False,
+               attn_implementation="eager"):
+    print(f"Loading model {model_id} (device_map={device_map}, attn={attn_implementation})...")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     bnb_config = None
     if load_in_4bit:
@@ -38,6 +39,7 @@ def load_model(model_id, device_map="auto", load_in_8bit=False, load_in_4bit=Fal
         torch_dtype=torch.float16 if bnb_config is None else None,
         device_map=device_map,
         trust_remote_code=True,
+        attn_implementation=attn_implementation,
     )
     model.eval()
     return model, tokenizer
@@ -182,6 +184,11 @@ def main():
     parser.add_argument("--output_dir", type=str, default="ldcb/results")
     parser.add_argument("--device_map", type=str, default="auto")
     parser.add_argument("--tasks",      type=str, default="continuation,reasoning,multiturn")
+    parser.add_argument("--attn_implementation", type=str, default=None,
+                        choices=["eager", "sdpa", "flash_attention_2"],
+                        help="Attention backend. Defaults to 'eager' (required for IAVQ-KC "
+                             "which needs output_attentions=True at prefill). Use 'sdpa' or "
+                             "'flash_attention_2' only if you are not running IAVQ-KC.")
     # Memory-saving options
     parser.add_argument("--low_memory", action="store_true",
                         help="Enable all memory-saving options at once: 8-bit weights, "
@@ -245,9 +252,12 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    # Default to eager if not explicitly set — required for IAVQ-KC (output_attentions=True)
+    attn_impl = args.attn_implementation or "eager"
     model, tokenizer = load_model(args.model_id, args.device_map,
                                    load_in_8bit=getattr(args, "load_in_8bit", False),
-                                   load_in_4bit=getattr(args, "load_in_4bit", False))
+                                   load_in_4bit=getattr(args, "load_in_4bit", False),
+                                   attn_implementation=attn_impl)
 
     max_pos = getattr(model.config, "max_position_embeddings", 2048)
     print(f"Model capacity: {max_pos} tokens")
