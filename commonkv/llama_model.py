@@ -2702,7 +2702,17 @@ def llama_flash_attn2_forward_HeadKV(
     return attn_output, attn_weights, past_key_value
 
 
-from transformers.models.llama.modeling_llama import StaticCache
+try:
+    from transformers.models.llama.modeling_llama import StaticCache
+except ImportError:
+    try:
+        from transformers.cache_utils import StaticCache
+    except ImportError:
+        # Transformers version has neither location; define a stub so the
+        # isinstance(past_key_values, StaticCache) check below is always False.
+        class StaticCache:  # type: ignore[no-redef]
+            pass
+
 
 
 def _prepare_4d_causal_attention_mask_with_cache_position(

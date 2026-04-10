@@ -2,7 +2,7 @@ import torch
 from ..utils import get_total_vram_gb
 from ..metrics import (
     compute_perplexity_on_reference,
-    compute_output_kl_on_text_pair,
+    compute_text_ppl_delta,
     aggregate_task_results,
 )
 
@@ -36,7 +36,7 @@ def run_continuation(method, model, tokenizer, max_new_tokens=None,
     ----------
     reference_texts : list[str] or None
         One generated string per prompt from FullKV, used as the baseline for
-        OutputKL and DeltaPPL metrics. Pass None for the FullKV run itself.
+        delta-PPL. Pass None for the FullKV run itself.
 
     Returns
     -------
@@ -45,18 +45,31 @@ def run_continuation(method, model, tokenizer, max_new_tokens=None,
         in the same order as CONTINUATION_PROMPTS.  The caller should
         capture this from the FullKV run and pass it as reference_texts
         for all subsequent methods.
+
+    Metrics (per-prompt, then aggregated across prompts)
+    -------
+    base_ppl     : WikiText-2 test-set PPL — sanity check, should be ~identical
+                   for all methods (no generation cache involved).
+    gen_ppl      : Model's teacher-forcing PPL on *this method's* generated text.
+                   Measures how natural/predictable the output is.
+    gen_ppl_ref  : Same for the FullKV reference text (only when reference_texts
+                   is provided, i.e. not the FullKV run).
+    delta_ppl    : gen_ppl - gen_ppl_ref.
+                   ~0 = compression is transparent.  >2 = noticeable degradation.
+                   >5 = serious quality loss.  This is the correct Level-5 metric
+                   (see IAVQ_KC_metrics.md).  The previously-used formula
+                   base_ppl * (exp(output_kl) - 1) was wrong: it used KL computed
+                   between distributions on two *different* texts, giving ~11 nats
+                   of noise (≈ ln(vocab_size)), inflating delta_ppl into the millions.
     """
     all_results = []
     generated_texts = []
 
-    # Calculate limits based on model capacity if provided
     limit = max_new_tokens or MAX_NEW_TOKENS
-    # Filter and cap checkpoint steps
     active_steps = [s for s in CHECKPOINT_STEPS if s < limit]
     active_steps.append(limit)
 
     for prompt_idx, prompt in enumerate(CONTINUATION_PROMPTS):
-        # Tokenize and verify prompt is short
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids
         assert input_ids.shape[1] <= 128, \
             f"Prompt too long: {input_ids.shape[1]} tokens. Trim it."
@@ -82,8 +95,6 @@ def run_continuation(method, model, tokenizer, max_new_tokens=None,
             ],
             "final_compression_ratio": final_state.compressed_bytes / final_state.fullkv_bytes,
             "peak_vram_gb": get_total_vram_gb(),
-            # WikiText-2 reference perplexity — identical for all methods (same
-            # base model, no cache state involved).  Use as a sanity check.
             "base_ppl": compute_perplexity_on_reference(model, tokenizer, n_tokens=2048),
             "distortion_mean": float(torch.tensor(final_state.distortions).mean())
                                if final_state.distortions else 0.0,
@@ -91,23 +102,21 @@ def run_continuation(method, model, tokenizer, max_new_tokens=None,
                               if final_state.distortions else 0.0,
         }
 
-        # Replace ROUGE with IAVQ-KC stack end metrics:
-        #  - Level 4: Output distribution KL vs FullKV continuation
-        #  - Level 5 proxy: Delta perplexity estimated from KL via:
-        #      H(p,q) = H(p) + KL(p||q),  PPL = exp(H)
         if reference_texts is not None and prompt_idx < len(reference_texts):
+            # Compressed method run: compare to FullKV reference text
             reference_text = reference_texts[prompt_idx]
-            result["output_kl"] = compute_output_kl_on_text_pair(
-                model, tokenizer, reference_text, generated_text
+            gen_ppl_comp, gen_ppl_ref, delta_ppl = compute_text_ppl_delta(
+                model, tokenizer, generated_text, reference_text
             )
-            ref_ppl = result["base_ppl"]
-            output_kl = result["output_kl"]
-            if output_kl == output_kl:  # not NaN
-                # If KL is measured in nats, this estimates how much perplexity
-                # would increase under q relative to p.
-                result["delta_ppl"] = ref_ppl * (float(torch.exp(torch.tensor(output_kl))) - 1.0)
-            else:
-                result["delta_ppl"] = float("nan")
+            result["gen_ppl"]     = gen_ppl_comp
+            result["gen_ppl_ref"] = gen_ppl_ref
+            result["delta_ppl"]   = delta_ppl
+        else:
+            # FullKV run: just record its own gen_ppl as baseline reference
+            gen_ppl_self, _, _ = compute_text_ppl_delta(
+                model, tokenizer, generated_text, generated_text
+            )
+            result["gen_ppl"] = gen_ppl_self
 
         all_results.append(result)
 

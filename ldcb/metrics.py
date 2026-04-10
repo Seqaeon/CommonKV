@@ -150,29 +150,44 @@ def output_distribution_kl(logits_full: torch.Tensor, logits_compressed: torch.T
     return kl.mean().item()
 
 
-def compute_output_kl_on_text_pair(model, tokenizer, reference_text: str,
-                                   compressed_text: str, max_tokens: int = 1024) -> float:
+def compute_text_ppl_delta(
+    model, tokenizer,
+    compressed_text: str,
+    reference_text: str,
+    max_tokens: int = 1024,
+) -> tuple:
     """
-    Practical benchmark approximation of Level-4 OutputKL.
-    We compare output distributions under teacher forcing on:
-      - FullKV reference continuation text
-      - Compressed-method continuation text
-    aligned to the same usable length.
+    Practical Level-5 delta-PPL metric for the continuation task.
+
+    Computes the model's perplexity on each text under teacher-forcing
+    (fresh forward pass, no cached state from generation).
+
+    - ppl_compressed: how natural/predictable is the compressed method's output
+    - ppl_reference:  same for FullKV output on the same prompt
+    - delta_ppl = ppl_compressed - ppl_reference
+
+    Positive delta means compression causes the model to assign lower probability
+    to its own outputs relative to FullKV.  Values < 1.0 are excellent.
+    Values > 5.0 indicate output quality is substantially degraded.
+
+    This is the correct metric — unlike comparing teacher-forced logits on two
+    *different* texts (which gives KL ≈ ln(vocab_size) ≈ 11 nats of noise).
     """
-    ref_ids = tokenizer(reference_text, return_tensors="pt").input_ids.to(model.device)
-    cmp_ids = tokenizer(compressed_text, return_tensors="pt").input_ids.to(model.device)
+    def _ppl(text):
+        ids = tokenizer(text, return_tensors="pt").input_ids.to(model.device)
+        if ids.shape[1] < 2:
+            return float("nan")
+        ids = ids[:, :max_tokens]
+        chunk = ids
+        labels = chunk.clone()
+        with torch.no_grad():
+            loss = model(chunk, labels=labels).loss  # mean NLL per token
+        return torch.exp(loss).item()
 
-    usable = min(ref_ids.shape[1], cmp_ids.shape[1], max_tokens)
-    if usable < 2:
-        return float("nan")
-
-    ref_ids = ref_ids[:, :usable]
-    cmp_ids = cmp_ids[:, :usable]
-
-    with torch.no_grad():
-        ref_logits = model(ref_ids).logits[:, :-1, :]
-        cmp_logits = model(cmp_ids).logits[:, :-1, :]
-    return output_distribution_kl(ref_logits, cmp_logits)
+    ppl_comp = _ppl(compressed_text)
+    ppl_ref  = _ppl(reference_text)
+    delta    = (ppl_comp - ppl_ref) if (ppl_comp == ppl_comp and ppl_ref == ppl_ref) else float("nan")
+    return ppl_comp, ppl_ref, delta
 
 
 def compute_compression_ratio(compressed_bytes: int, fullkv_bytes: int) -> float:
