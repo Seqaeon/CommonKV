@@ -2,7 +2,6 @@ import torch
 from ..utils import get_total_vram_gb
 from ..metrics import (
     compute_perplexity_on_reference,
-    compute_perplexity,
     compute_output_kl_on_text_pair,
     aggregate_task_results,
 )
@@ -94,16 +93,21 @@ def run_continuation(method, model, tokenizer, max_new_tokens=None,
 
         # Replace ROUGE with IAVQ-KC stack end metrics:
         #  - Level 4: Output distribution KL vs FullKV continuation
-        #  - Level 5: Delta perplexity vs FullKV continuation
+        #  - Level 5 proxy: Delta perplexity estimated from KL via:
+        #      H(p,q) = H(p) + KL(p||q),  PPL = exp(H)
         if reference_texts is not None and prompt_idx < len(reference_texts):
             reference_text = reference_texts[prompt_idx]
             result["output_kl"] = compute_output_kl_on_text_pair(
                 model, tokenizer, reference_text, generated_text
             )
-            result["delta_ppl"] = (
-                compute_perplexity(model, tokenizer, generated_text)
-                - compute_perplexity(model, tokenizer, reference_text)
-            )
+            ref_ppl = result["base_ppl"]
+            output_kl = result["output_kl"]
+            if output_kl == output_kl:  # not NaN
+                # If KL is measured in nats, this estimates how much perplexity
+                # would increase under q relative to p.
+                result["delta_ppl"] = ref_ppl * (float(torch.exp(torch.tensor(output_kl))) - 1.0)
+            else:
+                result["delta_ppl"] = float("nan")
 
         all_results.append(result)
 
