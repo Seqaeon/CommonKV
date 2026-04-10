@@ -185,10 +185,11 @@ def main():
     parser.add_argument("--device_map", type=str, default="auto")
     parser.add_argument("--tasks",      type=str, default="continuation,reasoning,multiturn")
     parser.add_argument("--attn_implementation", type=str, default=None,
-                        choices=["eager", "sdpa", "flash_attention_2"],
+                        choices=["eager", "sdpa", "flash_attention_2", "flash_attention_3"],
                         help="Attention backend. Defaults to 'eager' (required for IAVQ-KC "
-                             "which needs output_attentions=True at prefill). Use 'sdpa' or "
-                             "'flash_attention_2' only if you are not running IAVQ-KC.")
+                             "which needs output_attentions=True at prefill). Use 'sdpa', "
+                             "'flash_attention_2', or 'flash_attention_3' only if you are "
+                             "not running IAVQ-KC.")
     # Memory-saving options
     parser.add_argument("--low_memory", action="store_true",
                         help="Enable all memory-saving options at once: 8-bit weights, "
@@ -268,7 +269,26 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Default to eager if not explicitly set — required for IAVQ-KC (output_attentions=True)
+    # ------------------------------------------------------------------
+    # Helper: decide whether a previously-saved result for a method
+    # counts as "done" and can be skipped by --resume.
+    # A result is NOT done if it has status="failed" or status="skipped"
+    # (so those methods are always retried on the next run).
+    # ------------------------------------------------------------------
+    def _is_done(result) -> bool:
+        if not result:          # missing or empty
+            return False
+        if isinstance(result, dict):
+            # Task-4-style status dicts
+            status = result.get("status", "")
+            if status in ("failed", "skipped"):
+                return False
+            # Task-4 predictions_done also counts as done
+            if status in ("predictions_done",):
+                return True
+        # Anything else (aggregated metric dict from tasks 1-3) counts as done
+        return True
+
     attn_impl = args.attn_implementation or "eager"
     model, tokenizer = load_model(args.model_id, args.device_map,
                                    load_in_8bit=getattr(args, "load_in_8bit", False),
@@ -442,7 +462,7 @@ def main():
         # Recover FullKV texts for OutputKL/DeltaPPL baseline if we're resuming
         fullkv_texts = None
         for name, method in methods.items():
-            if name in task1_results:
+            if _is_done(task1_results.get(name)):
                 print(f"  Skipping {name} (already in results).")
                 if name == "FullKV":
                     # Can't recover raw text from JSON — run FullKV without
@@ -474,7 +494,7 @@ def main():
         print("=" * 60)
         task2_results = all_results.get("task2_reasoning", {})
         for name, method in methods.items():
-            if name in task2_results:
+            if _is_done(task2_results.get(name)):
                 print(f"  Skipping {name} (already in results).")
                 continue
             print(f"\nRunning {name}...")
@@ -496,7 +516,7 @@ def main():
         print("=" * 60)
         task3_results = all_results.get("task3_multiturn", {})
         for name, method in methods.items():
-            if name in task3_results:
+            if _is_done(task3_results.get(name)):
                 print(f"  Skipping {name} (already in results).")
                 continue
             print(f"\nRunning {name}...")
@@ -574,7 +594,7 @@ def main():
                 return cmd
 
             # --- FullKV via run_longbench.py ---
-            if "FullKV" not in task4_results:
+            if not _is_done(task4_results.get("FullKV")):
                 print("\n[LongBench] Running FullKV via run_longbench.py ...")
                 ret = subprocess.run(_lb_cmd("FullKV"), cwd=_REPO_ROOT)
                 if ret.returncode != 0:
@@ -588,7 +608,7 @@ def main():
                 print("  Skipping FullKV (already in results).")
 
             # --- KIVI-int4 via run_longbench.py (method=kivi, monkeypatch) ---
-            if "KIVI-int4" not in task4_results:
+            if not _is_done(task4_results.get("KIVI-int4")):
                 print("\n[LongBench] Running KIVI-int4 via run_longbench.py ...")
                 ret = subprocess.run(_lb_cmd("kivi"), cwd=_REPO_ROOT)
                 if ret.returncode != 0:
@@ -602,7 +622,7 @@ def main():
                 print("  Skipping KIVI-int4 (already in results).")
 
             # --- IAVQ-KC via its own generate() loop ---
-            if "IAVQ-KC" not in task4_results and "IAVQ-KC" in methods:
+            if not _is_done(task4_results.get("IAVQ-KC")) and "IAVQ-KC" in methods:
                 print("\n[LongBench] Running IAVQ-KC (custom generate loop) ...")
                 from ldcb.tasks.longbench import run_longbench_iavqkc
                 try:
@@ -621,7 +641,7 @@ def main():
                     print(f"  [WARN] IAVQ-KC LongBench run failed: {e}")
                 all_results["task4_longbench"] = task4_results
                 save_results_snapshot()
-            elif "IAVQ-KC" not in task4_results:
+            elif not _is_done(task4_results.get("IAVQ-KC")):
                 task4_results["IAVQ-KC"] = {"status": "skipped",
                                              "reason": "not in methods list"}
 
