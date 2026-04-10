@@ -13,6 +13,12 @@ class CacheState:
     distortions: list = field(default_factory=list)  # per-step distortion values
     anchor_positions: list = field(default_factory=list)  # optional token positions for anchor diagnostics
 
+    @property
+    def compression_ratio(self) -> float:
+        if self.compressed_bytes == 0:
+            return 1.0
+        return self.fullkv_bytes / self.compressed_bytes
+
 
 class KVCacheMethod(ABC):
 
