@@ -677,16 +677,42 @@ def main():
                                 task4_results[m].setdefault("lb_scores", {})[dataset] = (
                                     float(score_str) if score_str not in ("", "-1") else None
                                 )
-                        # Compute mean score per method
+                        # Compute mean score and mean CR per method
+                        cr_csv = os.path.join(lb_pred_subdir, "compression_ratios.csv")
+                        cr_rows = []
+                        if os.path.exists(cr_csv):
+                            with open(cr_csv) as f:
+                                cr_rows = list(csv.DictReader(f))
+                        
+                        for row in cr_rows:
+                            dataset = row.get("dataset", "")
+                            for method_col, score_str in row.items():
+                                if method_col == "dataset":
+                                    continue
+                                m = "KIVI-int4" if method_col.lower() == "kivi" else method_col
+                                if m not in task4_results:
+                                    task4_results[m] = {}
+                                task4_results[m].setdefault("lb_crs", {})[dataset] = (
+                                    float(score_str) if score_str not in ("", "-1") else None
+                                )
+
                         for m in list(task4_results.keys()):
                             scores = task4_results[m].get("lb_scores", {})
-                            valid = [v for v in scores.values() if v is not None and v >= 0]
-                            if valid:
-                                task4_results[m]["lb_mean_score"] = round(sum(valid) / len(valid), 2)
+                            valid_s = [v for v in scores.values() if v is not None and v >= 0]
+                            if valid_s:
+                                task4_results[m]["lb_mean_score"] = round(sum(valid_s) / len(valid_s), 2)
+                                
+                            crs = task4_results[m].get("lb_crs", {})
+                            valid_cr = [v for v in crs.values() if v is not None and v >= 0]
+                            if valid_cr:
+                                task4_results[m]["lb_mean_cr"] = round(sum(valid_cr) / len(valid_cr), 4)
+
                         print("\n[LongBench] Mean scores:")
                         for m, v in task4_results.items():
                             if "lb_mean_score" in v:
-                                print(f"  {m}: {v['lb_mean_score']:.2f}")
+                                scr = v["lb_mean_score"]
+                                cr = v.get("lb_mean_cr", 1.0)
+                                print(f"  {m:12s} Score: {scr:5.2f}  |  CR: {cr:.3f}x")
 
             all_results["task4_longbench"] = task4_results
             save_results_snapshot()

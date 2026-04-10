@@ -116,11 +116,11 @@ class _LayerState:
         dtype: torch.dtype,
         P: int = 8,
     ):
-        self.codebook = codebook   # [m, D]
+        self.codebook = codebook   # [H, m, D]
         self.pca_basis = pca_basis # [P, D]
         self.dtype = dtype
         self.P = P
-        self.m = codebook.shape[0]
+        self.m = codebook.shape[1]
         self.device = codebook.device
 
         # Anchors: {position → [H, D]} full fp16
@@ -155,16 +155,16 @@ class _LayerState:
         k: [H, D]
         """
         H, D = k.shape
-        C = self.codebook.float()   # [m, D]
+        C = self.codebook.float()   # [H, m, D]
         B = self.pca_basis.float()  # [P, D]
 
         # Nearest centroid per head
-        dists = torch.cdist(k.float(), C)    # [H, m]
-        idx = dists.argmin(dim=1)            # [H]
+        dists = torch.cdist(k.float().unsqueeze(1), C)    # [H, 1, m]
+        idx = dists.squeeze(1).argmin(dim=1)              # [H]
 
         # Residual from centroid
-        centroids_h = C[idx]                 # [H, D]
-        residual = k.float() - centroids_h   # [H, D]
+        centroids_h = C[torch.arange(H), idx]             # [H, D]
+        residual = k.float() - centroids_h                # [H, D]
 
         # Project onto PCA basis: [H, P]
         proj = residual @ B.T                # [H, P]
@@ -188,7 +188,7 @@ class _LayerState:
         # Dequantize projections: [H, P]
         proj = proj_int8.float() * scale.float().unsqueeze(1)           # [H, P]
         # Reconstruct: centroid + proj @ B
-        centroids_h = self.codebook[idx.long()].float()                  # [H, D]
+        centroids_h = self.codebook[torch.arange(H), idx.long()].float() # [H, D]
         k_hat = centroids_h + proj @ self.pca_basis.float()              # [H, D]
         return k_hat.to(self.dtype)
 
@@ -313,22 +313,33 @@ class IAVQKCMethod(KVCacheMethod):
         dtype: torch.dtype,
     ) -> _LayerState:
         B, H, T, D = K_l.shape
-        m = max(4, self.A // max(num_layers, 1))    # centroids per layer
+        m = max(8, self.A)    # A centroids per head
 
         # ---- Importance-weighted codebook ----
-        # Pool keys across heads: [H*T, D]
-        K_pool = K_l[0].permute(1, 0, 2).reshape(H * T, D)
-        # Each position has the same importance across all heads
+        # Pool keys across heads: [H*T, D] - head-major
+        K_pool = K_l[0].reshape(H * T, D)
+        # Each position has importance w_pool: [H*T] - head-major
         w_pool = importance.unsqueeze(0).expand(H, -1).reshape(H * T)
 
-        codebook = _importance_weighted_kmeans(
-            K_pool, w_pool, k=m, iters=self.kmeans_iters
-        ).to(dtype)
+        codebooks = []
+        for h in range(H):
+            start = h * T
+            end = start + T
+            cb_h = _importance_weighted_kmeans(
+                K_pool[start:end], w_pool[start:end], k=m, iters=self.kmeans_iters
+            )
+            codebooks.append(cb_h)
+            
+        codebook = torch.stack(codebooks).to(dtype) # [H, m, D]
 
         # ---- PCA basis from prefill residuals ----
-        dists = torch.cdist(K_pool.float(), codebook.float())  # [H*T, m]
-        assign = dists.argmin(dim=1)                            # [H*T]
-        residuals = K_pool.float() - codebook[assign].float()  # [H*T, D]
+        k_h_T = K_pool.view(H, T, D)                           # [H, T, D]
+        dists = torch.cdist(k_h_T.float(), codebook.float())   # [H, T, m]
+        assign = dists.argmin(dim=2)                           # [H, T]
+        
+        # Gather centroids and compute residual
+        centroids = torch.gather(codebook, 1, assign.unsqueeze(2).expand(-1, -1, D)) # [H, T, D]
+        residuals = (k_h_T.float() - centroids.float()).view(H * T, D)
 
         try:
             _, _, Vt = torch.linalg.svd(residuals, full_matrices=False)
@@ -428,12 +439,12 @@ class IAVQKCMethod(KVCacheMethod):
         """Exponential moving average update of nearest centroid. k_new: [H, D]"""
         if self.update_strategy == "frozen":
             return
-        dists = torch.cdist(k_new.float(), state.codebook.float())  # [H, m]
-        idx = dists.argmin(dim=1)                                    # [H]
+        dists = torch.cdist(k_new.float().unsqueeze(1), state.codebook.float())  # [H, 1, m]
+        idx = dists.squeeze(1).argmin(dim=1)                                     # [H]
         a = self.alpha
         for h in range(k_new.shape[0]):
-            state.codebook[idx[h]] = (
-                (1 - a) * state.codebook[idx[h]] + a * k_new[h]
+            state.codebook[h, idx[h]] = (
+                (1 - a) * state.codebook[h, idx[h]] + a * k_new[h]
             ).to(state.dtype)
 
     # ------------------------------------------------------------------

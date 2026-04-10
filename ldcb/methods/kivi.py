@@ -106,7 +106,7 @@ def _dequant_K(K_code: torch.Tensor, scale: torch.Tensor, mn: torch.Tensor,
     K_int = _unpack_tensor(K_code, bits, pack_dim=2).to(torch.float32)  # [B, H, T, D]
     Kg = K_int.view(B, H, T // G, G, D)
     out = Kg * scale + mn
-    return out.view(B, H, T, D).half()
+    return out.view(B, H, T, D)#.half()
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +154,7 @@ def _dequant_V(V_code: torch.Tensor, scale: torch.Tensor, mn: torch.Tensor,
     V_int = _unpack_tensor(V_code, bits, pack_dim=3).to(torch.float32)   # [B, H, T, D]
     Vg = V_int.view(B, H, T, D // G, G)
     out = Vg * scale + mn
-    return out.view(B, H, T, D).half()
+    return out.view(B, H, T, D)#.half()
 
 
 # ---------------------------------------------------------------------------
