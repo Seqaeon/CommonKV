@@ -569,7 +569,7 @@ def main():
             model_name = args.model_id.split("/")[-1]
             lb_pred_subdir = os.path.join(
                 lb_save_dir,
-                f"{model_name}_512_2_v4",   # rank=512, layer_step=2 defaults
+                f"{model_name}_1024_2_v4",   # rank=1024, layer_step=2 defaults
             )
             os.makedirs(lb_pred_subdir, exist_ok=True)
 
