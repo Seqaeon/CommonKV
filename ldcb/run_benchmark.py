@@ -444,11 +444,14 @@ def main():
             task1_results[name] = aggregated
             if name == "FullKV":
                 fullkv_texts = gen_texts
+            
+            # Save incrementally after each method
+            all_results["task1_continuation"] = task1_results
+            save_results_snapshot()
+            render_available_plots()
+
             torch.cuda.empty_cache()
             gc.collect()
-        all_results["task1_continuation"] = task1_results
-        save_results_snapshot()
-        render_available_plots()
 
     # ----- Task 2: Reasoning -----
     if "reasoning" in selected_tasks:
@@ -463,11 +466,14 @@ def main():
             print(f"\nRunning {name}...")
             task2_results[name] = run_reasoning(method, model, tokenizer,
                                                 max_new_tokens=safe_reasoning_max)
+            
+            # Save incrementally after each method
+            all_results["task2_reasoning"] = task2_results
+            save_results_snapshot()
+            render_available_plots()
+
             torch.cuda.empty_cache()
             gc.collect()
-        all_results["task2_reasoning"] = task2_results
-        save_results_snapshot()
-        render_available_plots()
 
     # ----- Task 3: Multi-turn -----
     if "multiturn" in selected_tasks:
@@ -482,11 +488,14 @@ def main():
             print(f"\nRunning {name}...")
             task3_results[name] = run_multiturn(method, model, tokenizer,
                                                 n_turns=safe_multiturn_turns)
+            
+            # Save incrementally after each method
+            all_results["task3_multiturn"] = task3_results
+            save_results_snapshot()
+            render_available_plots()
+
             torch.cuda.empty_cache()
             gc.collect()
-        all_results["task3_multiturn"] = task3_results
-        save_results_snapshot()
-        render_available_plots()
 
     results_path = save_results_snapshot()
     print(f"\nResults saved to {results_path}")

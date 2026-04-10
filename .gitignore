@@ -5,6 +5,7 @@ data.zip
 # Results
 results_long_bench/
 results_ruler/
+ldcb/results/
 
 # Python
 __pycache__/
