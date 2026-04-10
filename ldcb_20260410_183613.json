@@ -1,0 +1,18 @@
+{
+  "task4_longbench": {
+    "FullKV": {
+      "status": "failed",
+      "reason": "eval_failed",
+      "stderr_tail": "Traceback (most recent call last):\n  File \"/content/CommonKV/eval.py\", line 7, in <module>\n    from metrics import (\nModuleNotFoundError: No module named 'metrics'\n"
+    },
+    "KIVI-int4": {
+      "status": "failed",
+      "reason": "prediction_run_failed",
+      "stderr_tail": "1/291 [00:04<00:00, 67.87it/s, Materializing param=model.norm.weight]\n\n  0%|          | 0/200 [00:00<?, ?it/s]The following generation flags are not valid and may be ignored: ['top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more details.\nSetting `pad_token_id` to `eos_token_id`:128009 for open-end generation.\n\n  0%|          | 0/200 [00:00<?, ?it/s]\nTraceback (most recent call last):\n  File \"/content/CommonKV/run_longbench.py\", line 808, in <module>\n    main(args)\n  File \"/content/CommonKV/run_longbench.py\", line 404, in main\n    output = model.generate(\n             ^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py\", line 124, in decorate_context\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/transformers/generation/utils.py\", line 2632, in generate\n    self._prepare_cache_for_generation(\n  File \"/usr/local/lib/python3.12/dist-packages/transformers/generation/utils.py\", line 2032, in _prepare_cache_for_generation\n    raise ImportError(\nImportError: You need to install `HQQ` in order to use KV cache quantization with HQQ backend. Please install it via  with `pip install hqq`\n"
+    },
+    "IAVQ-KC": {
+      "status": "skipped",
+      "reason": "not_supported_by_run_longbench"
+    }
+  }
+}

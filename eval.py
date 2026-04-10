@@ -1,8 +1,14 @@
 import os
+import sys
 import json
 import argparse
 import glob
 import numpy as np
+
+# Ensure metrics.py can be found regardless of the calling working directory
+_EVAL_DIR = os.path.dirname(os.path.abspath(__file__))
+if _EVAL_DIR not in sys.path:
+    sys.path.insert(0, _EVAL_DIR)
 
 from metrics import (
     qa_f1_score,

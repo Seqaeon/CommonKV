@@ -388,30 +388,40 @@ def main(args):
             apkvc_cache = HybridAPKVCCache(model.config, apkvc_kwargs=model.config.to_dict())
             tokenized_prompts["past_key_values"] = apkvc_cache
             
-        if args.quant_method == None:
+        if args.quant_method is None or args.quant_method.lower() == "kivi":
+            # KIVI is applied via replace_llama monkeypatch at model-load time.
+            # Using cache_implementation="quantized" (HQQ backend) is incorrect for KIVI
+            # and requires `pip install hqq`.  The plain generate path is correct here.
             output = model.generate(
                 **tokenized_prompts,
-                output_attentions = args.output_attentions,
+                output_attentions=args.output_attentions,
                 max_new_tokens=output_max_len,
                 num_beams=1,
                 do_sample=False,
                 temperature=1.0,
-                min_length=context_length+1,
+                min_length=context_length + 1,
                 eos_token_id=[tokenizer.eos_token_id],
-                # pad_token_id=[tokenizer.eos_token_id]
             )
         else:
+            # Other explicit quant backends (e.g. kvquant)
             output = model.generate(
                 **tokenized_prompts,
-                output_attentions = args.output_attentions,
+                output_attentions=args.output_attentions,
                 max_new_tokens=output_max_len,
                 num_beams=1,
                 do_sample=False,
                 temperature=1.0,
-                min_length=context_length+1,
+                min_length=context_length + 1,
                 eos_token_id=[tokenizer.eos_token_id],
                 cache_implementation="quantized",
-                cache_config={"nbits": args.nbits, "backend": "HQQ","device":"cuda","residual_length":output_max_len,"axis_key":1,"q_group_size":64},
+                cache_config={
+                    "nbits": args.nbits,
+                    "backend": "HQQ",
+                    "device": "cuda",
+                    "residual_length": output_max_len,
+                    "axis_key": 1,
+                    "q_group_size": 64,
+                },
             )
         end_time = time.time()
         latency = end_time - start_time
