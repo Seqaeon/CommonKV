@@ -143,6 +143,10 @@ class _LayerState:
         # min-heap: (score, pos) — min at top so we can pop worst importance anchor
         self._importance_heap: list = []
 
+        # Fast cache for decode loop (avoids O(T) rebuild per step)
+        self.K_cache: torch.Tensor | None = None  # [1, H, T, D]
+        self.V_cache: torch.Tensor | None = None  # [1, H, T, D]
+
     # ---- Codebook compression ----
 
     def assign_and_compress(self, k: torch.Tensor, pos: int) -> None:
@@ -366,6 +370,12 @@ class IAVQKCMethod(KVCacheMethod):
             state.add_value(V_l[:, :, t : t + 1, :], pos=t)
 
         state.importance_scores = importance.clone()
+
+        # Initialize fast caches
+        n_heads = K_l.shape[1]
+        head_dim = K_l.shape[3]
+        state.K_cache = state.reconstruct_full_keys(n_heads, head_dim, state.device)
+        state.V_cache = state.reconstruct_full_values(device=state.device)
         return state
 
     # ------------------------------------------------------------------
@@ -395,6 +405,10 @@ class IAVQKCMethod(KVCacheMethod):
                 k_evict = state.anchor_keys.pop(evict_pos)
                 state.anchor_ids.discard(evict_pos)
                 state.assign_and_compress(k_evict, evict_pos)
+                # Slice-update cache because its value changed!
+                H, D = k_evict.shape
+                k_hat = state.reconstruct_key(evict_pos, H, D)
+                state.K_cache[:, :, evict_pos:evict_pos+1, :] = k_hat.unsqueeze(0).unsqueeze(2)
             state.push_importance(aging_pos, imp_score)
             # aging_pos stays in anchor_ids
 
@@ -403,6 +417,10 @@ class IAVQKCMethod(KVCacheMethod):
             k_aging = state.anchor_keys.pop(aging_pos)
             state.anchor_ids.discard(aging_pos)
             state.assign_and_compress(k_aging, aging_pos)
+            # Slice-update cache because its value changed!
+            H, D = k_aging.shape
+            k_hat = state.reconstruct_key(aging_pos, H, D)
+            state.K_cache[:, :, aging_pos:aging_pos+1, :] = k_hat.unsqueeze(0).unsqueeze(2)
 
     def _soft_centroid_update(
         self, state: _LayerState, k_new: torch.Tensor
@@ -494,12 +512,7 @@ class IAVQKCMethod(KVCacheMethod):
                 # Reconstruct full KV cache for attention
                 hf_cache = DynamicCache()
                 for i, state in enumerate(layer_states):
-                    layer_device = state.device
-                    K_full = state.reconstruct_full_keys(
-                        n_heads, head_dim, layer_device
-                    )
-                    V_full = state.reconstruct_full_values(device=layer_device)
-                    hf_cache.update(K_full, V_full, i)
+                    hf_cache.update(state.K_cache, state.V_cache, i)
 
                 out = model(
                     next_token,
@@ -540,6 +553,10 @@ class IAVQKCMethod(KVCacheMethod):
                 for l, state in enumerate(layer_states):
                     nK, nV = new_kvs[l]
                     k_new = nK[0, :, 0, :]    # [H, D]
+
+                    # Append to fast caches directly (avoids O(T) rebuild)
+                    state.K_cache = torch.cat([state.K_cache, nK.to(state.device)], dim=2)
+                    state.V_cache = torch.cat([state.V_cache, nV.to(state.device)], dim=2)
 
                     # Store as recency anchor
                     state.anchor_keys[abs_pos] = k_new
