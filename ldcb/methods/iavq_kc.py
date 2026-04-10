@@ -121,6 +121,7 @@ class _LayerState:
         self.dtype = dtype
         self.P = P
         self.m = codebook.shape[0]
+        self.device = codebook.device
 
         # Anchors: {position → [H, D]} full fp16
         self.anchor_keys: dict[int, torch.Tensor] = {}
@@ -196,10 +197,12 @@ class _LayerState:
             K[i] = self.reconstruct_key(pos, H, D)
         return K.permute(1, 0, 2).unsqueeze(0)  # [1, H, T, D]
 
-    def reconstruct_full_values(self) -> torch.Tensor:
+    def reconstruct_full_values(self, device=None) -> torch.Tensor:
         """Reconstruct all stored values → [B, H, T, D]."""
+        if device is None:
+            device = self.device
         return torch.cat(
-            [_dequant_int8_per_token(u, s, z, self.dtype)
+            [_dequant_int8_per_token(u, s, z, self.dtype).to(device)
              for u, s, z in zip(self._val_uint8, self._val_scale, self._val_zero)],
             dim=2,
         )
@@ -491,8 +494,11 @@ class IAVQKCMethod(KVCacheMethod):
                 # Reconstruct full KV cache for attention
                 hf_cache = DynamicCache()
                 for i, state in enumerate(layer_states):
-                    K_full = state.reconstruct_full_keys(n_heads, head_dim, device)
-                    V_full = state.reconstruct_full_values()
+                    layer_device = state.device
+                    K_full = state.reconstruct_full_keys(
+                        n_heads, head_dim, layer_device
+                    )
+                    V_full = state.reconstruct_full_values(device=layer_device)
                     hf_cache.update(K_full, V_full, i)
 
                 out = model(
