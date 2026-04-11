@@ -14,6 +14,7 @@ from ldcb.methods.commvq import CommVQMethod
 from ldcb.tasks.continuation import run_continuation
 from ldcb.tasks.reasoning import run_reasoning
 from ldcb.tasks.multiturn import run_multiturn
+from ldcb.tasks.gsm8k import run_gsm8k
 from ldcb.plots import plot1_compression_vs_length, plot2_pareto_frontier, plot3_vram_over_turns
 
 
@@ -248,6 +249,13 @@ def main():
                         help="Max number of LongBench datasets to evaluate. -1 = all 16.")
     parser.add_argument("--lb_max_capacity", type=int, default=512,
                         help="max_capacity_prompts passed to run_longbench.py for KIVI (default 512).")
+    # GSM8K options
+    parser.add_argument("--gsm8k_shots", type=int, default=8,
+                        help="Number of few-shot examples to prepend in GSM8K (0-8, default 8).")
+    parser.add_argument("--gsm8k_steps", type=int, default=200,
+                        help="Number of GSM8K test examples to evaluate (default 200, -1 = all 1319).")
+    parser.add_argument("--gsm8k_max_new_tokens", type=int, default=256,
+                        help="Max new tokens per GSM8K example (default 256).")
     args = parser.parse_args()
 
     # Apply --low_memory defaults
@@ -717,10 +725,52 @@ def main():
             all_results["task4_longbench"] = task4_results
             save_results_snapshot()
 
+    # ----- Task 5: GSM8K -----
+    if "gsm8k" in selected_tasks:
+        print("\n" + "=" * 60)
+        print("TASK 5: GSM8K (Grade School Math)")
+        print("=" * 60)
+        task5_results = all_results.get("task5_gsm8k", {})
+        for name, method in methods.items():
+            if _is_done(task5_results.get(name)):
+                print(f"  Skipping {name} (already in results).")
+                continue
+            print(f"\nRunning {name} on GSM8K "
+                  f"({args.gsm8k_shots}-shot, {args.gsm8k_steps} examples)...")
+            try:
+                task5_results[name] = run_gsm8k(
+                    method=method,
+                    model=model,
+                    tokenizer=tokenizer,
+                    n_shots=args.gsm8k_shots,
+                    steps=args.gsm8k_steps,
+                    max_new_tokens=args.gsm8k_max_new_tokens,
+                )
+            except Exception as e:
+                task5_results[name] = {"status": "failed", "reason": str(e)}
+                print(f"  [WARN] GSM8K failed for {name}: {e}")
+
+            all_results["task5_gsm8k"] = task5_results
+            save_results_snapshot()
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        if task5_results:
+            print("\n[GSM8K] Results:")
+            print(f"  {'Method':<14} {'Accuracy':>10}  {'CR':>8}  {'TPS':>8}")
+            print("  " + "-" * 46)
+            for m, r in task5_results.items():
+                if isinstance(r, dict) and "accuracy" in r:
+                    acc = r["accuracy"]
+                    cr  = r.get("mean_compression_ratio", 1.0)
+                    tps = r.get("mean_tps", 0.0)
+                    print(f"  {m:<14} {acc:>9.2f}%  {cr:>7.3f}x  {tps:>7.1f}")
+
     results_path = save_results_snapshot()
     print(f"\nResults saved to {results_path}")
     render_available_plots()
     print("Plots saved to", args.output_dir)
+
 
     # ----- Summary Table -----
     if "task1_continuation" in all_results:
