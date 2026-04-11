@@ -24,9 +24,30 @@ from ldcb.utils import get_kv_iterator
 
 
 # ---------------------------------------------------------------------------
-# Bit-packing helpers — mirrors pack_tensor / unpack_tensor from new_pack.py
-# but without the Triton dependency.
+# Triton-accelerated bit-packing (from KIVI/quant/new_pack.py)
+# Falls back to pure-PyTorch when Triton is unavailable or op is on CPU.
 # ---------------------------------------------------------------------------
+
+try:
+    import sys as _sys
+    import os as _os
+    _kivi_quant_dir = _os.path.join(
+        _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))),
+        "KIVI", "quant"
+    )
+    if _kivi_quant_dir not in _sys.path:
+        _sys.path.insert(0, _kivi_quant_dir)
+    from new_pack import (
+        quant_and_pack_kcache as _triton_quant_K,
+        quant_and_pack_vcache as _triton_quant_V,
+        unpack_and_dequant_kcache as _triton_dequant_K,
+        unpack_and_dequant_vcache as _triton_dequant_V,
+    )
+    _HAS_TRITON_KIVI = True
+    print("[KIVI] Using Triton-accelerated kernels from KIVI/quant/new_pack.py")
+except Exception as _e:
+    _HAS_TRITON_KIVI = False
+    print(f"[KIVI] Triton kernels unavailable ({_e}), falling back to pure-PyTorch bit-packing.")
 
 def _pack_tensor(data: torch.Tensor, bits: int, pack_dim: int) -> torch.Tensor:
     """Pack integer tensor along pack_dim into int32 words (pure PyTorch)."""
@@ -73,12 +94,25 @@ def _quant_K(K: torch.Tensor, group_size: int, bits: int):
       K_code : [B, H, T//feat_per_int, D]  int32  (bit-packed)
       scale  : [B, H, T//G, 1, D]          fp32
       mn     : [B, H, T//G, 1, D]          fp32
+    Prefers Triton kernel (3-5x faster); falls back to pure-PyTorch on CPU.
     """
     B, H, T, D = K.shape
     G = group_size
     assert T % G == 0, f"_quant_K: T={T} not divisible by G={G}"
     levels = (1 << bits) - 1
 
+    if _HAS_TRITON_KIVI and K.is_cuda:
+        # Triton path: expects [B, H, T, D] fp16/bf16
+        # Returns code [B, H, T//fpi, D], scale [B,H,T//G,D], mn [B,H,T//G,D]
+        # Note: Triton convention has scale/mn trailing D not leading, reshape to match internal fmt
+        try:
+            code, sc, mn = _triton_quant_K(K.half(), G, bits)
+            # Triton returns scale/mn as [B, H, T//G, D]; we need [B, H, T//G, 1, D]
+            return code, sc.unsqueeze(-2).float(), mn.unsqueeze(-2).float()
+        except Exception:
+            pass  # fall through to PyTorch path
+
+    # Pure-PyTorch fallback
     Kg = K.float().view(B, H, T // G, G, D)            # [B, H, T//G, G, D]
     mn = Kg.amin(dim=-2, keepdim=True)                  # [B, H, T//G, 1, D]
     mx = Kg.amax(dim=-2, keepdim=True)
@@ -121,12 +155,22 @@ def _quant_V(V: torch.Tensor, group_size: int, bits: int):
       V_code : [B, H, T, D//feat_per_int]  int32
       scale  : [B, H, T, D//G, 1]          fp32
       mn     : [B, H, T, D//G, 1]          fp32
+    Prefers Triton kernel; falls back to pure-PyTorch on CPU.
     """
     B, H, T, D = V.shape
     G = group_size
     assert D % G == 0, f"_quant_V: D={D} not divisible by G={G}"
     levels = (1 << bits) - 1
 
+    if _HAS_TRITON_KIVI and V.is_cuda:
+        try:
+            code, sc, mn = _triton_quant_V(V.half(), G, bits)
+            # Triton returns scale/mn as [B, H, T, D//G]; we need [B, H, T, D//G, 1]
+            return code, sc.unsqueeze(-1).float(), mn.unsqueeze(-1).float()
+        except Exception:
+            pass
+
+    # Pure-PyTorch fallback
     Vg = V.float().view(B, H, T, D // G, G)            # [B, H, T, D//G, G]
     mn = Vg.amin(dim=-1, keepdim=True)                  # [B, H, T, D//G, 1]
     mx = Vg.amax(dim=-1, keepdim=True)

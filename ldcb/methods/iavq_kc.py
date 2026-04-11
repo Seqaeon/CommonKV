@@ -4,8 +4,8 @@ Design reference: IAVQ_KC_design.md
 
 Compression strategy:
   - Prefill keys:  importance-weighted k-means codebook (built online from this
-                   prompt's own attention weights) + PCA residual projection
-                   (8 int8 scalars + 1 fp16 scale per token per head).
+                   prompt's own attention weights) + per-head PCA residual projection
+                   (16 int8 scalars + 1 fp16 scale per token per head).
   - Prefill values: INT8 per-token asymmetric quantization.
   - Decode keys:   new tokens enter as recency anchors (full fp16).
                    When a token ages out of the recency window it is either
@@ -111,13 +111,13 @@ class _LayerState:
 
     def __init__(
         self,
-        codebook: torch.Tensor,    # [m, D] fp16
-        pca_basis: torch.Tensor,   # [P, D] fp16
+        codebook: torch.Tensor,    # [H, m, D] fp16  — per-head codebooks
+        pca_basis: torch.Tensor,   # [H, P, D] fp16  — per-head PCA bases
         dtype: torch.dtype,
-        P: int = 8,
+        P: int = 16,
     ):
         self.codebook = codebook   # [H, m, D]
-        self.pca_basis = pca_basis # [P, D]
+        self.pca_basis = pca_basis # [H, P, D]
         self.dtype = dtype
         self.P = P
         self.m = codebook.shape[1]
@@ -156,7 +156,7 @@ class _LayerState:
         """
         H, D = k.shape
         C = self.codebook.float()   # [H, m, D]
-        B = self.pca_basis.float()  # [P, D]
+        B = self.pca_basis.float()  # [H, P, D] — per-head
 
         # Nearest centroid per head
         dists = torch.cdist(k.float().unsqueeze(1), C)    # [H, 1, m]
@@ -166,8 +166,9 @@ class _LayerState:
         centroids_h = C[torch.arange(H), idx]             # [H, D]
         residual = k.float() - centroids_h                # [H, D]
 
-        # Project onto PCA basis: [H, P]
-        proj = residual @ B.T                # [H, P]
+        # Per-head PCA projection: residual[h] @ B[h].T → [H, P]
+        # B: [H, P, D] → einsum or bmm
+        proj = torch.bmm(B, residual.unsqueeze(2)).squeeze(2)   # [H, P]
 
         # Per-head int8 quantization of projections
         scale = proj.abs().amax(dim=1, keepdim=True).clamp(min=1e-5)  # [H, 1]
@@ -186,10 +187,13 @@ class _LayerState:
 
         idx, proj_int8, scale = self.compressed[pos]
         # Dequantize projections: [H, P]
-        proj = proj_int8.float() * scale.float().unsqueeze(1)           # [H, P]
-        # Reconstruct: centroid + proj @ B
+        proj = proj_int8.float() * scale.float().unsqueeze(1)            # [H, P]
+        # Reconstruct: centroid + B[h].T @ proj[h] per head
         centroids_h = self.codebook[torch.arange(H), idx.long()].float() # [H, D]
-        k_hat = centroids_h + proj @ self.pca_basis.float()              # [H, D]
+        B = self.pca_basis.float()                                        # [H, P, D]
+        # proj: [H, P] → [H, 1, P] @ [H, P, D] → [H, 1, D] → [H, D]
+        recon_residual = torch.bmm(proj.unsqueeze(1), B).squeeze(1)      # [H, D]
+        k_hat = centroids_h + recon_residual
         return k_hat.to(self.dtype)
 
     def reconstruct_full_keys(self, H: int, D: int, device) -> torch.Tensor:
@@ -258,13 +262,13 @@ class IAVQKCMethod(KVCacheMethod):
     def __init__(
         self,
         codebook_size: int = 256,
-        recency_window: int = 64,
+        recency_window: int = 128,          # ↑ was 64 — more recent anchors, less forgetting
         importance_anchors: int = 128,
-        kmeans_iters: int = 3,
-        pca_components: int = 8,
-        update_strategy: str = "recency_gated",  # recency_gated | frozen | always
+        kmeans_iters: int = 5,              # ↑ was 3 — better centroid convergence
+        pca_components: int = 16,           # ↑ was 8  — more residual expressivity per head
+        update_strategy: str = "recency_gated",
         centroid_update_alpha: float = 0.01,
-        update_importance_during_decode: bool = False,
+        update_importance_during_decode: bool = True,  # ↑ was False — live importance updates
     ):
         self.A = codebook_size
         self.R = recency_window
@@ -332,22 +336,26 @@ class IAVQKCMethod(KVCacheMethod):
             
         codebook = torch.stack(codebooks).to(dtype) # [H, m, D]
 
-        # ---- PCA basis from prefill residuals ----
+        # ---- Per-head PCA basis from prefill residuals ----
         k_h_T = K_pool.view(H, T, D)                           # [H, T, D]
         dists = torch.cdist(k_h_T.float(), codebook.float())   # [H, T, m]
         assign = dists.argmin(dim=2)                           # [H, T]
-        
-        # Gather centroids and compute residual
-        centroids = torch.gather(codebook, 1, assign.unsqueeze(2).expand(-1, -1, D)) # [H, T, D]
-        residuals = (k_h_T.float() - centroids.float()).view(H * T, D)
 
-        try:
-            _, _, Vt = torch.linalg.svd(residuals, full_matrices=False)
-            pca_basis = Vt[: self.P].to(dtype)                 # [P, D]
-        except Exception:
-            pca_basis = F.normalize(
-                torch.randn(self.P, D, device=K_l.device, dtype=dtype), dim=1
-            )
+        # Gather centroids and compute residuals per head
+        centroids = torch.gather(codebook, 1, assign.unsqueeze(2).expand(-1, -1, D)) # [H, T, D]
+        residuals_h = (k_h_T.float() - centroids.float())     # [H, T, D]
+
+        # Build per-head PCA basis: [H, P, D]
+        pca_bases = []
+        for h in range(H):
+            try:
+                _, _, Vt_h = torch.linalg.svd(residuals_h[h], full_matrices=False)
+                pca_bases.append(Vt_h[: self.P])              # [P, D]
+            except Exception:
+                pca_bases.append(F.normalize(
+                    torch.randn(self.P, D, device=K_l.device), dim=1
+                ))
+        pca_basis = torch.stack(pca_bases).to(dtype)           # [H, P, D]
 
         state = _LayerState(codebook=codebook, pca_basis=pca_basis,
                             dtype=dtype, P=self.P)
@@ -442,10 +450,12 @@ class IAVQKCMethod(KVCacheMethod):
         dists = torch.cdist(k_new.float().unsqueeze(1), state.codebook.float())  # [H, 1, m]
         idx = dists.squeeze(1).argmin(dim=1)                                     # [H]
         a = self.alpha
-        for h in range(k_new.shape[0]):
-            state.codebook[h, idx[h]] = (
-                (1 - a) * state.codebook[h, idx[h]] + a * k_new[h]
-            ).to(state.dtype)
+        H = k_new.shape[0]
+        arange_h = torch.arange(H, device=state.codebook.device)
+        # Vectorised EMA update — avoids Python loop over heads
+        state.codebook[arange_h, idx] = (
+            (1 - a) * state.codebook[arange_h, idx] + a * k_new.to(state.codebook.dtype)
+        )
 
     # ------------------------------------------------------------------
     # Main generate
@@ -481,11 +491,21 @@ class IAVQKCMethod(KVCacheMethod):
             )
 
         # Aggregate importance across layers and heads → [T_prefill]
+        # Weight each head's contribution by its entropy (low-entropy heads are more selective)
         importance = torch.zeros(T_prefill, device=device, dtype=torch.float32)
         if prefill_out.attentions is not None:
             for attn in prefill_out.attentions:
-                # attn: [B, H, T, T] → column sums averaged over heads/batch
-                importance += attn[0].float().mean(dim=0).sum(dim=0)
+                # attn: [B, H, T, T]
+                a = attn[0].float()                          # [H, T, T]
+                col_sums = a.sum(dim=1)                      # [H, T] — how much each position is attended to
+                # Head entropy: H_h = -sum(p log p) over query dim for last query position
+                last_q = a[:, -1, :]                         # [H, T]
+                last_q = last_q / (last_q.sum(dim=-1, keepdim=True) + 1e-8)
+                entropy = -(last_q * (last_q + 1e-9).log()).sum(dim=-1)  # [H]
+                # Low entropy → head is more focused → weight it higher
+                head_weights = (1.0 / (entropy + 1.0))       # [H]
+                head_weights = head_weights / head_weights.sum()
+                importance += (col_sums * head_weights.unsqueeze(1)).sum(dim=0)
             importance = importance / max(len(prefill_out.attentions), 1)
         importance = importance.clamp(min=0)
 
