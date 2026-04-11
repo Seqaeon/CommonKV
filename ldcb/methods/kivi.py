@@ -245,37 +245,14 @@ class KIVIMethod(KVCacheMethod):
     # Generate
     # ------------------------------------------------------------------
 
-    def generate(self, model, tokenizer, prompt, max_new_tokens, checkpoint_steps):
-        inputs   = tokenizer(prompt, return_tensors="pt").to(model.device)
-        n_layers = model.config.num_hidden_layers
-        n_heads  = getattr(model.config, "num_key_value_heads",
-                           model.config.num_attention_heads)
-        head_dim = model.config.hidden_size // model.config.num_attention_heads
-        mdtype   = next(model.parameters()).dtype   # use actual model dtype (fp16 OR bf16)
-        G, R     = self.G, self.R
+    def prefill(self, model, tokenizer, prompt):
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        mdtype = next(model.parameters()).dtype
+        G, R = self.G, self.R
 
-        generated_ids = inputs.input_ids
-        snapshots = []
-        chk_iter  = iter(checkpoint_steps)
-        cur_chk   = next(chk_iter, None)
-        tok_gen   = 0
-
-        # ---- Prefill ----
         with torch.no_grad():
-            outputs = model(generated_ids, use_cache=True)
+            outputs = model(inputs.input_ids, use_cache=True)
 
-        # Build per-layer quantised cache.
-        # State per layer: [K_code, K_scale, K_mn, K_T_q, V_code, V_scale, V_mn, V_D, K_res, V_res]
-        #   K_code  : [B,H,T_kq//fpi,D]    int32  (bit-packed)
-        #   K_scale : [B,H,T_kq//G,1,D]    fp32
-        #   K_mn    : [B,H,T_kq//G,1,D]    fp32
-        #   K_T_q   : int   (T used for unpacking)
-        #   V_code  : [B,H,T_vq,D//fpi]    int32
-        #   V_scale : [B,H,T_vq,D//G,1]    fp32
-        #   V_mn    : [B,H,T_vq,D//G,1]    fp32
-        #   V_D     : int   (D used for unpacking)
-        #   K_res   : [B,H,T_kr,D]          mdtype
-        #   V_res   : [B,H,T_vr,D]          mdtype
         quant_cache = []
         for _, (layer_K, layer_V) in get_kv_iterator(outputs.past_key_values):
             T = layer_K.shape[2]
@@ -310,124 +287,172 @@ class KIVIMethod(KVCacheMethod):
             quant_cache.append([K_code, K_sc, K_mn, T_kq,
                                  V_code, V_sc, V_mn, D,
                                  K_res, V_res])
+        return quant_cache
 
-        next_token    = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        generated_ids = torch.cat([generated_ids, next_token], dim=1)
-        tok_gen      += 1
-        del outputs
+    def generate(self, model, tokenizer, prompt, max_new_tokens, checkpoint_steps, cached_state=None):
+        inputs   = tokenizer(prompt, return_tensors="pt").to(model.device)
+        n_layers = model.config.num_hidden_layers
+        n_heads  = getattr(model.config, "num_key_value_heads",
+                           model.config.num_attention_heads)
+        head_dim = model.config.hidden_size // model.config.num_attention_heads
+        mdtype   = next(model.parameters()).dtype   # use actual model dtype (fp16 OR bf16)
+        G, R     = self.G, self.R
 
-        # ---- Decode loop ----
-        with torch.no_grad():
-            while tok_gen < max_new_tokens:
-
-                # Reconstruct full KV for attention
+        generated_ids = inputs.input_ids
+        snapshots = []
+        chk_iter  = iter(checkpoint_steps)
+        cur_chk   = next(chk_iter, None)
+        tok_gen   = 0
+        
+        if cached_state is not None:
+            quant_cache = cached_state
+            # Prefill the new part of the prompt starting from cached_state
+            with torch.no_grad():
                 past_kv = DynamicCache()
                 for i, (K_code, K_sc, K_mn, K_T_q,
                          V_code, V_sc, V_mn, V_D,
                          K_res, V_res) in enumerate(quant_cache):
                     dev = K_res.device
-
                     if K_code is not None:
-                        kc = K_code.to(dev) if self.cpu else K_code
-                        ks = K_sc.to(dev)   if self.cpu else K_sc
-                        km = K_mn.to(dev)   if self.cpu else K_mn
-                        K_fp = torch.cat([
-                            _dequant_K(kc, ks, km, G, self.bits, K_T_q).to(mdtype),
-                            K_res.to(mdtype)], dim=2)
-                        if self.cpu: del kc, ks, km
+                        K_fp = torch.cat([_dequant_K(K_code.to(dev), K_sc.to(dev), K_mn.to(dev), G, self.bits, K_T_q).to(mdtype), K_res], dim=2)
                     else:
-                        K_fp = K_res.to(mdtype)
-
+                        K_fp = K_res
                     if V_code is not None:
-                        vc = V_code.to(dev) if self.cpu else V_code
-                        vs = V_sc.to(dev)   if self.cpu else V_sc
-                        vm = V_mn.to(dev)   if self.cpu else V_mn
-                        V_fp = torch.cat([
-                            _dequant_V(vc, vs, vm, G, self.bits, V_D).to(mdtype),
-                            V_res.to(mdtype)], dim=2)
-                        if self.cpu: del vc, vs, vm
+                        V_fp = torch.cat([_dequant_V(V_code.to(dev), V_sc.to(dev), V_mn.to(dev), G, self.bits, V_D).to(mdtype), V_res], dim=2)
                     else:
-                        V_fp = V_res.to(mdtype)
-
+                        V_fp = V_res
                     past_kv.update(K_fp, V_fp, i)
-                    del K_fp, V_fp   # free dequantised tensors immediately
+
+                outputs = model(generated_ids, past_key_values=past_kv, use_cache=True)
+            
+            # Incorporate new tokens into quant_cache
+            new_pkvs = list(get_kv_iterator(outputs.past_key_values))
+            for i, (_, (layer_K, layer_V)) in enumerate(new_pkvs):
+                T = layer_K.shape[2]
+                D = layer_K.shape[3]
+                
+                # Reserving the logic for simplicity: just update the résiduels for now
+                # In a real KIVI resumption, we'd need to re-quantize if we cross R.
+                # Since 'prompt' in GSM8K after few-shot is small, we mostly just append to residuals.
+                # But to be safe, we should probably just re-run the quant logic on the whole new layer_K/layer_V
+                
+                # ---- Keys ----
+                T_kq = (T // R) * R
+                K_old = layer_K[:, :, :T_kq, :].to(dtype=torch.float32)
+                K_res = layer_K[:, :, T_kq:, :].to(dtype=mdtype)
+                if T_kq > 0:
+                    K_code, K_sc, K_mn = _quant_K(K_old, G, self.bits)
+                    if self.cpu: K_code, K_sc, K_mn = K_code.cpu(), K_sc.cpu(), K_mn.cpu()
+                else:
+                    K_code = K_sc = K_mn = None
+
+                # ---- Values ----
+                T_vq = max(0, T - R)
+                V_old = layer_V[:, :, :T_vq, :].to(dtype=torch.float32)
+                V_res = layer_V[:, :, T_vq:, :].to(dtype=mdtype)
+                if T_vq > 0:
+                    V_code, V_sc, V_mn = _quant_V(V_old, G, self.bits)
+                    if self.cpu: V_code, V_sc, V_mn = V_code.cpu(), V_sc.cpu(), V_mn.cpu()
+                else:
+                    V_code = V_sc = V_mn = None
+
+                quant_cache[i] = [K_code, K_sc, K_mn, T_kq, V_code, V_sc, V_mn, D, K_res, V_res]
+
+            next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+            tok_gen = 1
+            del outputs, past_kv
+        else:
+            # ---- Normal Prefill ----
+            with torch.no_grad():
+                outputs = model(generated_ids, use_cache=True)
+            
+            quant_cache = []
+            for _, (layer_K, layer_V) in get_kv_iterator(outputs.past_key_values):
+                T, D = layer_K.shape[2], layer_K.shape[3]
+                T_kq = (T // R) * R
+                K_old, K_res = layer_K[:, :, :T_kq, :].float(), layer_K[:, :, T_kq:, :].to(mdtype)
+                K_code, K_sc, K_mn = _quant_K(K_old, G, self.bits) if T_kq > 0 else (None, None, None)
+                if self.cpu and K_code is not None: K_code, K_sc, K_mn = K_code.cpu(), K_sc.cpu(), K_mn.cpu()
+
+                T_vq = max(0, T - R)
+                V_old, V_res = layer_V[:, :, :T_vq, :].float(), layer_V[:, :, T_vq:, :].to(mdtype)
+                V_code, V_sc, V_mn = _quant_V(V_old, G, self.bits) if T_vq > 0 else (None, None, None)
+                if self.cpu and V_code is not None: V_code, V_sc, V_mn = V_code.cpu(), V_sc.cpu(), V_mn.cpu()
+                
+                quant_cache.append([K_code, K_sc, K_mn, T_kq, V_code, V_sc, V_mn, D, K_res, V_res])
+
+            next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+            tok_gen = 1
+            del outputs
+
+        # ---- Decode loop ----
+        with torch.no_grad():
+            while tok_gen < max_new_tokens:
+                # Reconstruct full KV for attention
+                past_kv = DynamicCache()
+                for i, (K_code, K_sc, K_mn, K_T_q, V_code, V_sc, V_mn, V_D, K_res, V_res) in enumerate(quant_cache):
+                    dev = K_res.device
+                    if K_code is not None:
+                        kc, ks, km = (K_code.to(dev), K_sc.to(dev), K_mn.to(dev)) if self.cpu else (K_code, K_sc, K_mn)
+                        K_fp = torch.cat([_dequant_K(kc, ks, km, G, self.bits, K_T_q).to(mdtype), K_res], dim=2)
+                    else: K_fp = K_res
+                    if V_code is not None:
+                        vc, vs, vm = (V_code.to(dev), V_sc.to(dev), V_mn.to(dev)) if self.cpu else (V_code, V_sc, V_mn)
+                        V_fp = torch.cat([_dequant_V(vc, vs, vm, G, self.bits, V_D).to(mdtype), V_res], dim=2)
+                    else: V_fp = V_res
+                    past_kv.update(K_fp, V_fp, i)
 
                 outputs = model(next_token, past_key_values=past_kv, use_cache=True)
-
-                new_kvs = [
-                    (K[:, :, -1:, :].to(mdtype).clone(),
-                     V[:, :, -1:, :].to(mdtype).clone())
-                    for _, (K, V) in get_kv_iterator(outputs.past_key_values)
-                ]
-                next_token    = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                new_kvs = [(K[:, :, -1:, :].to(mdtype).clone(), V[:, :, -1:, :].to(mdtype).clone())
+                            for _, (K, V) in get_kv_iterator(outputs.past_key_values)]
+                next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
                 del outputs, past_kv
-                # NOTE: empty_cache() every token is expensive and triggers async error
-                # reporting. Only call it periodically.
-
                 generated_ids = torch.cat([generated_ids, next_token], dim=1)
-                tok_gen      += 1
+                tok_gen += 1
 
-                # Update quantised cache
-                new_cache = []
-                for i, (K_code, K_sc, K_mn, K_T_q,
-                         V_code, V_sc, V_mn, V_D,
-                         K_res, V_res) in enumerate(quant_cache):
+                for i, state in enumerate(quant_cache):
+                    K_code, K_sc, K_mn, K_T_q, V_code, V_sc, V_mn, V_D, K_res, V_res = state
                     nK, nV = new_kvs[i]
-
-                    # --- Key residual (flush when full = R tokens) ---
                     K_res = torch.cat([K_res, nK], dim=2)
                     if K_res.shape[2] == R:
                         pK_code, pK_sc, pK_mn = _quant_K(K_res.float(), G, self.bits)
-                        new_K_T_q = K_T_q + R
-                        if self.cpu:
-                            pK_code = pK_code.cpu(); pK_sc = pK_sc.cpu(); pK_mn = pK_mn.cpu()
-                        if K_code is None:
-                            K_code, K_sc, K_mn, K_T_q = pK_code, pK_sc, pK_mn, new_K_T_q
+                        if self.cpu: pK_code, pK_sc, pK_mn = pK_code.cpu(), pK_sc.cpu(), pK_mn.cpu()
+                        if K_code is None: K_code, K_sc, K_mn, K_T_q = pK_code, pK_sc, pK_mn, R
                         else:
                             K_code = torch.cat([K_code, pK_code], dim=2)
-                            K_sc   = torch.cat([K_sc,   pK_sc],   dim=2)
-                            K_mn   = torch.cat([K_mn,   pK_mn],   dim=2)
-                            K_T_q  = new_K_T_q
-                        K_res = K_res[:, :, :0, :]   # reset
+                            K_sc = torch.cat([K_sc, pK_sc], dim=2)
+                            K_mn = torch.cat([K_mn, pK_mn], dim=2)
+                            K_T_q += R
+                        K_res = K_res[:, :, :0, :]
 
-                    # --- Value residual (flush oldest when > R) ---
                     V_res = torch.cat([V_res, nV], dim=2)
                     if V_res.shape[2] > R:
                         evict = V_res[:, :, :1, :].contiguous()
                         V_res = V_res[:, :, 1:, :]
                         pV_code, pV_sc, pV_mn = _quant_V(evict.float(), G, self.bits)
-                        if self.cpu:
-                            pV_code = pV_code.cpu(); pV_sc = pV_sc.cpu(); pV_mn = pV_mn.cpu()
-                        if V_code is None:
-                            V_code, V_sc, V_mn = pV_code, pV_sc, pV_mn
+                        if self.cpu: pV_code, pV_sc, pV_mn = pV_code.cpu(), pV_sc.cpu(), pV_mn.cpu()
+                        if V_code is None: V_code, V_sc, V_mn = pV_code, pV_sc, pV_mn
                         else:
                             V_code = torch.cat([V_code, pV_code], dim=2)
-                            V_sc   = torch.cat([V_sc,   pV_sc],   dim=2)
-                            V_mn   = torch.cat([V_mn,   pV_mn],   dim=2)
-
-                    new_cache.append([K_code, K_sc, K_mn, K_T_q,
-                                      V_code, V_sc, V_mn, V_D,
-                                      K_res, V_res])
-
-                quant_cache = new_cache
+                            V_sc = torch.cat([V_sc, pV_sc], dim=2)
+                            V_mn = torch.cat([V_mn, pV_mn], dim=2)
+                    quant_cache[i] = [K_code, K_sc, K_mn, K_T_q, V_code, V_sc, V_mn, V_D, K_res, V_res]
 
                 if tok_gen == cur_chk:
-                    T       = generated_ids.shape[1]
-                    compr   = self._cache_bytes(T, n_layers, n_heads, head_dim)
+                    T = generated_ids.shape[1]
+                    compr = self._cache_bytes(T, n_layers, n_heads, head_dim)
                     full_kv = T * n_layers * n_heads * head_dim * 2 * 2
                     snapshots.append(CacheState(compressed_bytes=compr, fullkv_bytes=full_kv))
                     cur_chk = next(chk_iter, None)
+                if next_token.item() == tokenizer.eos_token_id: break
 
-                if next_token.item() == tokenizer.eos_token_id:
-                    break
-
-        T       = generated_ids.shape[1]
-        compr   = self._cache_bytes(T, n_layers, n_heads, head_dim)
+        T = generated_ids.shape[1]
+        compr = self._cache_bytes(T, n_layers, n_heads, head_dim)
         full_kv = T * n_layers * n_heads * head_dim * 2 * 2
-        text    = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        final   = CacheState(compressed_bytes=compr, fullkv_bytes=full_kv)
-
-        while len(snapshots) < len(checkpoint_steps):
-            snapshots.append(final)
-
+        text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        final = CacheState(compressed_bytes=compr, fullkv_bytes=full_kv)
+        while len(snapshots) < len(checkpoint_steps): snapshots.append(final)
         return text, snapshots, final
+

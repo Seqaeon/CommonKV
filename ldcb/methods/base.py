@@ -22,6 +22,18 @@ class CacheState:
 
 class KVCacheMethod(ABC):
 
+    def prefill(
+        self,
+        model,
+        tokenizer,
+        prompt: str,
+    ) -> any:
+        """
+        Optional: Processes a prompt and returns the method-specific KV cache state.
+        Used for shared prefix caching (e.g. few-shot examples).
+        """
+        raise NotImplementedError(f"{self.name} does not support prefill caching.")
+
     @abstractmethod
     def generate(
         self,
@@ -30,6 +42,7 @@ class KVCacheMethod(ABC):
         prompt: str,
         max_new_tokens: int,
         checkpoint_steps: list,      # token counts at which to snapshot metrics
+        cached_state: any = None,    # optional shared prefix state to resume from
     ) -> Tuple[str, list, CacheState]:
         """
         Returns:
@@ -38,3 +51,4 @@ class KVCacheMethod(ABC):
           final_state: CacheState at end of generation
         """
         pass
+

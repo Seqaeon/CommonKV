@@ -461,6 +461,45 @@ class IAVQKCMethod(KVCacheMethod):
     # Main generate
     # ------------------------------------------------------------------
 
+    def prefill(self, model, tokenizer, prompt: str):
+        device = next(model.parameters()).device
+        dtype = next(model.parameters()).dtype
+
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        n_layers = model.config.num_hidden_layers
+        T_prefill = inputs.input_ids.shape[1]
+
+        # Prefill pass — output_attentions=True to get importance scores
+        with torch.no_grad():
+            prefill_out = model(
+                inputs.input_ids,
+                use_cache=True,
+                output_attentions=True,
+            )
+
+        importance = torch.zeros(T_prefill, device=device, dtype=torch.float32)
+        if prefill_out.attentions is not None:
+            for attn in prefill_out.attentions:
+                a = attn[0].float()
+                col_sums = a.sum(dim=1)
+                last_q = a[:, -1, :]
+                last_q = last_q / (last_q.sum(dim=-1, keepdim=True) + 1e-8)
+                entropy = -(last_q * (last_q + 1e-9).log()).sum(dim=-1)
+                head_weights = (1.0 / (entropy + 1.0))
+                head_weights = head_weights / head_weights.sum()
+                importance += (col_sums * head_weights.unsqueeze(1)).sum(dim=0)
+            importance = importance / max(len(prefill_out.attentions), 1)
+        importance = importance.clamp(min=0)
+
+        layer_states = []
+        for l, (K_l, V_l) in get_kv_iterator(prefill_out.past_key_values):
+            state = self._build_layer_state(
+                K_l, V_l, importance, l, n_layers, dtype
+            )
+            layer_states.append(state)
+        
+        return layer_states
+
     def generate(
         self,
         model,
@@ -468,6 +507,7 @@ class IAVQKCMethod(KVCacheMethod):
         prompt: str,
         max_new_tokens: int,
         checkpoint_steps: list,
+        cached_state=None,
     ):
         device = next(model.parameters()).device
         dtype = next(model.parameters()).dtype
@@ -478,52 +518,76 @@ class IAVQKCMethod(KVCacheMethod):
             model.config, "num_key_value_heads", model.config.num_attention_heads
         )
         head_dim = model.config.hidden_size // model.config.num_attention_heads
-        T_prefill = inputs.input_ids.shape[1]
+        
+        if cached_state is not None:
+            layer_states = cached_state
+            # Sum of prefill tokens from the cache
+            T_prefill = layer_states[0].K_cache.shape[2]
+            # Since we are resuming, we don't do a full prefill pass here.
+            # We treat the 'prompt' as a continuation starting from cached_state.
+            # But we still need to process the 'new' prompt part.
+            with torch.no_grad():
+                hf_cache = DynamicCache()
+                for i, state in enumerate(layer_states):
+                    hf_cache.update(state.K_cache, state.V_cache, i)
+                
+                out = model(
+                    inputs.input_ids,
+                    past_key_values=hf_cache,
+                    use_cache=True,
+                    output_attentions=True,
+                )
+            
+            # Update importance for the new tokens in the prompt
+            T_new = inputs.input_ids.shape[1]
+            if out.attentions is not None:
+                for l, attn in enumerate(out.attentions):
+                    a = attn[0].float()
+                    col_sums = a.sum(dim=1) # [H, T_total]
+                    upd = col_sums.mean(dim=0)
+                    sc = layer_states[l].importance_scores
+                    T_total = T_prefill + T_new
+                    if sc.shape[0] < T_total:
+                        sc = torch.cat([sc, torch.zeros(T_total - sc.shape[0], device=device)])
+                        layer_states[l].importance_scores = sc
+                    sc[:T_total] += upd
+            
+            # Incorporate the new prompt tokens into layer_states
+            for l, (K_l, V_l) in get_kv_iterator(out.past_key_values):
+                state = layer_states[l]
+                # Process tokens from T_prefill to T_prefill + T_new - 1
+                for offset in range(T_new):
+                    t = T_prefill + offset
+                    k_t = K_l[0, :, t, :]
+                    v_t = V_l[:, :, t:t+1, :]
+                    
+                    state.K_cache = torch.cat([state.K_cache, K_l[:, :, t:t+1, :]], dim=2)
+                    state.V_cache = torch.cat([state.V_cache, v_t], dim=2)
+                    state.anchor_keys[t] = k_t
+                    state.anchor_ids.add(t)
+                    state.add_value(v_t, pos=t)
 
-        # ----------------------------------------------------------------
-        # Prefill pass — output_attentions=True to get importance scores
-        # ----------------------------------------------------------------
-        with torch.no_grad():
-            prefill_out = model(
-                inputs.input_ids,
-                use_cache=True,
-                output_attentions=True,
-            )
+            next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            generated_ids = torch.cat([inputs.input_ids, next_token], dim=1)
+            T_prefill = T_prefill + T_new
+            tok_gen = 1
+            del out
+        else:
+            T_prefill = inputs.input_ids.shape[1]
+            layer_states = self.prefill(model, tokenizer, prompt)
+            
+            # Recompute first next_token since prefill method didn't return it
+            with torch.no_grad():
+                hf_cache = DynamicCache()
+                for i, state in enumerate(layer_states):
+                    hf_cache.update(state.K_cache, state.V_cache, i)
+                out = model(inputs.input_ids[:, -1:], past_key_values=hf_cache, use_cache=True)
+                next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            
+            generated_ids = torch.cat([inputs.input_ids, next_token], dim=1)
+            tok_gen = 1
+            del out, hf_cache
 
-        # Aggregate importance across layers and heads → [T_prefill]
-        # Weight each head's contribution by its entropy (low-entropy heads are more selective)
-        importance = torch.zeros(T_prefill, device=device, dtype=torch.float32)
-        if prefill_out.attentions is not None:
-            for attn in prefill_out.attentions:
-                # attn: [B, H, T, T]
-                a = attn[0].float()                          # [H, T, T]
-                col_sums = a.sum(dim=1)                      # [H, T] — how much each position is attended to
-                # Head entropy: H_h = -sum(p log p) over query dim for last query position
-                last_q = a[:, -1, :]                         # [H, T]
-                last_q = last_q / (last_q.sum(dim=-1, keepdim=True) + 1e-8)
-                entropy = -(last_q * (last_q + 1e-9).log()).sum(dim=-1)  # [H]
-                # Low entropy → head is more focused → weight it higher
-                head_weights = (1.0 / (entropy + 1.0))       # [H]
-                head_weights = head_weights / head_weights.sum()
-                importance += (col_sums * head_weights.unsqueeze(1)).sum(dim=0)
-            importance = importance / max(len(prefill_out.attentions), 1)
-        importance = importance.clamp(min=0)
-
-        # Build per-layer states
-        layer_states: list[_LayerState] = []
-        for l, (K_l, V_l) in get_kv_iterator(prefill_out.past_key_values):
-            # K_l, V_l: [B, H, T, D]
-            state = self._build_layer_state(
-                K_l, V_l, importance, l, n_layers, dtype
-            )
-            layer_states.append(state)
-
-        # First token from prefill logits
-        next_token = prefill_out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        generated_ids = torch.cat([inputs.input_ids, next_token], dim=1)
-        tok_gen = 1
-        del prefill_out
-        gc.collect()
 
         snapshots = []
         chk_iter = iter(checkpoint_steps)

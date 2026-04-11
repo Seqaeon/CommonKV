@@ -124,6 +124,22 @@ def run_gsm8k(
     if steps != -1:
         ds = ds.select(range(min(steps, len(ds))))
 
+    # --- Prefix Caching Optimization ---
+    # Prefill the few-shot context once and reuse it for all examples.
+    few_shot_prefix = ""
+    if n_shots > 0:
+        examples = _8SHOT_EXAMPLES.split("\n\n")
+        few_shot_prefix = "\n\n".join(examples[:n_shots]) + "\n\n"
+    
+    cached_context = None
+    if few_shot_prefix:
+        print(f"  Prefilling {n_shots}-shot context ...")
+        try:
+            cached_context = method.prefill(model, tokenizer, few_shot_prefix)
+        except Exception as e:
+            print(f"  [WARN] Prefix caching not supported by {method.name}: {e}")
+            cached_context = None
+
     n_correct = 0
     total = 0
     compression_ratios = []
@@ -133,25 +149,41 @@ def run_gsm8k(
     for example in ds:
         question = example["question"]
         gold = _gold_answer(example["answer"])
-        prompt = _build_prompt(question, n_shots=n_shots)
+        
+        # When using cached_context, we only send the question part to generate()
+        if cached_context is not None:
+            prompt_to_gen = f"Q: {question}\nA:"
+            full_prompt = few_shot_prefix + prompt_to_gen
+        else:
+            full_prompt = _build_prompt(question, n_shots=n_shots)
+            prompt_to_gen = full_prompt
 
         t0 = time.time()
         try:
             gen_text, _snapshots, final_state = method.generate(
                 model=model,
                 tokenizer=tokenizer,
-                prompt=prompt,
+                prompt=prompt_to_gen,
                 max_new_tokens=max_new_tokens,
                 checkpoint_steps=[max_new_tokens],
+                cached_state=cached_context,
             )
         except Exception as e:
             print(f"    [WARN] generate() failed: {e}")
+            import traceback
+            traceback.print_exc()
             gen_text = ""
             final_state = None
         elapsed = time.time() - t0
 
-        # Strip prompt prefix if returned in gen_text
-        pred_text = gen_text[len(prompt):].strip() if gen_text.startswith(prompt) else gen_text.strip()
+        # Strip prefix if present (some methods might return full text, others just the generation)
+        if gen_text.startswith(prompt_to_gen):
+            pred_text = gen_text[len(prompt_to_gen):].strip()
+        elif gen_text.startswith(full_prompt):
+            pred_text = gen_text[len(full_prompt):].strip()
+        else:
+            pred_text = gen_text.strip()
+            
         pred_ans = _extract_answer(pred_text)
         correct = pred_ans is not None and pred_ans == gold
 
@@ -165,7 +197,7 @@ def run_gsm8k(
         if final_state is not None and hasattr(final_state, "compression_ratio"):
             compression_ratios.append(final_state.compression_ratio)
 
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache() # Avoid excessive fragmentations
 
     accuracy = round(100.0 * n_correct / max(total, 1), 2)
     mean_cr = round(sum(compression_ratios) / len(compression_ratios), 4) if compression_ratios else 1.0
